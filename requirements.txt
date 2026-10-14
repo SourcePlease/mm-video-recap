@@ -1,0 +1,8 @@
+# 100% Free Online Video Recap — Python dependencies
+# Version ranges are relaxed for cloud builds; tested minimums are pinned.
+# No developer API keys are used anywhere (Bring-Your-Own-Key design).
+google-genai>=2.30.1
+edge-tts>=7.3.1
+yt-dlp>=2026.8.19
+gradio>=6.30.0
+streamlit>=1.32.0

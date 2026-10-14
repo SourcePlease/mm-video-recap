@@ -1,0 +1,17 @@
+# Python virtual environment (rebuild from requirements.txt on the server)
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Temporary test artifacts from local development
+# (sample_test.mp4 is kept: Demo Mode needs it)
+*.mp4
+!sample_test.mp4
+*.mp3
+*.srt
+*.log
+
+# OS / editor files
+.DS_Store
