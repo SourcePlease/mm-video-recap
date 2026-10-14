@@ -334,6 +334,13 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     /* Set when the user taps the canvas ✕ (remove): the next no-video
        render is the real removal, not an in-flight pick. */
     expectRemove: false,
+    /* Stale-pick re-sync: the browser may keep a video the server
+       forgot (session reset). pickTime = when the pick was sent;
+       localDataUrl/localName let JS re-send it once. */
+    pickTime: 0,
+    localDataUrl: null,
+    localName: null,
+    resyncSent: false,
     /* videoId whose base64 video_data is still sitting in the component
        value — cleared once Python acks receipt, so the ~40MB payload
        is not re-sent on every later rerun (phone-data burn). */
@@ -601,6 +608,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
        the subtitle, and the user can tap Edit/Add-blur on top of it. */
     S.hasVideo = true;
     S.expectRemove = false;
+    S.resyncSent = false;
     applyEmpty();
     var reader = new FileReader();
     reader.onload = function () {
@@ -616,6 +624,9 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       video.src = dataUrl;
       video.load();
       S.videoDataPending = vid;
+      S.pickTime = Date.now();
+      S.localDataUrl = dataUrl;
+      S.localName = name;
       sendValue("video_selected", {
         video_id: vid, video_data: dataUrl, video_name: name,
       });
@@ -861,6 +872,20 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     S.subsEnabled = S.args.subtitles_enabled !== false;
 
     var vid = S.args.video_id || null;
+    /* Session-reset heal: Python says "no video" but the browser has
+       held a locally-picked video for a while (Python should have
+       saved it by now) — the server session must have been lost.
+       Re-send the video once so Python recovers it; the in-flight
+       guard below keeps it displayed meanwhile. */
+    if (!vid && S.localPicked && S.videoId && !S.expectRemove
+        && S.localDataUrl && !S.resyncSent
+        && Date.now() - (S.pickTime || 0) > 30000) {
+      S.resyncSent = true;
+      sendValue("video_selected", {
+        video_id: S.videoId, video_data: S.localDataUrl,
+        video_name: S.localName || "video",
+      });
+    }
     if (!vid && S.localPicked && S.videoId && !S.expectRemove) {
       /* A locally-picked video is in flight (Python hasn't saved it
          yet): ignore this no-video render — don't wipe the video. */
@@ -875,6 +900,10 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.metaSentFor = null;
       S.videoDataPending = null;
       S.expectRemove = false;
+      S.pickTime = 0;
+      S.localDataUrl = null;
+      S.localName = null;
+      S.resyncSent = false;
       S.boxes = [];
       S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct,
                 fs: DEFAULT_SUB.font_size };

@@ -246,6 +246,7 @@ if isinstance(_val, dict):
             _action = None  # already processed
         else:
             st.session_state["last_canvas_nonce"] = _nonce
+    _fresh_action = _action is not None
     if _action == "remove_video":
         # Canvas ✕: drop the current video and reset the canvas.
         st.session_state["src_path"] = None
@@ -257,7 +258,10 @@ if isinstance(_val, dict):
         _reset_canvas_state()
         st.session_state["canvas_vid"] = None
         st.session_state["canvas_vid_sent"] = None
-        st.rerun()
+        # Deferred: the refresh rerun happens at the end of the script
+        # (see bottom) so a Run click coalesced with this action is
+        # not swallowed by an early st.rerun().
+        st.session_state["_canvas_rerun_needed"] = True
     elif _action == "video_selected":
         # A file picked inside the canvas: save it, ffprobe its ratio.
         try:
@@ -295,7 +299,7 @@ if isinstance(_val, dict):
             _reset_canvas_state()
         except Exception:  # noqa: BLE001 - bad payload: keep previous state
             st.error("❌ ဗီဒီယိုဖိုင် ဖတ်လို့ မရပါ။ ထပ်ကြိုးစားပေးပါ")
-        st.rerun()
+        st.session_state["_canvas_rerun_needed"] = True
     elif _action == "video_url":
         _u = (_val.get("video_url") or "").strip()
         if _u:
@@ -305,7 +309,7 @@ if isinstance(_val, dict):
             st.session_state["src_local_picked"] = False
             st.session_state["canvas_aspect"] = "9 / 16"
             _reset_canvas_state()
-        st.rerun()
+        st.session_state["_canvas_rerun_needed"] = True
     elif _action == "video_meta":
         # URL video's real dimensions -> canvas follows its ratio.
         if (
@@ -316,19 +320,22 @@ if isinstance(_val, dict):
             st.session_state["canvas_aspect"] = (
                 f"{int(_val['video_w'])} / {int(_val['video_h'])}"
             )
-            st.rerun()
-    # Adopt the canvas's current edit state (no-op for action values
-    # that already carry the reset state).
-    try:
-        st.session_state["canvas_blur"] = list(_val.get("blur_boxes") or [])
-        _s = _val.get("subtitle") or {}
-        st.session_state["canvas_sub"] = {
-            "x_pct": float(_s.get("x_pct", 0.5)),
-            "y_pct": float(_s.get("y_pct", 0.82)),
-            "font_size": int(_s.get("font_size", 22)),
-        }
-    except (TypeError, ValueError):
-        pass  # keep previous canvas state on malformed values
+            st.session_state["_canvas_rerun_needed"] = True
+    # Adopt the canvas's current edit state — but NOT when a fresh
+    # action was just consumed (its handler already reset/applied the
+    # canvas state; adopting the action value's stale boxes would
+    # undo that).
+    if not _fresh_action:
+        try:
+            st.session_state["canvas_blur"] = list(_val.get("blur_boxes") or [])
+            _s = _val.get("subtitle") or {}
+            st.session_state["canvas_sub"] = {
+                "x_pct": float(_s.get("x_pct", 0.5)),
+                "y_pct": float(_s.get("y_pct", 0.82)),
+                "font_size": int(_s.get("font_size", 22)),
+            }
+        except (TypeError, ValueError):
+            pass  # keep previous canvas state on malformed values
 
 # ---- API Key (below the canvas) ----
 st.markdown(KEY_GUIDE)
@@ -483,3 +490,11 @@ if run_btn:
     except Exception as exc:  # noqa: BLE001 - surfaced to the user in Myanmar UI
         traceback.print_exc()
         st.error(f"❌ အမှား: {exc}")
+
+# A canvas action asked for a refresh. Do it now — after the Run
+# handler has had its chance — so a Run click that arrived in the same
+# run as a canvas action (e.g. picking a video, then hitting Run
+# immediately) is not swallowed by an early st.rerun(). When Run did
+# run, skip the refresh: the recap result must stay on screen.
+if st.session_state.pop("_canvas_rerun_needed", False) and not run_btn:
+    st.rerun()
