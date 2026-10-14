@@ -331,6 +331,13 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     gesture: null,
     lastSent: "",
     nonceCounter: 0,
+    /* Set when the user taps the canvas ✕ (remove): the next no-video
+       render is the real removal, not an in-flight pick. */
+    expectRemove: false,
+    /* videoId whose base64 video_data is still sitting in the component
+       value — cleared once Python acks receipt, so the ~40MB payload
+       is not re-sent on every later rerun (phone-data burn). */
+    videoDataPending: null,
     subsEnabled: true,
   };
 
@@ -589,6 +596,12 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     var ok = /^video\//.test(file.type || "") ||
       /\.(mp4|mov|mkv|avi|webm|m4v)$/i.test(name);
     if (!ok) return;
+    /* Hide the empty overlay IMMEDIATELY (before the async FileReader
+       finishes): otherwise the upload UI keeps covering the video and
+       the subtitle, and the user can tap Edit/Add-blur on top of it. */
+    S.hasVideo = true;
+    S.expectRemove = false;
+    applyEmpty();
     var reader = new FileReader();
     reader.onload = function () {
       var dataUrl = reader.result;
@@ -602,6 +615,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.hasVideo = true;
       video.src = dataUrl;
       video.load();
+      S.videoDataPending = vid;
       sendValue("video_selected", {
         video_id: vid, video_data: dataUrl, video_name: name,
       });
@@ -626,7 +640,10 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 
   /* ---------------- top buttons ---------------- */
   function wireTopButtons() {
-    btnX.addEventListener("click", function () { sendValue("remove_video"); });
+    btnX.addEventListener("click", function () {
+      S.expectRemove = true;
+      sendValue("remove_video");
+    });
     btnEdit.addEventListener("click", function () {
       S.editMode = true;
       applyMode();
@@ -831,12 +848,24 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 
   function onRender(args) {
     S.args = args || {};
+    /* Server acked receipt of the picked file: drop the base64 payload
+       from the component value (send a small state instead) so the
+       ~40MB is not re-sent on every later rerun. Runs once. */
+    if (S.videoDataPending && S.args.video_ack === S.videoDataPending) {
+      S.videoDataPending = null;
+      sendValue(null);
+    }
     /* The phone's shape follows the VIDEO's own ratio (arg), not the
        output aspect setting. */
     phone.style.aspectRatio = S.args.canvas_aspect || "9 / 16";
     S.subsEnabled = S.args.subtitles_enabled !== false;
 
     var vid = S.args.video_id || null;
+    if (!vid && S.localPicked && S.videoId && !S.expectRemove) {
+      /* A locally-picked video is in flight (Python hasn't saved it
+         yet): ignore this no-video render — don't wipe the video. */
+      vid = S.videoId;
+    }
     if (!vid) {
       /* No video yet (or just removed): show the upload input that
          lives inside the canvas. */
@@ -844,6 +873,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.videoId = null;
       S.localPicked = false;
       S.metaSentFor = null;
+      S.videoDataPending = null;
+      S.expectRemove = false;
       S.boxes = [];
       S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct,
                 fs: DEFAULT_SUB.font_size };
@@ -866,6 +897,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     var isNewVideo = Boolean(vid !== S.videoId);
     if (isNewVideo) {
       S.videoId = vid;
+      S.expectRemove = false;
       S.localPicked = Boolean(S.args.local_picked);
       if (S.args.video_data_url) {
         video.src = S.args.video_data_url;
@@ -983,6 +1015,7 @@ def interactive_canvas(
     subtitles_enabled: bool = True,
     canvas_aspect: str = "9 / 16",
     local_picked: bool = False,
+    video_ack: Optional[str] = None,
     key: Optional[str] = None,
 ) -> Dict:
     """Render the canvas and return the latest user-edited state.
@@ -991,6 +1024,9 @@ def interactive_canvas(
     so the phone mockup matches the uploaded video — independent of the
     output aspect setting. ``local_picked`` tells the frontend the video
     is already loaded in-frame (picked locally), so it must not reload.
+    ``video_ack`` tells the frontend the server has saved the picked
+    file, so it can drop the base64 payload from its component value
+    (otherwise the ~40MB would be re-sent on every rerun).
     """
     value = _canvas(
         video_id=video_id,
@@ -1000,6 +1036,7 @@ def interactive_canvas(
         subtitles_enabled=bool(subtitles_enabled),
         canvas_aspect=canvas_aspect,
         local_picked=bool(local_picked),
+        video_ack=video_ack,
         default=CANVAS_DEFAULT,
         key=key,
     )

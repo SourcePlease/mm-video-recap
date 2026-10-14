@@ -227,6 +227,13 @@ _val = interactive_canvas(
     subtitles_enabled=bool(st.session_state.get("burn_subtitles", True)),
     canvas_aspect=st.session_state.get("canvas_aspect") or "9 / 16",
     local_picked=_canvas_local_picked,
+    # Ack: the server has saved this picked file (lets the frontend
+    # drop the base64 payload so it is not re-sent every rerun).
+    video_ack=(
+        st.session_state.get("src_video_id")
+        if st.session_state.get("src_path")
+        else None
+    ),
     key="mmr_canvas",
 )
 if isinstance(_val, dict):
