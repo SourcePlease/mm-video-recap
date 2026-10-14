@@ -57,6 +57,7 @@ def run_full_recap_pipeline(
     srt_path: Optional[str] = None,
     burn_subtitles: bool = True,
     tts_proxy: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> Dict:
     """Run the full recap pipeline end to end.
 
@@ -85,6 +86,7 @@ def run_full_recap_pipeline(
             plan = analyze_video_for_recap(
                 local_path, user_api_key,
                 target_duration=target_duration, style=style,
+                model=model,
             )
     script_text = plan.get("burmese_script", "")
     title = plan.get("title", "")

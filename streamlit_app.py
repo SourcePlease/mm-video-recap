@@ -63,6 +63,22 @@ def _parse_aspect(choice: str) -> str:
     return "9:16" if (choice or "").startswith("9:16") else "16:9"
 
 
+MODEL_OPTIONS = [
+    "Auto (အလိုအလျောက် အကောင်းဆုံး Free Model ရွေးမည်)",
+    "gemini-3.1-flash-lite (Gemini 3.1 Flash-Lite)",
+    "gemini-3.8-flash (Gemini 3.8 Flash)",
+    "gemini-3-flash-preview (Gemini 3 Flash)",
+    "gemini-3.6-flash (Gemini 3.6 Flash)",
+]
+
+
+def _parse_model(choice: str):
+    """Return a model ID, or None for Auto."""
+    if not choice or choice.startswith("Auto"):
+        return None
+    return choice.split(" (")[0].strip() or None
+
+
 def verify_gemini_api_key(user_api_key: str):
     """Lightweight live check that a Gemini API key actually works.
 
@@ -172,6 +188,7 @@ voice_choice = st.radio("🎙️ မြန်မာ AI အသံ ရွေးပ
 aspect_choice = st.radio("📐 Aspect Ratio ရွေးပါ", ASPECT_CHOICES, index=0)
 bg_volume = st.slider("🔊 မူရင်းနောက်ခံအသံ အတိုးအကျယ်", 0.0, 0.5, 0.15, 0.05)
 burn_subtitles = st.checkbox("💬 မြန်မာစာတန်းထိုး Burn-in ထည့်မည်", value=True)
+model_choice = st.selectbox("🤖 AI Model ရွေးပါ", MODEL_OPTIONS, index=0)
 
 run_btn = st.button("🎬 Recap ဗီဒီယို ထုတ်လုပ်မည်", type="primary")
 
@@ -222,6 +239,7 @@ if run_btn:
                 output_name="recap.mp4",
                 use_mock_plan=bool(demo_mode),
                 tts_proxy=tts_proxy,
+                model=_parse_model(model_choice),
             )
         status = (
             f"✅ ပြီးဆုံးပါပြီ! | {result['aspect_ratio']} | "

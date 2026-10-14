@@ -10,12 +10,14 @@ no literal key string appears in this file by design.
 Public functions
 ----------------
 - analyze_video_for_recap(video_path, user_api_key, target_duration=30,
-    style="စိတ်ဝင်စားဖွယ် ဇာတ်လမ်းအကျဉ်းချုပ်")
+    style="စိတ်ဝင်စားဖွယ် ဇာတ်လမ်းအကျဉ်းချုပ်", model=None)
     Uploads the video to the user's own Gemini Files storage, waits until it
     is ACTIVE, asks Gemini for a recap plan as strict JSON, validates the
     timestamps against the real video duration, then ALWAYS deletes the
     remote file in a ``finally:`` block so the user's free cloud storage
-    does not fill up.
+    does not fill up. ``model`` optionally pins one model ID (tried first);
+    otherwise the free-tier MODEL_CANDIDATES are tried in order, then any
+    other flash model the key can access (live discovery).
 - validate_recap_plan(plan_dict, video_duration)
     Clamps every highlight's start/end into [0, video_duration], drops
     invalid segments, sorts by start time.
@@ -39,8 +41,26 @@ MISSING_KEY_MSG = "ကျေးဇူးပြု၍ သင်၏ Free Gemini AP
 
 DEFAULT_STYLE = "စိတ်ဝင်စားဖွယ် ဇာတ်လမ်းအကျဉ်းချုပ်"
 
-# Preferred model first; auto-fallback if a model is unavailable for the key.
-MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+# Preferred models first (verified free-tier, Oct 2026); auto-fallback if a
+# model is unavailable for the key. Sources: Google Gemini Developer API
+# pricing page snapshots (Oct 2026) — gemini-3.8-flash, gemini-3.6-flash,
+# gemini-3.5-flash-lite, gemini-3.1-flash-lite, gemini-3-flash-preview are
+# "Free of charge"; gemini-2.5-* remain only for keys that used them before.
+# "gemini-flash-latest" is a last-resort alias; harmless if it 404s (skipped).
+MODEL_CANDIDATES = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-flash-latest",
+]
+
+# Model-name fragments that must NOT be auto-picked by dynamic discovery
+# (image/audio/live/TTS/transcribe/embedding variants can't do this job).
+_NON_TEXT_FLASH_HINTS = (
+    "image", "audio", "live", "tts", "transcribe", "embedding", "aqa",
+)
 
 # Strict JSON schema for the recap plan.
 RECAP_JSON_SCHEMA: Dict[str, Any] = {
@@ -89,6 +109,33 @@ def _looks_like_model_error(exc: Exception) -> bool:
             "model is not supported", "invalid model", "not available",
         )
     )
+
+
+def _discover_flash_models(client: genai.Client,
+                           already_tried: List[str]) -> List[str]:
+    """Dynamically find usable flash models via the API's own model list.
+
+    Returns short model IDs (e.g. "gemini-3.8-flash") containing "flash"
+    that this key can see, excluding already-tried ones and non-text
+    variants (image/audio/live/TTS/...). Never raises — returns [] if the
+    list call itself fails.
+    """
+    try:
+        found: List[str] = []
+        for m in client.models.list():
+            full = getattr(m, "name", "") or ""
+            short = full.split("/")[-1]
+            low = short.lower()
+            if "flash" not in low:
+                continue
+            if short in already_tried or short in found:
+                continue
+            if any(h in low for h in _NON_TEXT_FLASH_HINTS):
+                continue
+            found.append(short)
+        return found
+    except Exception:
+        return []
 
 
 def _wait_for_active(client: genai.Client, file_name: str,
@@ -141,8 +188,13 @@ def analyze_video_for_recap(
     user_api_key: str,
     target_duration: int = 30,
     style: str = DEFAULT_STYLE,
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Analyze a video with the USER's own Gemini key; return a recap plan.
+
+    ``model`` optionally pins one model ID (tried first). Otherwise the
+    static MODEL_CANDIDATES are tried in order, then any other flash model
+    the key can access (discovered live via ``client.models.list()``).
 
     The uploaded remote file is always deleted in a ``finally:`` block.
     """
@@ -158,12 +210,25 @@ def analyze_video_for_recap(
         _wait_for_active(client, uploaded.name)
         prompt = _build_prompt(target_duration, style)
 
+        # Candidate order: explicit user pick -> static list -> dynamic.
+        candidates: List[str] = []
+        pinned = (model or "").strip()
+        if pinned and pinned.lower() != "auto":
+            candidates.append(pinned)
+        for m in MODEL_CANDIDATES:
+            if m not in candidates:
+                candidates.append(m)
+
         plan: Optional[Dict[str, Any]] = None
         last_err: Optional[Exception] = None
-        for model in MODEL_CANDIDATES:
+        tried: List[str] = []
+
+        def _try_generate(mid: str) -> bool:
+            nonlocal plan, last_err
+            tried.append(mid)
             try:
                 resp = client.models.generate_content(
-                    model=model,
+                    model=mid,
                     contents=[uploaded, prompt],
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
@@ -171,12 +236,22 @@ def analyze_video_for_recap(
                     ),
                 )
                 plan = json.loads(resp.text)
-                break
+                return True
             except Exception as exc:  # noqa: BLE001 - inspected below
                 if _looks_like_model_error(exc):
                     last_err = exc
-                    continue
+                    return False
                 raise
+
+        for mid in candidates:
+            if _try_generate(mid):
+                break
+        if plan is None:
+            # Dynamic fallback: ask the API which flash models this key
+            # can actually use, and try each of them.
+            for mid in _discover_flash_models(client, tried):
+                if _try_generate(mid):
+                    break
         if plan is None:
             raise AnalyzerError(
                 "AI model နှင့် ချိတ်ဆက်၍ မရပါ။ "
