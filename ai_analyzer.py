@@ -101,12 +101,22 @@ def _require_key(user_api_key: Any) -> str:
 
 
 def _looks_like_model_error(exc: Exception) -> bool:
+    """True if another model in the fallback chain is worth trying.
+
+    Covers: model doesn't exist for this key (404/not-found), the key's
+    quota for this model is exhausted (429/rate-limit), and the model is
+    temporarily overloaded (503/high-demand). A 400-class bad request
+    (bad video, bad schema) is NOT matched — it raises immediately.
+    """
     msg = str(exc).lower()
     return any(
         token in msg
         for token in (
-            "404", "not_found", "not found", "unknown model",
+            "404", "429", "503",
+            "not_found", "not found", "unknown model",
             "model is not supported", "invalid model", "not available",
+            "rate limit", "rate_limit", "high demand", "overloaded",
+            "unavailable",
         )
     )
 
