@@ -13,6 +13,8 @@ tempfile.mkdtemp(), so concurrent users never overwrite each other's files.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import tempfile
@@ -21,6 +23,7 @@ import traceback
 import streamlit as st
 from streamlit_js_eval import streamlit_js_eval
 
+from canvas_component import CANVAS_DEFAULT, interactive_canvas
 from pipeline import run_full_recap_pipeline
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -112,6 +115,18 @@ if "api_key" not in st.session_state:
 if "key_restored" not in st.session_state:
     st.session_state["key_restored"] = False
 
+# Step 11 canvas state (survives reruns; reset when the video changes).
+if "canvas_blur" not in st.session_state:
+    st.session_state["canvas_blur"] = []
+if "canvas_sub" not in st.session_state:
+    st.session_state["canvas_sub"] = dict(CANVAS_DEFAULT["subtitle"])
+if "uploader_nonce" not in st.session_state:
+    st.session_state["uploader_nonce"] = 0
+if "canvas_vid" not in st.session_state:
+    st.session_state["canvas_vid"] = None
+if "canvas_vid_sent" not in st.session_state:
+    st.session_state["canvas_vid_sent"] = None
+
 # Ask this browser for a previously saved key (cached after first answer).
 browser_saved = streamlit_js_eval(
     js_expressions=f"localStorage.getItem('{LS_KEY}')",
@@ -172,11 +187,13 @@ if forget_btn:
 demo_mode = st.checkbox(
     "🧪 API Key မပါဘဲ Demo စမ်းသပ်မည် (Mock Mode)",
     value=False,
+    key="demo_mode",
 )
 
 video_file = st.file_uploader(
     "📹 ဗီဒီယိုဖိုင် တင်ပါ",
     type=["mp4", "mov", "mkv", "avi", "webm"],
+    key=f"video_uploader_{st.session_state.get('uploader_nonce', 0)}",
 )
 video_url = st.text_input(
     "🔗 သို့မဟုတ် YouTube/Video URL ထည့်ပါ",
@@ -189,6 +206,74 @@ aspect_choice = st.radio("📐 Aspect Ratio ရွေးပါ", ASPECT_CHOICES,
 bg_volume = st.slider("🔊 မူရင်းနောက်ခံအသံ အတိုးအကျယ်", 0.0, 0.5, 0.15, 0.05)
 burn_subtitles = st.checkbox("💬 မြန်မာစာတန်းထိုး Burn-in ထည့်မည်", value=True)
 model_choice = st.selectbox("🤖 AI Model ရွေးပါ", MODEL_OPTIONS, index=0)
+
+# ---- Step 11: Interactive Main Canvas ----
+_sub_default = dict(CANVAS_DEFAULT["subtitle"])
+_canvas_video_id = None
+_canvas_data_url = None
+if video_file is not None:
+    _canvas_video_id = f"up_{video_file.file_id}"
+    if st.session_state.get("canvas_vid_sent") != _canvas_video_id:
+        _canvas_data_url = (
+            "data:video/mp4;base64,"
+            + base64.b64encode(video_file.getbuffer()).decode()
+        )
+elif demo_mode and os.path.isfile(DEMO_SAMPLE):
+    _canvas_video_id = "demo"
+    if st.session_state.get("canvas_vid_sent") != _canvas_video_id:
+        with open(DEMO_SAMPLE, "rb") as _f:
+            _canvas_data_url = (
+                "data:video/mp4;base64," + base64.b64encode(_f.read()).decode()
+            )
+elif (video_url or "").strip():
+    _u = (video_url or "").strip()
+    _canvas_video_id = "url_" + hashlib.md5(_u.encode()).hexdigest()[:12]
+    _canvas_data_url = _u  # direct URL as <video> src (best effort)
+
+if _canvas_video_id is not None:
+    if st.session_state.get("canvas_vid") != _canvas_video_id:
+        # A new video means a fresh canvas.
+        st.session_state["canvas_vid"] = _canvas_video_id
+        st.session_state["canvas_blur"] = []
+        st.session_state["canvas_sub"] = dict(_sub_default)
+    if _canvas_data_url is not None:
+        st.session_state["canvas_vid_sent"] = _canvas_video_id
+    st.markdown("### 📱 Main Canvas — ဗီဒီယို ပြင်ဆင်ရန်")
+    st.caption(
+        "✏️ Edit ကို နှိပ်ပြီး Blur ထည့်ခြင်း / စာတန်းနေရာ ရွှေ့ခြင်း တို့ကို "
+        "လုပ်နိုင်ပါတယ်။"
+    )
+    _val = interactive_canvas(
+        video_id=_canvas_video_id,
+        video_data_url=_canvas_data_url,
+        blur_boxes=st.session_state.get("canvas_blur") or [],
+        subtitle=st.session_state.get("canvas_sub") or dict(_sub_default),
+        subtitles_enabled=bool(burn_subtitles),
+        aspect=_parse_aspect(aspect_choice),
+        key="mmr_canvas",
+    )
+    if isinstance(_val, dict) and _val.get("action") == "remove_video":
+        # Canvas ✕: drop the current video and reset the canvas.
+        st.session_state["uploader_nonce"] = (
+            st.session_state.get("uploader_nonce", 0) + 1
+        )
+        st.session_state["demo_mode"] = False
+        st.session_state["canvas_blur"] = []
+        st.session_state["canvas_sub"] = dict(_sub_default)
+        st.session_state["canvas_vid"] = None
+        st.session_state["canvas_vid_sent"] = None
+        st.rerun()
+    if isinstance(_val, dict):
+        try:
+            st.session_state["canvas_blur"] = list(_val.get("blur_boxes") or [])
+            _s = _val.get("subtitle") or {}
+            st.session_state["canvas_sub"] = {
+                "x_pct": float(_s.get("x_pct", 0.5)),
+                "y_pct": float(_s.get("y_pct", 0.82)),
+                "font_size": int(_s.get("font_size", 22)),
+            }
+        except (TypeError, ValueError):
+            pass  # keep previous canvas state on malformed values
 
 run_btn = st.button("🎬 Recap ဗီဒီယို ထုတ်လုပ်မည်", type="primary")
 
@@ -223,6 +308,16 @@ if run_btn:
     # and keeps local/dev parity with app.py.
     tts_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
 
+    # Step 10/11: canvas edits flow into the render engine.
+    _sub = st.session_state.get("canvas_sub") or dict(CANVAS_DEFAULT["subtitle"])
+    _subtitle_config = {
+        "enabled": bool(burn_subtitles),
+        "x_pct": float(_sub.get("x_pct", 0.5)),
+        "y_pct": float(_sub.get("y_pct", 0.82)),
+        "font_size": int(_sub.get("font_size", 22)),
+    }
+    _blur_boxes = st.session_state.get("canvas_blur") or None
+
     try:
         with st.spinner("⏳ Recap ဗီဒီယို ထုတ်လုပ်နေပါတယ်… ခဏစောင့်ပေးပါ"):
             result = run_full_recap_pipeline(
@@ -240,6 +335,8 @@ if run_btn:
                 use_mock_plan=bool(demo_mode),
                 tts_proxy=tts_proxy,
                 model=_parse_model(model_choice),
+                blur_boxes=_blur_boxes,
+                subtitle_config=_subtitle_config,
             )
         status = (
             f"✅ ပြီးဆုံးပါပြီ! | {result['aspect_ratio']} | "

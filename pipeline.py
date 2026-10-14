@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from video_processor import get_video_metadata, prepare_video_source
 from ai_analyzer import (
@@ -58,6 +58,8 @@ def run_full_recap_pipeline(
     burn_subtitles: bool = True,
     tts_proxy: Optional[str] = None,
     model: Optional[str] = None,
+    blur_boxes: Optional[List[Dict]] = None,
+    subtitle_config: Optional[Dict] = None,
 ) -> Dict:
     """Run the full recap pipeline end to end.
 
@@ -128,6 +130,8 @@ def run_full_recap_pipeline(
         video_speed_factor=sync["video_speed_factor"],
         bg_volume=bg_volume,
         work_dir=work_dir,
+        blur_boxes=blur_boxes,
+        subtitle_config=subtitle_config,
     )
 
     # 6) cleanup temp fragments (keep final video + srt + voiceover)
@@ -156,4 +160,6 @@ def run_full_recap_pipeline(
         "sync_method": sync["method"],
         "video_speed_factor": sync["video_speed_factor"],
         "aspect_ratio": aspect_ratio,
+        "blur_boxes_applied": render.get("blur_boxes_applied", 0),
+        "subtitle_position": render.get("subtitle_position"),
     }
