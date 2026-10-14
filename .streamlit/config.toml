@@ -1,0 +1,12 @@
+# Streamlit Cloud + local config for the MM Recap app.
+#
+# The canvas sends the picked video through the component value
+# (WebSocket). Streamlit's default client-message limit is only 25 MB,
+# so a 30 MB video (~40 MB base64) was rejected and the connection
+# closed — the video never reached the server and Run did nothing.
+# Raise the limit so phone videos work; the app drops the payload
+# from state right after the server saves it (ack-clear), so the
+# large value is transient. The canvas also refuses files whose
+# base64 would exceed ~470 MB, with a clear in-canvas message.
+[server]
+maxWidgetStateSize = 500
