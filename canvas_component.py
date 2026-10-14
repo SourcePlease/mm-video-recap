@@ -666,15 +666,35 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 
 
 def _ensure_frontend_dir() -> str:
-    """Write the embedded frontend to a versioned temp dir and return it."""
+    """Write the embedded frontend to a versioned dir and return it.
+
+    Prefer a directory next to this module — the standard, most robust
+    location for Streamlit component serving (a stale-process reload can
+    otherwise leave the component pointing at a vanished temp path).
+    Fall back to the system temp dir if the app directory is not
+    writable.
+    """
     digest = hashlib.md5(_EMBEDDED_HTML.encode("utf-8")).hexdigest()[:12]
-    d = os.path.join(tempfile.gettempdir(), f"mmr_canvas_{digest}")
-    p = os.path.join(d, "index.html")
-    if not os.path.isfile(p):
-        os.makedirs(d, exist_ok=True)
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(_EMBEDDED_HTML)
-    return d
+    dirname = f"canvas_frontend_runtime_{digest}"
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), dirname),
+        os.path.join(tempfile.gettempdir(), f"mmr_canvas_{digest}"),
+    ]
+    last_exc: Optional[OSError] = None
+    for d in candidates:
+        try:
+            p = os.path.join(d, "index.html")
+            if not os.path.isfile(p):
+                os.makedirs(d, exist_ok=True)
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(_EMBEDDED_HTML)
+            return d
+        except OSError as exc:  # noqa: BLE001 - try the next candidate
+            last_exc = exc
+            continue
+    raise RuntimeError(
+        "could not write canvas frontend to any location"
+    ) from last_exc
 
 
 _canvas = components.declare_component(
