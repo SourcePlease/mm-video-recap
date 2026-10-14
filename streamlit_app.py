@@ -13,11 +13,13 @@ tempfile.mkdtemp(), so concurrent users never overwrite each other's files.
 """
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import traceback
 
 import streamlit as st
+from streamlit_js_eval import streamlit_js_eval
 
 from pipeline import run_full_recap_pipeline
 
@@ -61,13 +63,96 @@ def _parse_aspect(choice: str) -> str:
     return "9:16" if (choice or "").startswith("9:16") else "16:9"
 
 
+def verify_gemini_api_key(user_api_key: str):
+    """Lightweight live check that a Gemini API key actually works.
+
+    Returns (ok, message). Makes exactly one tiny API call (first page of
+    the model list) — no video is uploaded and (almost) no tokens are spent.
+    """
+    key = (user_api_key or "").strip()
+    if not key:
+        return False, "❌ API Key ထည့်သွင်းပေးပါ"
+    try:
+        from google import genai
+
+        client = genai.Client(api_key=key)
+        # Force exactly one small HTTP request; any auth/network failure
+        # raises here, which means the key is not usable.
+        next(iter(client.models.list()), None)
+        return True, "✅ API Key မှန်ကန်ပါသည်"
+    except Exception:  # noqa: BLE001 - any failure means the key can't be used
+        return (
+            False,
+            "❌ API Key မှားယွင်းနေပါသည် သို့မဟုတ် အလုပ်မလုပ်ပါ။ "
+            "Key အမှန်ကို ပြန်စစ်ပေးပါ",
+        )
+
+
+# Browser-local key storage (per-user, never touches our server).
+LS_KEY = "mmr_gemini_api_key"
+
+if "api_key" not in st.session_state:
+    st.session_state["api_key"] = ""
+if "key_restored" not in st.session_state:
+    st.session_state["key_restored"] = False
+
+# Ask this browser for a previously saved key (cached after first answer).
+browser_saved = streamlit_js_eval(
+    js_expressions=f"localStorage.getItem('{LS_KEY}')",
+    key="mmr_key_load",
+)
+if browser_saved and not st.session_state["key_restored"]:
+    st.session_state["api_key"] = browser_saved  # before widget creation
+    st.session_state["key_restored"] = True
+
 st.markdown(HEADER)
 
-api_key = st.text_input(
+key_input = st.text_input(
     "🔑 သင်၏ Free Gemini API Key ထည့်ပါ",
     type="password",
+    value=st.session_state["api_key"],
     placeholder="AIza...",
+    key="api_key_box",
 )
+# Plain source of truth (the widget above owns "api_key_box").
+st.session_state["api_key"] = key_input
+
+if browser_saved and st.session_state["api_key"] == browser_saved:
+    st.info("🟢 သိမ်းဆည်းထားသော API Key အသင့်ရှိနေပါသည်")
+
+key_col1, key_col2 = st.columns(2)
+with key_col1:
+    verify_save_btn = st.button("✅ API Key စစ်ဆေးပြီး Browser မှာ သိမ်းမည်")
+with key_col2:
+    forget_btn = st.button("🗑️ သိမ်းထားသော Key ဖျက်မည်")
+
+if verify_save_btn:
+    _k = (st.session_state["api_key"] or "").strip()
+    _ok, _msg = verify_gemini_api_key(_k)
+    if _ok:
+        streamlit_js_eval(
+            js_expressions=f"localStorage.setItem('{LS_KEY}',{json.dumps(_k)})",
+            key="mmr_key_save",
+        )
+        st.success(
+            "✅ API Key မှန်ကန်ကြောင်း စစ်ဆေးပြီး "
+            "သင့် Browser တွင် သိမ်းဆည်းပြီးပါပြီ!"
+        )
+    else:
+        # Invalid key: show the error and do NOT save anything.
+        st.error(_msg)
+
+if forget_btn:
+    streamlit_js_eval(
+        js_expressions=f"localStorage.removeItem('{LS_KEY}')",
+        key="mmr_key_del",
+    )
+    st.session_state["api_key"] = ""
+    # Don't re-restore the (now stale) cached browser value on rerun.
+    st.session_state["key_restored"] = True
+    if "api_key_box" in st.session_state:
+        del st.session_state["api_key_box"]
+    st.rerun()
 demo_mode = st.checkbox(
     "🧪 API Key မပါဘဲ Demo စမ်းသပ်မည် (Mock Mode)",
     value=False,
@@ -91,7 +176,7 @@ burn_subtitles = st.checkbox("💬 မြန်မာစာတန်းထို
 run_btn = st.button("🎬 Recap ဗီဒီယို ထုတ်လုပ်မည်", type="primary")
 
 if run_btn:
-    key = (api_key or "").strip()
+    key = (st.session_state.get("api_key") or "").strip()
     url = (video_url or "").strip()
 
     if not demo_mode and not key:
