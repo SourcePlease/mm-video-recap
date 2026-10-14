@@ -162,8 +162,10 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 }
 .mmr-bdel {
   position: absolute;
-  top: -15px;
-  right: -15px;
+  /* Inside the box (not outside): the phone clips anything past its
+     edge, so an outside button would be unclickable at the edges. */
+  top: 4px;
+  right: 4px;
   width: 30px;
   height: 30px;
   border-radius: 50%;
@@ -177,8 +179,10 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 }
 .mmr-handle {
   position: absolute;
-  right: -14px;
-  bottom: -14px;
+  /* Inside the corner (not outside): the phone clips anything past its
+     edge, so an outside handle would be unclickable at the edges. */
+  right: 2px;
+  bottom: 2px;
   width: 28px;
   height: 28px;
   border-radius: 50%;
@@ -275,7 +279,9 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   }
 
   function post(type, payload) {
-    var msg = { type: type };
+    /* isStreamlitMessage is REQUIRED: Streamlit's ComponentRegistry
+       silently drops any message without it. */
+    var msg = { type: type, isStreamlitMessage: true };
     if (payload) {
       for (var k in payload) msg[k] = payload[k];
     }
@@ -364,7 +370,11 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     wireSubtitle();
     applyMode();
     fitHeight();
-    window.addEventListener("resize", fitHeight);
+    window.addEventListener("resize", function () {
+      fitHeight();
+      paintSubtitle();
+      S.boxes.forEach(paintBox);
+    });
   }
 
   /* ---------------- player ---------------- */
@@ -462,6 +472,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       b.el = d;
 
       var pill = el("div", "mmr-sliderpill", d);
+      b.pill = pill;
+      positionPill(b);
       var lab = el("span", "", pill);
       lab.textContent = "Blur";
       var rng = el("input", "", pill);
@@ -546,6 +558,18 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     }
   }
 
+  function positionPill(b) {
+    /* Pill floats above the box — unless the box is near the top edge,
+       where it would be clipped by the phone: then flip it below. */
+    if (!b.pill) return;
+    if (b.y < 0.09) {
+      b.pill.style.top = "calc(100% + 12px)";
+      b.pill.style.bottom = "auto";
+    } else {
+      b.pill.style.bottom = "calc(100% + 12px)";
+      b.pill.style.top = "auto";
+    }
+  }
   function paintBox(b) {
     if (!b.el) return;
     var g = boxGeom(b);
@@ -553,6 +577,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     b.el.style.top = g.y + "px";
     b.el.style.width = g.w + "px";
     b.el.style.height = g.h + "px";
+    positionPill(b);
   }
 
   /* ---------------- subtitle ---------------- */
@@ -606,7 +631,12 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     subEl.classList.toggle("mmr-hidden", !S.subsEnabled);
 
     var vid = S.args.video_id || null;
-    if (vid && vid !== S.videoId) {
+    /* A new video means a fresh canvas; otherwise the component's local
+       state is authoritative. Python passes PRE-adoption args on the
+       rerun triggered by our own setComponentValue, so adopting those
+       stale args would wipe the user's just-made edit. */
+    var isNewVideo = Boolean(vid && vid !== S.videoId);
+    if (isNewVideo) {
       S.videoId = vid;
       if (S.args.video_data_url) {
         video.src = S.args.video_data_url;
@@ -617,8 +647,9 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       }
     }
 
-    /* Adopt incoming state only when idle (never mid-gesture). */
-    if (!S.gesture) {
+    /* Adopt incoming state only for a new video (fresh canvas) and
+       never mid-gesture. */
+    if (!S.gesture && isNewVideo) {
       var inBoxes = (S.args.blur_boxes || []).map(function (b) {
         return { x: +b.x_pct || 0, y: +b.y_pct || 0,
                  w: +b.w_pct || 0, h: +b.h_pct || 0,
@@ -639,6 +670,11 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       }
     }
     S.lastSent = JSON.stringify(currentValue(null));
+    /* Repaint in px from the fractional state: the phone's size is only
+       real after the first render (before that it was display:none),
+       and it changes on window resize. */
+    if (S.editMode) renderBoxes();
+    paintSubtitle();
     fitHeight();
   }
 
