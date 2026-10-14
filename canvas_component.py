@@ -603,6 +603,17 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     var ok = /^video\//.test(file.type || "") ||
       /\.(mp4|mov|mkv|avi|webm|m4v)$/i.test(name);
     if (!ok) return;
+    /* The picked video travels through the component value
+       (WebSocket, server limit 500 MB in .streamlit/config.toml).
+       Base64 inflates it ~4/3, so refuse files whose payload would
+       exceed the limit instead of sending them (a send over the
+       limit kills the connection silently). */
+    if (file.size && file.size > 350 * 1024 * 1024) {
+      emptyHint.textContent =
+        "ဗီဒီယိုက အရမ်းကြီးနေတယ် (350MB ထက် မပိုရပါ)။ "
+        + "အရွယ်အစား သေးတဲ့ ဗီဒီယို ရွေးပေးပါ။";
+      return;
+    }
     /* Hide the empty overlay IMMEDIATELY (before the async FileReader
        finishes): otherwise the upload UI keeps covering the video and
        the subtitle, and the user can tap Edit/Add-blur on top of it. */

@@ -340,15 +340,30 @@ if isinstance(_val, dict):
 # ---- API Key (below the canvas) ----
 st.markdown(KEY_GUIDE)
 
+
+def _key_changed() -> None:
+    # Fires ONLY when the user actually edits the key box. Browser
+    # autofill does not trigger this, so a stale autofill ghost can
+    # never clobber the restored key. The restored key lives in
+    # "api_key" (a plain key); the box itself always starts empty.
+    st.session_state["api_key"] = st.session_state.get("api_key_box", "")
+
+
 key_input = st.text_input(
     "🔑 သင်၏ Free Gemini API Key ထည့်ပါ",
     type="password",
-    value=st.session_state["api_key"],
-    placeholder="AIza...",
+    # Always start empty: the restored key is shown via the blue note,
+    # never echoed back into the box (and an autofill ghost in the box
+    # must not become the app's key).
+    value="",
     key="api_key_box",
+    placeholder="AIza...",
+    on_change=_key_changed,
 )
-# Plain source of truth (the widget above owns "api_key_box").
-st.session_state["api_key"] = key_input
+# NOTE: do NOT copy key_input into api_key here. The box is empty on
+# every fresh load; copying it would wipe the localStorage-restored
+# key (the "enter the key every time" bug). api_key is set only by
+# the restore above and by _key_changed (a real user edit).
 
 if browser_saved and st.session_state["api_key"] == browser_saved:
     st.info("🟢 သိမ်းဆည်းထားသော API Key အသင့်ရှိနေပါသည်")
