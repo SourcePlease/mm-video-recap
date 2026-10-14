@@ -35,13 +35,15 @@ st.set_page_config(
     layout="centered",
 )
 
-HEADER = """\
+HEADER_TOP = """\
 # 🎬 100% Free Online Video Recap
 
 ဗီဒီယိုအရှည်ကြီးတွေကို **မြန်မာ AI အသံ** ဖြင့် အကျဉ်းချုပ်ပေးတဲ့ အခမဲ့စနစ်။
 သင့်ရဲ့ **ကိုယ်ပိုင် Free Gemini API Key** နဲ့သာ အလုပ်လုပ်ပါတယ် —
 Key ကို server မှာ သိမ်းထားခြင်း **လုံးဝမရှိပါ**။
+"""
 
+KEY_GUIDE = """\
 ### 🔑 Free Gemini API Key အခမဲ့ယူနည်း (၁ မိနစ်အတွင်း၊ ကတ်မလို)
 1. 👉 **[https://aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)** ကို နှိပ်ပါ
 2. **"Create API Key"** → **"Create API key in new project"** ကို ရွေးပါ
@@ -120,12 +122,29 @@ if "canvas_blur" not in st.session_state:
     st.session_state["canvas_blur"] = []
 if "canvas_sub" not in st.session_state:
     st.session_state["canvas_sub"] = dict(CANVAS_DEFAULT["subtitle"])
-if "uploader_nonce" not in st.session_state:
-    st.session_state["uploader_nonce"] = 0
 if "canvas_vid" not in st.session_state:
     st.session_state["canvas_vid"] = None
 if "canvas_vid_sent" not in st.session_state:
     st.session_state["canvas_vid_sent"] = None
+# Video source picked INSIDE the canvas (file) or entered there (URL).
+if "src_path" not in st.session_state:
+    st.session_state["src_path"] = None
+if "src_url" not in st.session_state:
+    st.session_state["src_url"] = None
+if "src_video_id" not in st.session_state:
+    st.session_state["src_video_id"] = None
+if "src_local_picked" not in st.session_state:
+    st.session_state["src_local_picked"] = False
+# The canvas phone follows the SOURCE video's own ratio ("1280 / 720").
+if "canvas_aspect" not in st.session_state:
+    st.session_state["canvas_aspect"] = "9 / 16"
+# Demo can be suppressed by the canvas ✕ (a plain flag — widget keys
+# like "demo_mode" cannot be written after the widget is created).
+if "demo_suppressed" not in st.session_state:
+    st.session_state["demo_suppressed"] = False
+# Persistent per-session dir for the canvas-picked source file.
+if "session_dir" not in st.session_state:
+    st.session_state["session_dir"] = tempfile.mkdtemp(prefix="recap_session_")
 
 # Ask this browser for a previously saved key (cached after first answer).
 browser_saved = streamlit_js_eval(
@@ -136,7 +155,176 @@ if browser_saved and not st.session_state["key_restored"]:
     st.session_state["api_key"] = browser_saved  # before widget creation
     st.session_state["key_restored"] = True
 
-st.markdown(HEADER)
+st.markdown(HEADER_TOP)
+
+def _demo_toggled() -> None:
+    # Re-arming the Demo checkbox clears a suppression set by canvas ✕.
+    st.session_state["demo_suppressed"] = False
+
+
+demo_mode = st.checkbox(
+    "🧪 API Key မပါဘဲ Demo စမ်းသပ်မည် (Mock Mode)",
+    value=False,
+    key="demo_mode",
+    on_change=_demo_toggled,
+)
+demo_active = bool(demo_mode) and not st.session_state.get("demo_suppressed")
+
+# ---- Step 11: Interactive Main Canvas (TOP; video input lives inside it) ----
+_sub_default = dict(CANVAS_DEFAULT["subtitle"])
+
+
+def _reset_canvas_state() -> None:
+    st.session_state["canvas_blur"] = []
+    st.session_state["canvas_sub"] = dict(_sub_default)
+
+
+# Source precedence matches the canvas display: picked file > demo > URL.
+_canvas_video_id = None
+_canvas_data_url = None
+_canvas_local_picked = False
+if st.session_state.get("src_path"):
+    _canvas_video_id = st.session_state.get("src_video_id")
+    _canvas_local_picked = True  # JS already holds this video; never re-send
+elif demo_active and os.path.isfile(DEMO_SAMPLE):
+    _canvas_video_id = "demo"
+    if st.session_state.get("canvas_vid_sent") != _canvas_video_id:
+        with open(DEMO_SAMPLE, "rb") as _f:
+            _canvas_data_url = (
+                "data:video/mp4;base64," + base64.b64encode(_f.read()).decode()
+            )
+elif (st.session_state.get("src_url") or "").strip():
+    _u = (st.session_state.get("src_url") or "").strip()
+    _canvas_video_id = "url_" + hashlib.md5(_u.encode()).hexdigest()[:12]
+    _canvas_data_url = _u  # direct URL as <video> src (best effort)
+
+# Demo video is 1280x720 by construction; other sources set the aspect
+# when they arrive (ffprobe for files, video_meta for URL videos).
+if _canvas_video_id == "demo":
+    st.session_state["canvas_aspect"] = "1280 / 720"
+
+if _canvas_video_id is not None:
+    if st.session_state.get("canvas_vid") != _canvas_video_id:
+        # A new video means a fresh canvas.
+        st.session_state["canvas_vid"] = _canvas_video_id
+        _reset_canvas_state()
+    if _canvas_data_url is not None:
+        st.session_state["canvas_vid_sent"] = _canvas_video_id
+else:
+    st.session_state["canvas_vid"] = None
+
+st.markdown("### 📱 Main Canvas — ဗီဒီယို ပြင်ဆင်ရန်")
+st.caption(
+    "📹 ဗီဒီယို မရှိသေးရင် Canvas ထဲမှာပဲ ရွေးပါ / URL ထည့်ပါ။ "
+    "✏️ Edit ကို နှိပ်ပြီး Blur ထည့်ခြင်း / စာတန်းနေရာ ရွှေ့ခြင်း တို့ကို "
+    "လုပ်နိုင်ပါတယ်။"
+)
+_val = interactive_canvas(
+    video_id=_canvas_video_id,
+    video_data_url=_canvas_data_url,
+    blur_boxes=st.session_state.get("canvas_blur") or [],
+    subtitle=st.session_state.get("canvas_sub") or dict(_sub_default),
+    subtitles_enabled=bool(st.session_state.get("burn_subtitles", True)),
+    canvas_aspect=st.session_state.get("canvas_aspect") or "9 / 16",
+    local_picked=_canvas_local_picked,
+    key="mmr_canvas",
+)
+if isinstance(_val, dict):
+    _action = _val.get("action")
+    # Actions are sticky: the component's last value is re-returned on
+    # every rerun, so consume each nonce exactly once.
+    _nonce = _val.get("nonce")
+    if _action and _nonce is not None:
+        if _nonce == st.session_state.get("last_canvas_nonce"):
+            _action = None  # already processed
+        else:
+            st.session_state["last_canvas_nonce"] = _nonce
+    if _action == "remove_video":
+        # Canvas ✕: drop the current video and reset the canvas.
+        st.session_state["src_path"] = None
+        st.session_state["src_url"] = None
+        st.session_state["src_video_id"] = None
+        st.session_state["src_local_picked"] = False
+        st.session_state["canvas_aspect"] = "9 / 16"
+        st.session_state["demo_suppressed"] = True
+        _reset_canvas_state()
+        st.session_state["canvas_vid"] = None
+        st.session_state["canvas_vid_sent"] = None
+        st.rerun()
+    elif _action == "video_selected":
+        # A file picked inside the canvas: save it, ffprobe its ratio.
+        try:
+            _data = _val.get("video_data") or ""
+            _mime, _, _b64 = _data.partition(";base64,")
+            _raw = base64.b64decode(_b64)
+            _ext = {
+                "data:video/mp4": "mp4",
+                "data:video/quicktime": "mov",
+                "data:video/webm": "webm",
+                "data:video/x-matroska": "mkv",
+                "data:video/avi": "avi",
+                "data:video/x-m4v": "m4v",
+            }.get(_mime, "mp4")
+            _dst = os.path.join(
+                st.session_state["session_dir"], f"input.{_ext}"
+            )
+            with open(_dst, "wb") as _f:
+                _f.write(_raw)
+            st.session_state["src_path"] = _dst
+            st.session_state["src_url"] = None
+            st.session_state["src_video_id"] = _val.get("video_id")
+            st.session_state["src_local_picked"] = True
+            st.session_state["canvas_vid_sent"] = _val.get("video_id")
+            try:
+                from video_processor import get_video_metadata
+
+                _meta = get_video_metadata(_dst)
+                if _meta.get("width") and _meta.get("height"):
+                    st.session_state["canvas_aspect"] = (
+                        f"{_meta['width']} / {_meta['height']}"
+                    )
+            except Exception:  # noqa: BLE001 - aspect stays at the default
+                pass
+            _reset_canvas_state()
+        except Exception:  # noqa: BLE001 - bad payload: keep previous state
+            st.error("❌ ဗီဒီယိုဖိုင် ဖတ်လို့ မရပါ။ ထပ်ကြိုးစားပေးပါ")
+        st.rerun()
+    elif _action == "video_url":
+        _u = (_val.get("video_url") or "").strip()
+        if _u:
+            st.session_state["src_url"] = _u
+            st.session_state["src_path"] = None
+            st.session_state["src_video_id"] = None
+            st.session_state["src_local_picked"] = False
+            st.session_state["canvas_aspect"] = "9 / 16"
+            _reset_canvas_state()
+        st.rerun()
+    elif _action == "video_meta":
+        # URL video's real dimensions -> canvas follows its ratio.
+        if (
+            _val.get("video_id") == st.session_state.get("canvas_vid")
+            and _val.get("video_w")
+            and _val.get("video_h")
+        ):
+            st.session_state["canvas_aspect"] = (
+                f"{int(_val['video_w'])} / {int(_val['video_h'])}"
+            )
+            st.rerun()
+    # Adopt the canvas's current edit state (no-op for action values
+    # that already carry the reset state).
+    try:
+        st.session_state["canvas_blur"] = list(_val.get("blur_boxes") or [])
+        _s = _val.get("subtitle") or {}
+        st.session_state["canvas_sub"] = {
+            "x_pct": float(_s.get("x_pct", 0.5)),
+            "y_pct": float(_s.get("y_pct", 0.82)),
+            "font_size": int(_s.get("font_size", 22)),
+        }
+    except (TypeError, ValueError):
+        pass  # keep previous canvas state on malformed values
+
+# ---- API Key (below the canvas) ----
+st.markdown(KEY_GUIDE)
 
 key_input = st.text_input(
     "🔑 သင်၏ Free Gemini API Key ထည့်ပါ",
@@ -184,125 +372,44 @@ if forget_btn:
     if "api_key_box" in st.session_state:
         del st.session_state["api_key_box"]
     st.rerun()
-demo_mode = st.checkbox(
-    "🧪 API Key မပါဘဲ Demo စမ်းသပ်မည် (Mock Mode)",
-    value=False,
-    key="demo_mode",
-)
-
-video_file = st.file_uploader(
-    "📹 ဗီဒီယိုဖိုင် တင်ပါ",
-    type=["mp4", "mov", "mkv", "avi", "webm"],
-    key=f"video_uploader_{st.session_state.get('uploader_nonce', 0)}",
-)
-video_url = st.text_input(
-    "🔗 သို့မဟုတ် YouTube/Video URL ထည့်ပါ",
-    placeholder="https://www.youtube.com/watch?v=...",
-)
 
 recap_length = st.slider("🎞️ Recap အရှည် (စက္ကန့်)", 15, 120, 30, 5)
 voice_choice = st.radio("🎙️ မြန်မာ AI အသံ ရွေးပါ", VOICE_CHOICES, index=0)
 aspect_choice = st.radio("📐 Aspect Ratio ရွေးပါ", ASPECT_CHOICES, index=0)
 bg_volume = st.slider("🔊 မူရင်းနောက်ခံအသံ အတိုးအကျယ်", 0.0, 0.5, 0.15, 0.05)
-burn_subtitles = st.checkbox("💬 မြန်မာစာတန်းထိုး Burn-in ထည့်မည်", value=True)
+burn_subtitles = st.checkbox(
+    "💬 မြန်မာစာတန်းထိုး Burn-in ထည့်မည်",
+    value=True,
+    key="burn_subtitles",
+)
 model_choice = st.selectbox("🤖 AI Model ရွေးပါ", MODEL_OPTIONS, index=0)
-
-# ---- Step 11: Interactive Main Canvas ----
-_sub_default = dict(CANVAS_DEFAULT["subtitle"])
-_canvas_video_id = None
-_canvas_data_url = None
-if video_file is not None:
-    _canvas_video_id = f"up_{video_file.file_id}"
-    if st.session_state.get("canvas_vid_sent") != _canvas_video_id:
-        _canvas_data_url = (
-            "data:video/mp4;base64,"
-            + base64.b64encode(video_file.getbuffer()).decode()
-        )
-elif demo_mode and os.path.isfile(DEMO_SAMPLE):
-    _canvas_video_id = "demo"
-    if st.session_state.get("canvas_vid_sent") != _canvas_video_id:
-        with open(DEMO_SAMPLE, "rb") as _f:
-            _canvas_data_url = (
-                "data:video/mp4;base64," + base64.b64encode(_f.read()).decode()
-            )
-elif (video_url or "").strip():
-    _u = (video_url or "").strip()
-    _canvas_video_id = "url_" + hashlib.md5(_u.encode()).hexdigest()[:12]
-    _canvas_data_url = _u  # direct URL as <video> src (best effort)
-
-if _canvas_video_id is not None:
-    if st.session_state.get("canvas_vid") != _canvas_video_id:
-        # A new video means a fresh canvas.
-        st.session_state["canvas_vid"] = _canvas_video_id
-        st.session_state["canvas_blur"] = []
-        st.session_state["canvas_sub"] = dict(_sub_default)
-    if _canvas_data_url is not None:
-        st.session_state["canvas_vid_sent"] = _canvas_video_id
-    st.markdown("### 📱 Main Canvas — ဗီဒီယို ပြင်ဆင်ရန်")
-    st.caption(
-        "✏️ Edit ကို နှိပ်ပြီး Blur ထည့်ခြင်း / စာတန်းနေရာ ရွှေ့ခြင်း တို့ကို "
-        "လုပ်နိုင်ပါတယ်။"
-    )
-    _val = interactive_canvas(
-        video_id=_canvas_video_id,
-        video_data_url=_canvas_data_url,
-        blur_boxes=st.session_state.get("canvas_blur") or [],
-        subtitle=st.session_state.get("canvas_sub") or dict(_sub_default),
-        subtitles_enabled=bool(burn_subtitles),
-        aspect=_parse_aspect(aspect_choice),
-        key="mmr_canvas",
-    )
-    if isinstance(_val, dict) and _val.get("action") == "remove_video":
-        # Canvas ✕: drop the current video and reset the canvas.
-        st.session_state["uploader_nonce"] = (
-            st.session_state.get("uploader_nonce", 0) + 1
-        )
-        st.session_state["demo_mode"] = False
-        st.session_state["canvas_blur"] = []
-        st.session_state["canvas_sub"] = dict(_sub_default)
-        st.session_state["canvas_vid"] = None
-        st.session_state["canvas_vid_sent"] = None
-        st.rerun()
-    if isinstance(_val, dict):
-        try:
-            st.session_state["canvas_blur"] = list(_val.get("blur_boxes") or [])
-            _s = _val.get("subtitle") or {}
-            st.session_state["canvas_sub"] = {
-                "x_pct": float(_s.get("x_pct", 0.5)),
-                "y_pct": float(_s.get("y_pct", 0.82)),
-                "font_size": int(_s.get("font_size", 22)),
-            }
-        except (TypeError, ValueError):
-            pass  # keep previous canvas state on malformed values
 
 run_btn = st.button("🎬 Recap ဗီဒီယို ထုတ်လုပ်မည်", type="primary")
 
 if run_btn:
     key = (st.session_state.get("api_key") or "").strip()
-    url = (video_url or "").strip()
 
-    if not demo_mode and not key:
+    if not demo_active and not key:
         st.error("❌ ကျေးဇူးပြု၍ သင်၏ Free Gemini API Key ကို ထည့်သွင်းပေးပါ")
         st.stop()
-    if not video_file and not url and not demo_mode:
-        st.error("❌ ဗီဒီယိုဖိုင် တင်ပေးပါ သို့မဟုတ် Video URL ထည့်ပေးပါ")
-        st.stop()
 
-    # Per-run isolated working directory (multi-user safety).
-    session_dir = tempfile.mkdtemp(prefix="recap_session_")
-
-    src_path = None
-    src_url = url or None
-    if video_file is not None:
-        src_path = os.path.join(session_dir, "input.mp4")
-        with open(src_path, "wb") as f:
-            f.write(video_file.getbuffer())
-    elif demo_mode and not src_url:
+    # Source precedence matches the canvas display: picked file > demo > URL.
+    src_path = st.session_state.get("src_path") or None
+    src_url = (st.session_state.get("src_url") or "").strip() or None
+    if src_path:
+        src_url = None
+    elif demo_active and not src_url:
         if os.path.isfile(DEMO_SAMPLE):
             src_path = DEMO_SAMPLE
         else:
             st.error("❌ Demo video မရှိပါ")
             st.stop()
+    if not src_path and not src_url:
+        st.error("❌ Canvas ထဲမှာ ဗီဒီယို ရွေးပေးပါ သို့မဟုတ် Video URL ထည့်ပေးပါ")
+        st.stop()
+
+    # Per-run isolated working directory (multi-user safety).
+    session_dir = tempfile.mkdtemp(prefix="recap_session_")
 
     # Streamlit Cloud has no egress proxy; the env lookup is harmless there
     # and keeps local/dev parity with app.py.
@@ -332,7 +439,7 @@ if run_btn:
                 work_dir=session_dir,
                 output_dir=session_dir,
                 output_name="recap.mp4",
-                use_mock_plan=bool(demo_mode),
+                use_mock_plan=bool(demo_active),
                 tts_proxy=tts_proxy,
                 model=_parse_model(model_choice),
                 blur_boxes=_blur_boxes,

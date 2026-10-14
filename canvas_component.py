@@ -14,10 +14,13 @@ string by hand.
 Value shape returned to Python:
     {"blur_boxes": [{"x_pct","y_pct","w_pct","h_pct","strength"}, ...],
      "subtitle": {"x_pct","y_pct","font_size"},
-     "action": None | "remove_video"}
+     "action": None | "remove_video" | "video_selected" | "video_url" | "video_meta",
+     ... plus action-specific fields (video_data/video_name/video_id,
+     video_url, video_w/video_h).}
 
 The component only sends a value after the user acts (drag end, slider
-release, add/delete, remove). Until then the caller sees ``default``.
+release, add/delete, remove, pick file, submit URL). Until then the
+caller sees ``default``.
 """
 from __future__ import annotations
 
@@ -49,13 +52,12 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 .mmr-phone {
   position: relative;
   width: min(400px, 100%);
-  aspect-ratio: 9 / 16;
+  aspect-ratio: 9 / 16; /* default; JS overrides with the video's own ratio */
   border-radius: 28px;
   overflow: hidden;
   background: #000;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
 }
-.mmr-phone.wide { aspect-ratio: 16 / 9; }
 .mmr-video {
   position: absolute;
   inset: 0;
@@ -97,7 +99,63 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 .mmr-editbtn { right: 14px; }
 .mmr-addblur { left: 14px; }
 .mmr-done { right: 14px; }
-/* ---------- player bar ---------- */
+/* ---------- empty state (no video yet): upload inside the canvas ---------- */
+.mmr-empty {
+  position: absolute;
+  inset: 0;
+  z-index: 35;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 28px 22px;
+  text-align: center;
+  background: linear-gradient(180deg, rgba(30, 38, 60, 0.92), rgba(12, 16, 28, 0.94));
+  color: #fff;
+}
+.mmr-empty.mmr-drag {
+  background: linear-gradient(180deg, rgba(40, 90, 180, 0.92), rgba(20, 40, 90, 0.94));
+  outline: 3px dashed rgba(255, 255, 255, 0.8);
+  outline-offset: -10px;
+}
+.mmr-empty-icon { font-size: 52px; line-height: 1; }
+.mmr-empty-title { font-size: 19px; font-weight: 700; }
+.mmr-empty-btn {
+  border: none;
+  cursor: pointer;
+  padding: 13px 26px;
+  border-radius: 999px;
+  background: #fff;
+  color: #111;
+  font-size: 16px;
+  font-weight: 700;
+}
+.mmr-empty-or { opacity: 0.7; font-size: 14px; }
+.mmr-empty-urlrow { display: flex; gap: 8px; width: 100%; }
+.mmr-empty-url {
+  flex: 1;
+  min-width: 0;
+  padding: 11px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  font-size: 14px;
+  outline: none;
+}
+.mmr-empty-url::placeholder { color: rgba(255, 255, 255, 0.6); }
+.mmr-empty-go {
+  border: none;
+  cursor: pointer;
+  padding: 11px 18px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.22);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 700;
+}
+.mmr-empty-hint { opacity: 0.65; font-size: 13px; }
 .mmr-player {
   position: absolute;
   left: 12px;
@@ -220,7 +278,9 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 /* ---------- subtitle ---------- */
 .mmr-subtitle {
   position: absolute;
-  z-index: 15;
+  /* ABOVE the blur boxes (z 20): the subtitle must never be covered
+     by a blur box, in the preview or in the final video. */
+  z-index: 30;
   transform: translate(-50%, -100%);
   color: #fff;
   font-weight: 700;
@@ -265,8 +325,12 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     sub: { x: 0.5, y: 0.82, fs: 22 },
     editMode: false,
     videoId: null,
+    hasVideo: false,
+    localPicked: false,
+    metaSentFor: null,
     gesture: null,
     lastSent: "",
+    nonceCounter: 0,
     subsEnabled: true,
   };
 
@@ -305,17 +369,41 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     };
   }
 
-  function sendValue(action) {
-    var s = JSON.stringify(currentValue(action));
+  function sendValue(action, extra) {
+    var v = currentValue(action);
+    if (extra) {
+      for (var k in extra) v[k] = extra[k];
+    }
+    if (action) {
+      /* Every real action carries a fresh nonce: the component's last
+         value is re-returned on every rerun, so without it Python
+         would re-process the same action (e.g. re-save the same file,
+         re-clear the same video) forever. Plain state (action null)
+         stays nonce-free so the dedup below still works. */
+      S.nonceCounter += 1;
+      v.nonce = S.nonceCounter;
+    }
+    var s = JSON.stringify(v);
     if (s !== S.lastSent) {
       S.lastSent = s;
-      post("streamlit:setComponentValue", { value: currentValue(action) });
+      post("streamlit:setComponentValue", { value: v });
     }
+  }
+
+  /* Fresh canvas for a newly picked / newly entered video. */
+  function resetForNewVideo() {
+    S.boxes = [];
+    S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct, fs: DEFAULT_SUB.font_size };
+    S.editMode = false;
+    renderBoxes();
+    paintSubtitle();
+    applyMode();
   }
 
   /* ---------------- DOM ---------------- */
   var wrap, phone, video, player, btnPlay, prog, progFill, timeEl,
-      btnMute, btnFs, btnX, btnEdit, btnAddBlur, btnDone, subEl, subHandle;
+      btnMute, btnFs, btnX, btnEdit, btnAddBlur, btnDone, subEl, subHandle,
+      emptyEl, emptyUrl, fileInput;
 
   function el(tag, cls, parent) {
     var e = document.createElement(tag);
@@ -365,10 +453,36 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     btnFs = el("button", "mmr-pbtn", player);
     btnFs.textContent = "\u26F6";
 
+    /* Empty state: the video input lives INSIDE the canvas. */
+    emptyEl = el("div", "mmr-empty", phone);
+    var emptyIcon = el("div", "mmr-empty-icon", emptyEl);
+    emptyIcon.textContent = "\uD83D\uDCF9";
+    var emptyTitle = el("div", "mmr-empty-title", emptyEl);
+    emptyTitle.textContent = "ဗီဒီယို ရွေးပါ";
+    var emptyBtn = el("button", "mmr-empty-btn", emptyEl);
+    emptyBtn.textContent = "ဗီဒီယို ရွေးပါ";
+    var emptyOr = el("div", "mmr-empty-or", emptyEl);
+    emptyOr.textContent = "\u2014 \u101E\u102D\u102F\u1037\u1019\u101F\u102F\u1010\u103A \u2014";
+    var urlRow = el("div", "mmr-empty-urlrow", emptyEl);
+    emptyUrl = el("input", "mmr-empty-url", urlRow);
+    emptyUrl.type = "text";
+    emptyUrl.placeholder = "YouTube / Video URL";
+    var emptyGo = el("button", "mmr-empty-go", urlRow);
+    emptyGo.textContent = "\u1016\u103D\u1004\u103A\u1037\u1019\u100A\u103A";
+    var emptyHint = el("div", "mmr-empty-hint", emptyEl);
+    emptyHint.textContent = "\u1016\u102D\u102F\u1004\u103A\u1000\u102D\u102F \u1012\u102E\u1014\u1031\u101B\u102C\u1019\u103E\u102C \u1001\u103B\u101C\u102D\u102F\u1000\u103A\u1015\u102B";
+
+    fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = "video/*";
+    fileInput.style.display = "none";
+    document.body.appendChild(fileInput);
+
     wirePlayer();
     wireTopButtons();
     wireSubtitle();
-    applyMode();
+    wireEmptyState();
+    applyEmpty();
     fitHeight();
     window.addEventListener("resize", function () {
       fitHeight();
@@ -392,6 +506,17 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     video.addEventListener("loadedmetadata", function () {
       timeEl.textContent = fmt(0) + " / " + fmt(video.duration || 0);
       fitHeight();
+      /* URL videos only: report real dimensions so Python can size
+         the canvas to the video's ratio. Local files are ffprobed
+         server-side, so they never send this. */
+      if (!S.localPicked && video.src && /^https?:/.test(video.src) &&
+          video.videoWidth > 0 && S.metaSentFor !== S.videoId) {
+        S.metaSentFor = S.videoId;
+        sendValue("video_meta", {
+          video_id: S.videoId,
+          video_w: video.videoWidth, video_h: video.videoHeight,
+        });
+      }
     });
     var seeking = false;
     function seekTo(clientX) {
@@ -416,6 +541,87 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       if (document.fullscreenElement) { document.exitFullscreen(); }
       else if (phone.requestFullscreen) { phone.requestFullscreen(); }
     });
+  }
+
+  /* ---------------- empty state: video input inside the canvas ---------------- */
+  function wireEmptyState() {
+    emptyEl.querySelector(".mmr-empty-btn").addEventListener("click", function () {
+      fileInput.click();
+    });
+    fileInput.addEventListener("change", function () {
+      if (fileInput.files && fileInput.files[0]) {
+        handlePickedFile(fileInput.files[0]);
+      }
+      fileInput.value = "";
+    });
+    function submitUrl() {
+      var u = (emptyUrl.value || "").trim();
+      if (!u) return;
+      resetForNewVideo();
+      S.localPicked = false;
+      sendValue("video_url", { video_url: u });
+    }
+    emptyEl.querySelector(".mmr-empty-go").addEventListener("click", submitUrl);
+    emptyUrl.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") submitUrl();
+    });
+    /* Drag & drop a video file onto the canvas (not in Edit mode). */
+    phone.addEventListener("dragover", function (e) {
+      if (S.editMode) return;
+      e.preventDefault();
+      emptyEl.classList.add("mmr-drag");
+    });
+    phone.addEventListener("dragleave", function () {
+      emptyEl.classList.remove("mmr-drag");
+    });
+    phone.addEventListener("drop", function (e) {
+      e.preventDefault();
+      emptyEl.classList.remove("mmr-drag");
+      if (S.editMode) return;
+      var files = e.dataTransfer && e.dataTransfer.files;
+      if (files && files[0]) handlePickedFile(files[0]);
+    });
+  }
+
+  function handlePickedFile(file) {
+    if (!file) return;
+    var name = file.name || "video";
+    var ok = /^video\//.test(file.type || "") ||
+      /\.(mp4|mov|mkv|avi|webm|m4v)$/i.test(name);
+    if (!ok) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      var dataUrl = reader.result;
+      /* Fresh canvas for the new video; id is stable for this file. */
+      resetForNewVideo();
+      S.localPicked = true;
+      S.metaSentFor = null;
+      var vid = "js_" + name.replace(/[^A-Za-z0-9._-]+/g, "_") +
+        "_" + file.size + "_" + (file.lastModified || 0);
+      S.videoId = vid;
+      S.hasVideo = true;
+      video.src = dataUrl;
+      video.load();
+      sendValue("video_selected", {
+        video_id: vid, video_data: dataUrl, video_name: name,
+      });
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function applyEmpty() {
+    var empty = !S.hasVideo;
+    emptyEl.classList.toggle("mmr-hidden", !empty);
+    if (empty) {
+      btnX.classList.add("mmr-hidden");
+      btnEdit.classList.add("mmr-hidden");
+      btnAddBlur.classList.add("mmr-hidden");
+      btnDone.classList.add("mmr-hidden");
+      player.classList.add("mmr-hidden");
+      subEl.classList.add("mmr-hidden");
+    } else {
+      applyMode();
+    }
   }
 
   /* ---------------- top buttons ---------------- */
@@ -625,25 +831,48 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 
   function onRender(args) {
     S.args = args || {};
-    var wide = (S.args.aspect || "9:16") === "16:9";
-    phone.classList.toggle("wide", wide);
+    /* The phone's shape follows the VIDEO's own ratio (arg), not the
+       output aspect setting. */
+    phone.style.aspectRatio = S.args.canvas_aspect || "9 / 16";
     S.subsEnabled = S.args.subtitles_enabled !== false;
-    subEl.classList.toggle("mmr-hidden", !S.subsEnabled);
 
     var vid = S.args.video_id || null;
+    if (!vid) {
+      /* No video yet (or just removed): show the upload input that
+         lives inside the canvas. */
+      S.hasVideo = false;
+      S.videoId = null;
+      S.localPicked = false;
+      S.metaSentFor = null;
+      S.boxes = [];
+      S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct,
+                fs: DEFAULT_SUB.font_size };
+      S.editMode = false;
+      video.removeAttribute("src");
+      video.load();
+      renderBoxes();
+      paintSubtitle();
+      applyEmpty();
+      S.lastSent = JSON.stringify(currentValue(null));
+      fitHeight();
+      return;
+    }
+    S.hasVideo = true;
+
     /* A new video means a fresh canvas; otherwise the component's local
        state is authoritative. Python passes PRE-adoption args on the
        rerun triggered by our own setComponentValue, so adopting those
        stale args would wipe the user's just-made edit. */
-    var isNewVideo = Boolean(vid && vid !== S.videoId);
+    var isNewVideo = Boolean(vid !== S.videoId);
     if (isNewVideo) {
       S.videoId = vid;
+      S.localPicked = Boolean(S.args.local_picked);
       if (S.args.video_data_url) {
         video.src = S.args.video_data_url;
         video.load();
       } else {
-        video.removeAttribute("src");
-        video.load();
+        /* No data URL: the video is already loaded in this frame
+           (picked locally), so keep it. */
       }
     }
 
@@ -675,6 +904,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
        and it changes on window resize. */
     if (S.editMode) renderBoxes();
     paintSubtitle();
+    applyEmpty();
+    if (S.hasVideo) subEl.classList.toggle("mmr-hidden", !S.subsEnabled);
     fitHeight();
   }
 
@@ -745,22 +976,30 @@ CANVAS_DEFAULT: Dict = {
 
 
 def interactive_canvas(
-    video_id: str,
+    video_id: Optional[str],
     video_data_url: Optional[str],
     blur_boxes: List[Dict],
     subtitle: Dict,
     subtitles_enabled: bool = True,
-    aspect: str = "9:16",
+    canvas_aspect: str = "9 / 16",
+    local_picked: bool = False,
     key: Optional[str] = None,
 ) -> Dict:
-    """Render the canvas and return the latest user-edited state."""
+    """Render the canvas and return the latest user-edited state.
+
+    ``canvas_aspect`` is the SOURCE video's own ratio (e.g. "1280 / 720"),
+    so the phone mockup matches the uploaded video — independent of the
+    output aspect setting. ``local_picked`` tells the frontend the video
+    is already loaded in-frame (picked locally), so it must not reload.
+    """
     value = _canvas(
         video_id=video_id,
         video_data_url=video_data_url,
         blur_boxes=blur_boxes or [],
         subtitle=subtitle or dict(CANVAS_DEFAULT["subtitle"]),
         subtitles_enabled=bool(subtitles_enabled),
-        aspect=aspect,
+        canvas_aspect=canvas_aspect,
+        local_picked=bool(local_picked),
         default=CANVAS_DEFAULT,
         key=key,
     )
