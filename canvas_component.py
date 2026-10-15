@@ -111,11 +111,11 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   gap: 12px;
   padding: 28px 22px;
   text-align: center;
-  background: linear-gradient(180deg, rgba(30, 38, 60, 0.92), rgba(12, 16, 28, 0.94));
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.92), rgba(17, 17, 17, 0.94));
   color: #fff;
 }
 .mmr-empty.mmr-drag {
-  background: linear-gradient(180deg, rgba(40, 90, 180, 0.92), rgba(20, 40, 90, 0.94));
+  background: linear-gradient(180deg, rgba(90, 90, 90, 0.92), rgba(50, 50, 50, 0.94));
   outline: 3px dashed rgba(255, 255, 255, 0.8);
   outline-offset: -10px;
 }
@@ -470,7 +470,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     /* Empty state: the video input lives INSIDE the canvas. */
     emptyEl = el("div", "mmr-empty", phone);
     var emptyIcon = el("div", "mmr-empty-icon", emptyEl);
-    emptyIcon.textContent = "\uD83D\uDCF9";
+    emptyIcon.textContent = "▣";
     var emptyTitle = el("div", "mmr-empty-title", emptyEl);
     emptyTitle.textContent = "ဗီဒီယို ရွေးပါ";
     var emptyBtn = el("button", "mmr-empty-btn", emptyEl);
