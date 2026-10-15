@@ -10,3 +10,11 @@
 # base64 would exceed ~470 MB, with a clear in-canvas message.
 [server]
 maxWidgetStateSize = 500
+
+# Black & white only: the theme's primary accent (slider fill, radio
+# dots, checkbox checks) defaults to Streamlit red — force it to black.
+[theme]
+primaryColor = "#000000"
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#111111"
+textColor = "#FFFFFF"
