@@ -209,6 +209,62 @@ def _render_subtitle_pngs(srt_path: str, font_file: str, font_size: int,
     return out
 
 
+def _build_subtitle_concat(pngs: List[Dict], out_w: int, out_h: int,
+                           work_dir: str, fps: float = 30.0) -> str:
+    """Build an FFmpeg concat list for the subtitle PNGs + blank gaps.
+
+    One concat video input + ONE overlay filter replaces N overlay
+    filters: 30 per-cue overlays made a 28s render take 6.5 minutes
+    locally (and likely timed out / OOM'd on Streamlit Cloud). The
+    concat demuxer emits each PNG for its cue window and a transparent
+    blank PNG for the gaps, so a single overlay shows the right cue at
+    the right time. Returns the concat list file path.
+
+    Segment boundaries are quantized to frame boundaries (1/fps) so
+    rounding cannot drift over many cues: each boundary is rounded
+    once, and segment durations are the differences of rounded
+    boundaries (never independently rounded durations).
+    """
+    from PIL import Image
+
+    blank_path = os.path.join(work_dir, "sub_blank.png")
+    Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0)).save(blank_path)
+    # Contiguous segments: blank gaps + cue PNGs, in time order.
+    # (Overlapping cues: the later cue is delayed to the previous end.)
+    bounds: List[tuple] = []
+    cursor = 0.0
+    for png in sorted(pngs, key=lambda p: (float(p["start"]), float(p["end"]))):
+        s, e = float(png["start"]), float(png["end"])
+        if e <= s:
+            continue
+        s = max(s, cursor)
+        if s > cursor + 1e-9:
+            bounds.append((cursor, s, None))
+        bounds.append((s, e, png["path"]))
+        cursor = e
+    if not bounds:
+        bounds.append((0.0, 1.0, None))
+    # Quantize boundaries to frames and drop zero-length segments.
+    qbounds: List[tuple] = []
+    prev_f = 0
+    for s, e, path in bounds:
+        sf = int(round(s * fps))
+        ef = int(round(e * fps))
+        sf = max(sf, prev_f)  # keep segments contiguous, no drift
+        if ef <= sf:
+            continue
+        qbounds.append((sf, ef, path))
+        prev_f = ef
+    if not qbounds:
+        qbounds.append((0, int(round(fps)), None))
+    list_path = os.path.join(work_dir, "sub_list.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for sf, ef, path in qbounds:
+            dur = (ef - sf) / fps
+            f.write(f"file '{path or blank_path}'\nduration {dur:.4f}\n")
+    return list_path
+
+
 def get_subtitle_font(display_name: str):
     """Resolve a Subtitles-tab font choice to (family, bold_ok, fonts_dir).
 
@@ -570,7 +626,7 @@ def render_recap_video(
                         "bold": True, "file": _sys["path"]}
         # Subtitle PNG overlays (Pillow RAQM — correct Myanmar shaping) or
         # ASS fallback when RAQM is unavailable, or none when disabled.
-        subtitle_pngs: List[Dict] = []
+        subtitle_concat = None
         if srt_path and font and cfg_enabled:
             try:
                 fx = float(cfg.get("x_pct", 0.5))
@@ -604,19 +660,13 @@ def render_recap_video(
                     pos_x, pos_y, _rgb, work_dir)
                 if not subtitle_pngs:
                     raise VideoEditorError("SRT တွင် စာတန်းမတွေ့ပါ။")
-                # Chain one overlay per cue. PNG inputs are 2..N+1
-                # (0=video, 1=voiceover); each is -loop 1 so it is
-                # available for its whole between(t) window.
-                _lbl = cur_label
-                for i, png in enumerate(subtitle_pngs):
-                    _out_lbl = ("vout" if i == len(subtitle_pngs) - 1
-                                else f"vsub{i}")
-                    vchain.append(
-                        f"[{_lbl}][{2 + i}:v]overlay=0:0:"
-                        f"enable='between(t,{png['start']:.3f},"
-                        f"{png['end']:.3f})'[{_out_lbl}]"
-                    )
-                    _lbl = _out_lbl
+                # One concat video input + ONE overlay (see
+                # _build_subtitle_concat for why N overlays are too slow).
+                subtitle_concat = _build_subtitle_concat(
+                    subtitle_pngs, out_w, out_h, work_dir)
+                vchain.append(
+                    f"[{cur_label}][2:v]overlay=0:0:format=auto[vout]"
+                )
                 subtitle_mode = "burned_in"
                 subtitle_position = dict(_sub_pos, method="raqm_png",
                                          cues=len(subtitle_pngs))
@@ -658,9 +708,8 @@ def render_recap_video(
 
         cmd = ["ffmpeg", "-y", "-v", "error",
                "-i", concat_path, "-i", voiceover_path]
-        if subtitle_pngs:
-            for png in subtitle_pngs:
-                cmd += ["-loop", "1", "-i", png["path"]]
+        if subtitle_concat:
+            cmd += ["-f", "concat", "-safe", "0", "-i", subtitle_concat]
         soft_srt_out = None
         if srt_path and subtitle_mode != "burned_in":
             # soft subtitles: mux as mov_text track + keep a sidecar .srt
