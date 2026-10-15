@@ -115,6 +115,99 @@ SUBTITLE_COLORS = {
     "Red": "&H000000FF",
 }
 
+# Same colours as RGB tuples for the Pillow PNG subtitle renderer.
+SUBTITLE_COLOR_RGB = {
+    "White": (255, 255, 255),
+    "Yellow": (255, 255, 0),
+    "Green": (0, 255, 0),
+    "Red": (255, 0, 0),
+}
+
+
+def _raqm_available() -> bool:
+    """True when Pillow was built with libraqm (Myanmar complex shaping)."""
+    try:
+        from PIL import features
+        return bool(features.check("raqm"))
+    except Exception:
+        return False
+
+
+def _subtitle_font_file(display_name: str) -> str:
+    """Path to the font file used for a Subtitles-tab choice.
+
+    Prefers the Bold face when the font ships one (matches the ASS
+    Bold=-1 behaviour); otherwise the Regular face. The thick black
+    stroke adds weight for Regular-only fonts.
+    """
+    entry = SUBTITLE_FONTS.get(display_name) or SUBTITLE_FONTS["Pyidaungsu"]
+    _family, regular, bold_file = entry
+    fonts_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "fonts")
+    if bold_file and os.path.isfile(os.path.join(fonts_dir, bold_file)):
+        return os.path.join(fonts_dir, bold_file)
+    return os.path.join(fonts_dir, regular)
+
+
+def _wrap_subtitle_lines(text: str, font, max_width: int) -> List[str]:
+    """Greedy word-wrap for one cue (Myanmar phrases split on spaces)."""
+    if font.getlength(text) <= max_width:
+        return [text]
+    words = text.split(" ")
+    lines: List[str] = []
+    cur = ""
+    for w in words:
+        cand = (cur + " " + w).strip()
+        if cur and font.getlength(cand) > max_width:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = cand
+    if cur:
+        lines.append(cur)
+    return lines or [text]
+
+
+def _render_subtitle_pngs(srt_path: str, font_file: str, font_size: int,
+                          out_w: int, out_h: int, pos_x: int, pos_y: int,
+                          rgb: tuple, work_dir: str) -> List[Dict]:
+    """Render every SRT cue as a full-size transparent PNG (Pillow RAQM).
+
+    RAQM (HarfBuzz) shapes Myanmar correctly: the e-vowel (ေ) reorders to
+    the front and stacked consonants (ပါဌ်ဆင့်/ကင်းစီး) combine with no
+    "+" sign — which the server's libass cannot do. Returns a list of
+    {"path", "start", "end"} for the FFmpeg overlay chain. The full cue
+    text is drawn as one continuous run (no tags inside a cluster).
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    if not _raqm_available():
+        raise VideoEditorError(
+            "Pillow RAQM (libraqm) မရှိပါ — မြန်မာစာ ပုံဖော်မှု မရပါ။")
+    font = ImageFont.truetype(font_file, font_size,
+                              layout_engine=ImageFont.Layout.RAQM)
+    ascent, descent = font.getmetrics()
+    line_h = ascent + descent + max(4, font_size // 10)
+    stroke_w = max(2, int(round(font_size * 0.1)))
+    fill = (rgb[0], rgb[1], rgb[2], 255)
+    stroke = (0, 0, 0, 255)
+    max_width = int(out_w * 0.92)
+    out: List[Dict] = []
+    for i, (start, end, text) in enumerate(_parse_srt_cues(srt_path)):
+        lines = _wrap_subtitle_lines(text, font, max_width)
+        img = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Stack lines upward from pos_y (last line's baseline sits at pos_y).
+        for li, line in enumerate(lines):
+            y = pos_y - (len(lines) - 1 - li) * line_h
+            draw.text((pos_x, y), line, font=font, fill=fill,
+                      stroke_width=stroke_w, stroke_fill=stroke,
+                      anchor="ms")
+        png_path = os.path.join(work_dir, f"sub_{i}.png")
+        img.save(png_path)
+        out.append({"path": png_path, "start": float(start), "end": float(end)})
+    return out
+
 
 def get_subtitle_font(display_name: str):
     """Resolve a Subtitles-tab font choice to (family, bold_ok, fonts_dir).
@@ -467,40 +560,69 @@ def render_recap_video(
                                       SUBTITLE_COLORS["Yellow"])
         font = None
         if srt_path and os.path.isdir(_fonts_dir):
-            font = {"family": _fam, "dir": _fonts_dir, "bold": _bold_ok}
+            font = {"family": _fam, "dir": _fonts_dir, "bold": _bold_ok,
+                    "file": _subtitle_font_file(
+                        str(cfg.get("font_family", "Pyidaungsu")))}
         elif srt_path:
             _sys = find_myanmar_font()
             if _sys:
                 font = {"family": _sys["family"], "dir": _sys["dir"],
-                        "bold": True}
-        use_exact = (
-            cfg.get("x_pct") is not None
-            or cfg.get("y_pct") is not None
-            or cfg.get("font_size") is not None
-            or cfg.get("font_size_pct") is not None
-        )
+                        "bold": True, "file": _sys["path"]}
+        # Subtitle PNG overlays (Pillow RAQM — correct Myanmar shaping) or
+        # ASS fallback when RAQM is unavailable, or none when disabled.
+        subtitle_pngs: List[Dict] = []
         if srt_path and font and cfg_enabled:
-            if use_exact:
-                try:
-                    fx = float(cfg.get("x_pct", 0.5))
-                    fy = float(cfg.get("y_pct", 0.82))
-                    # Prefer font_size_pct (fraction of output width) so the
-                    # burned-in size matches the canvas preview exactly at
-                    # any output resolution. Legacy font_size is px at the
-                    # 400px reference width.
-                    if cfg.get("font_size_pct") is not None:
-                        fpct = float(cfg["font_size_pct"])
-                        fs = int(round(fpct * out_w))
-                    else:
-                        fpct = float(cfg.get("font_size", 22)) / 400.0
-                        fs = int(round(fpct * out_w))
-                except (TypeError, ValueError):
-                    fx, fy, fpct, fs = 0.5, 0.82, 0.055, int(round(0.055 * out_w))
-                fx = min(1.0, max(0.0, fx))
-                fy = min(1.0, max(0.0, fy))
-                fpct = min(0.30, max(0.02, fpct))
-                fs = min(200, max(8, fs))
-                pos_x, pos_y = int(round(fx * out_w)), int(round(fy * out_h))
+            try:
+                fx = float(cfg.get("x_pct", 0.5))
+                fy = float(cfg.get("y_pct", 0.82))
+                # Prefer font_size_pct (fraction of output width) so the
+                # burned-in size matches the canvas preview exactly at
+                # any output resolution. Legacy font_size is px at the
+                # 400px reference width.
+                if cfg.get("font_size_pct") is not None:
+                    fpct = float(cfg["font_size_pct"])
+                    fs = int(round(fpct * out_w))
+                else:
+                    fpct = float(cfg.get("font_size", 22)) / 400.0
+                    fs = int(round(fpct * out_w))
+            except (TypeError, ValueError):
+                fx, fy, fpct, fs = 0.5, 0.82, 0.055, int(round(0.055 * out_w))
+            fx = min(1.0, max(0.0, fx))
+            fy = min(1.0, max(0.0, fy))
+            fpct = min(0.30, max(0.02, fpct))
+            fs = min(200, max(8, fs))
+            pos_x, pos_y = int(round(fx * out_w)), int(round(fy * out_h))
+            _rgb = SUBTITLE_COLOR_RGB.get(
+                str(cfg.get("color", "Yellow")), (255, 255, 0))
+            _sub_pos = {"x_pct": fx, "y_pct": fy, "font_size": fs,
+                        "font_size_pct": fpct, "pos_x": pos_x, "pos_y": pos_y,
+                        "font_family": font["family"],
+                        "color": str(cfg.get("color", "Yellow"))}
+            if _raqm_available():
+                subtitle_pngs = _render_subtitle_pngs(
+                    srt_path, font["file"], fs, out_w, out_h,
+                    pos_x, pos_y, _rgb, work_dir)
+                if not subtitle_pngs:
+                    raise VideoEditorError("SRT တွင် စာတန်းမတွေ့ပါ။")
+                # Chain one overlay per cue. PNG inputs are 2..N+1
+                # (0=video, 1=voiceover); each is -loop 1 so it is
+                # available for its whole between(t) window.
+                _lbl = cur_label
+                for i, png in enumerate(subtitle_pngs):
+                    _out_lbl = ("vout" if i == len(subtitle_pngs) - 1
+                                else f"vsub{i}")
+                    vchain.append(
+                        f"[{_lbl}][{2 + i}:v]overlay=0:0:"
+                        f"enable='between(t,{png['start']:.3f},"
+                        f"{png['end']:.3f})'[{_out_lbl}]"
+                    )
+                    _lbl = _out_lbl
+                subtitle_mode = "burned_in"
+                subtitle_position = dict(_sub_pos, method="raqm_png",
+                                         cues=len(subtitle_pngs))
+            else:
+                # Fallback: ASS burn-in (server libass shapes Myanmar
+                # poorly, but it beats no subtitles when RAQM is missing).
                 ass_path = os.path.join(work_dir, "subtitles_exact.ass")
                 n_cues = srt_to_ass(srt_path, ass_path, font["family"], fs,
                                     pos_x, pos_y, out_w, out_h,
@@ -514,30 +636,7 @@ def render_recap_video(
                     f"fontsdir='{_escape_filter_path(font['dir'])}'[vout]"
                 )
                 subtitle_mode = "burned_in"
-                subtitle_position = {"x_pct": fx, "y_pct": fy,
-                                     "font_size": fs,
-                                     "font_size_pct": fpct,
-                                     "pos_x": pos_x, "pos_y": pos_y,
-                                     "cues": n_cues,
-                                     "font_family": font["family"],
-                                     "color": str(cfg.get("color", "Yellow"))}
-            else:
-                # Legacy centred style: same font + colour as the ASS path.
-                # force_style colours are &HBBGGRR& (no alpha byte).
-                _legacy_colour = f"&H{_colour[-6:]}&"
-                style = (
-                    f"FontName={font['family']},FontSize=22,"
-                    f"Bold={1 if font.get('bold', True) else 0},"
-                    f"PrimaryColour={_legacy_colour},"
-                    "OutlineColour=&H80000000&,"
-                    "BorderStyle=1,Outline=2,Shadow=0,MarginV=28"
-                )
-                vchain.append(
-                    f"[{cur_label}]subtitles='{_escape_filter_path(srt_path)}':"
-                    f"fontsdir='{_escape_filter_path(font['dir'])}':"
-                    f"force_style='{style}'[vout]"
-                )
-                subtitle_mode = "burned_in"
+                subtitle_position = dict(_sub_pos, method="ass", cues=n_cues)
         else:
             vchain.append(f"[{cur_label}]null[vout]")
 
@@ -559,6 +658,9 @@ def render_recap_video(
 
         cmd = ["ffmpeg", "-y", "-v", "error",
                "-i", concat_path, "-i", voiceover_path]
+        if subtitle_pngs:
+            for png in subtitle_pngs:
+                cmd += ["-loop", "1", "-i", png["path"]]
         soft_srt_out = None
         if srt_path and subtitle_mode != "burned_in":
             # soft subtitles: mux as mov_text track + keep a sidecar .srt
