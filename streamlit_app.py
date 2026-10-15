@@ -457,7 +457,7 @@ _preview = {
 # Fix 4: reactive subtitle style for the canvas preview — the
 # Subtitles-tab colour + font flow into the canvas live, so changing
 # the dropdown/radio immediately recolours / re-fonts the placeholder
-# ("ဒီနေရာမှာ စာတန်းထိုး ပေါ်မယ်") instead of only showing in the
+# ("ဒီနေရာတွင် စာတန်းထိုးထည့်ပေးပါမည်") instead of only showing in the
 # rendered video. The font file is sent as a data URL until the canvas
 # acks the load (tracked in _canvas_font_loaded from the component
 # value's loaded_font field); otherwise font_data is None and the

@@ -350,7 +350,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
      width, so the burned-in size matches the canvas preview exactly
      at any output resolution (22px at the 400px reference = 0.055). */
   var DEFAULT_SUB = { x_pct: 0.5, y_pct: 0.82, font_size_pct: 0.055 };
-  var SUB_TEXT = "\u1012\u102E\u1014\u1031\u101B\u102C\u1019\u103E\u102C \u1005\u102C\u1010\u1014\u103A\u1038\u1011\u102D\u102F \u1015\u1031\u102B\u1019\u101A\u103A";
+  var SUB_TEXT = "\u1012\u102E\u1014\u1031\u101B\u102C\u1010\u103D\u1004\u103A \u1005\u102C\u1010\u1014\u103A\u1038\u1011\u102D\u102F\u1038\u1011\u100A\u1037\u103A\u1015\u1031\u1038\u1015\u102B\u1019\u100A\u103A";
 
   var S = {
     args: {},
