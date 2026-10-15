@@ -234,6 +234,14 @@ if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 if "key_restored" not in st.session_state:
     st.session_state["key_restored"] = False
+if "forget_pending" not in st.session_state:
+    st.session_state["forget_pending"] = False
+if "forgotten_key" not in st.session_state:
+    st.session_state["forgotten_key"] = ""
+if "key_load_nonce" not in st.session_state:
+    st.session_state["key_load_nonce"] = 0
+if "forget_just_clicked" not in st.session_state:
+    st.session_state["forget_just_clicked"] = False
 
 # Step 11 canvas state (survives reruns; reset when the video changes).
 if "canvas_blur" not in st.session_state:
@@ -265,12 +273,30 @@ if "session_dir" not in st.session_state:
     st.session_state["session_dir"] = tempfile.mkdtemp(prefix="recap_session_")
 
 # Ask this browser for a previously saved key (cached after first answer).
+# The component key includes a nonce: bumping the nonce forces a FRESH
+# read. Without it the component keeps returning its first (stale) value
+# even after localStorage changes (Verify-save / Forget).
 browser_saved = streamlit_js_eval(
     js_expressions=f"localStorage.getItem('{LS_KEY}')",
-    key="mmr_key_load",
+    key=f"mmr_key_load_{st.session_state['key_load_nonce']}",
 )
-if browser_saved and not st.session_state["key_restored"]:
-    st.session_state["api_key"] = browser_saved  # before widget creation
+# Restore on EVERY run while the key box is empty (not just once per
+# session): a server session reset must not force the user to re-enter
+# the key. A typed-but-unverified key in the box is never overwritten.
+# After Forget, block restore until the browser confirms removal
+# (browser_saved is None) so the just-deleted key can't come back;
+# forgotten_key also guards against a stale cached read of it.
+# NOTE: the forget guards are NEVER cleared by a None read — a None
+# can be transient (the component hasn't answered yet), and clearing
+# on it would let a stale OLD value re-restore the deleted key. The
+# guards clear only on a fresh Verify-save or a fresh session.
+if (
+    browser_saved
+    and browser_saved != st.session_state.get("forgotten_key")
+    and not st.session_state.get("api_key_box")
+    and not st.session_state.get("forget_pending")
+):
+    st.session_state["api_key"] = browser_saved
     st.session_state["key_restored"] = True
 
 st.markdown(HEADER_TOP)
@@ -518,6 +544,18 @@ with tab_sub:
         f"(အကျယ်၏)"
     )
 
+
+def _saved_note() -> None:
+    # Small green pill (not a Streamlit alert: the B&W theme forces all
+    # alerts white, but the user asked for this one note to be green).
+    st.markdown(
+        '<div style="display:inline-block;background:#16a34a;color:#ffffff;'
+        "font-weight:700;padding:6px 14px;border-radius:999px;\">"
+        "✓ သိမ်းပြီး</div>",
+        unsafe_allow_html=True,
+    )
+
+
 with tab_adv:
     st.markdown(KEY_GUIDE)
 
@@ -528,15 +566,25 @@ with tab_adv:
         # "api_key" (a plain key); the box itself always starts empty.
         st.session_state["api_key"] = st.session_state.get("api_key_box", "")
 
+    key_saved = bool(
+        browser_saved
+        and st.session_state.get("api_key") == browser_saved
+        # After Forget, a stale cached read can still equal a re-typed
+        # key — forget_pending blocks the note until a fresh save.
+        and not st.session_state.get("forget_pending")
+    )
     key_input = st.text_input(
         " သင်၏ Free Gemini API Key ထည့်ပါ",
         type="password",
-        # Always start empty: the restored key is shown via the blue note,
-        # never echoed back into the box (and an autofill ghost in the box
-        # must not become the app's key).
+        # Always start empty: the restored key is shown via the green
+        # "သိမ်းပြီး" note, never echoed back into the box (and an
+        # autofill ghost in the box must not become the app's key).
+        # Once saved, the box is disabled so it is obvious no re-entry
+        # is needed; Forget re-enables it for a new key.
         value="",
         key="api_key_box",
-        placeholder="AIza...",
+        placeholder="••••••••" if key_saved else "AIza...",
+        disabled=key_saved,
         on_change=_key_changed,
     )
     # NOTE: do NOT copy key_input into api_key here. The box is empty on
@@ -544,49 +592,73 @@ with tab_adv:
     # key (the "enter the key every time" bug). api_key is set only by
     # the restore above and by _key_changed (a real user edit).
 
-    if browser_saved and st.session_state["api_key"] == browser_saved:
-        st.info("✓ သိမ်းဆည်းထားသော API Key အသင့်ရှိနေပါသည်")
+    if key_saved:
+        _saved_note()
+
+    def _forget_key() -> None:
+        # on_click callback: runs BEFORE the script body on the click
+        # run, so the tab UI below renders the cleared state
+        # immediately (no stale green note / disabled box).
+        _old = st.session_state.get("api_key") or ""
+        st.session_state["forgotten_key"] = _old
+        st.session_state["api_key"] = ""
+        st.session_state["key_restored"] = True
+        st.session_state["forget_pending"] = True
+        st.session_state["key_load_nonce"] += 1
+        st.session_state["forget_just_clicked"] = True
+        if "api_key_box" in st.session_state:
+            del st.session_state["api_key_box"]
 
     key_col1, key_col2 = st.columns(2)
     with key_col1:
         verify_save_btn = st.button("✓ API Key စစ်ဆေးပြီး Browser မှာ သိမ်းမည်")
     with key_col2:
-        forget_btn = st.button(" သိမ်းထားသော Key ဖျက်မည်")
+        forget_btn = st.button(" သိမ်းထားသော Key ဖျက်မည်", on_click=_forget_key)
 
     if verify_save_btn:
         _k = (st.session_state["api_key"] or "").strip()
         _ok, _msg = verify_gemini_api_key(_k)
         if _ok:
+            # A fresh save supersedes any earlier Forget; force a fresh
+            # localStorage read so the green note shows immediately.
+            st.session_state["forgotten_key"] = ""
+            st.session_state["forget_pending"] = False
+            st.session_state["key_load_nonce"] += 1
             streamlit_js_eval(
                 js_expressions=f"localStorage.setItem('{LS_KEY}',{json.dumps(_k)})",
-                key="mmr_key_save",
+                key=f"mmr_key_save_{st.session_state['key_load_nonce']}",
             )
-            st.success(
-                "✓ API Key မှန်ကန်ကြောင်း စစ်ဆေးပြီး "
-                "သင့် Browser တွင် သိမ်းဆည်းပြီးပါပြီ!"
-            )
+            _saved_note()
         else:
             # Invalid key: show the error and do NOT save anything.
             st.error(_msg)
 
-    if forget_btn:
+    if st.session_state.get("forget_just_clicked"):
+        # Execute the removal exactly once. The eval key includes the
+        # nonce (bumped in the callback), so the component re-executes
+        # even if the user forgets again later (the frontend only runs
+        # an expression when it changes). NO st.rerun() here: it would
+        # discard this run's render and the removal would never reach
+        # the browser. The removal result triggers a rerun on its own.
         streamlit_js_eval(
             js_expressions=f"localStorage.removeItem('{LS_KEY}')",
-            key="mmr_key_del",
+            key=f"mmr_key_del_{st.session_state['key_load_nonce']}",
         )
-        st.session_state["api_key"] = ""
-        # Don't re-restore the (now stale) cached browser value on rerun.
-        st.session_state["key_restored"] = True
-        if "api_key_box" in st.session_state:
-            del st.session_state["api_key_box"]
-        st.rerun()
+        st.session_state["forget_just_clicked"] = False
 
     aspect_choice = st.radio(" Aspect Ratio ရွေးပါ", ASPECT_CHOICES, index=0)
 
 run_btn = st.button(" Recap ဗီဒီယို ထုတ်လုပ်မည်", type="primary")
 
 if run_btn:
-    key = (st.session_state.get("api_key") or "").strip()
+    # Fall back to the browser-saved key if session_state lost it
+    # (e.g. a session reset) but the browser still has it. A key the
+    # user just deleted (Forget) is never used, even if a stale cached
+    # read still returns it.
+    _saved = browser_saved or ""
+    if _saved == st.session_state.get("forgotten_key"):
+        _saved = ""
+    key = (st.session_state.get("api_key") or _saved or "").strip()
 
     if not demo_active and not key:
         st.error("✕ ကျေးဇူးပြု၍ သင်၏ Free Gemini API Key ကို ထည့်သွင်းပေးပါ")
