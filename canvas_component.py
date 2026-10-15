@@ -264,6 +264,22 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   touch-action: none;
   z-index: 6;
 }
+/* Subtitle bottom-center handle (Fix 3): width-only resize. */
+.mmr-whandle {
+  /* Bottom-center width handle: a short wide pill hugging the bottom
+     edge, NOT a big circle — a 28px circle on a ~48px-tall subtitle
+     box would cover the box's vertical centre and swallow body drags
+     that start there (Fix 3 regression). The pill leaves the centre
+     free so the subtitle body stays grabbable. */
+  right: auto;
+  left: 50%;
+  bottom: 2px;
+  transform: translateX(-50%);
+  width: 56px;
+  height: 12px;
+  border-radius: 6px;
+  cursor: ew-resize;
+}
 .mmr-sliderpill {
   position: absolute;
   bottom: calc(100% + 12px);
@@ -339,8 +355,14 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   var S = {
     args: {},
     boxes: [],
-    sub: { x: 0.5, y: 0.82, fs: 22 },
+    /* sub.wpct: subtitle box width as a fraction of the phone width
+       (null = auto width, the old behaviour). Set once the user drags
+       a width handle; the renderer then wraps to this width. */
+    sub: { x: 0.5, y: 0.82, fs: 22, wpct: null },
     editMode: false,
+    /* Subtitle font loaded into this frame via FontFace (Fix 4). */
+    loadedFont: null,
+    loadedFace: null,
     videoId: null,
     hasVideo: false,
     localPicked: false,
@@ -396,11 +418,18 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       subtitle: {
         x_pct: r3(S.sub.x), y_pct: r3(S.sub.y),
         /* Authoritative: fraction of width. font_size is the same size
-           at the 400px reference width, kept for backward compat. */
+           at the 400px reference width, kept for backward compat.
+           w_pct is the subtitle box width (null = auto width). */
         font_size_pct: r4(S.sub.fpct),
         font_size: clamp(Math.round(S.sub.fpct * 400), 8, 200),
+        w_pct: (S.sub.wpct == null ? null : r4(S.sub.wpct)),
       },
       action: action || null,
+      /* Fix 4 ack: which subtitle font this frame actually loaded.
+         Python keeps sending font_data until the canvas acks this
+         font (a one-shot send can miss the component's first render
+         if a rerun lands first). */
+      loaded_font: S.loadedFont,
     };
   }
 
@@ -429,7 +458,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   function resetForNewVideo() {
     S.boxes = [];
     S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct,
-              fpct: DEFAULT_SUB.font_size_pct };
+              fpct: DEFAULT_SUB.font_size_pct, wpct: null };
     S.editMode = false;
     renderBoxes();
     paintSubtitle();
@@ -439,7 +468,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   /* ---------------- DOM ---------------- */
   var wrap, phone, stage, video, bgVideo, player, btnPlay, prog, progFill,
       timeEl, btnMute, btnFs, btnX, btnEdit, btnAddBlur, btnDone, subEl,
-      subHandle, emptyEl, emptyUrl, fileInput;
+      subHandle, subWHandle, emptyEl, emptyUrl, fileInput;
 
   function el(tag, cls, parent) {
     var e = document.createElement(tag);
@@ -483,7 +512,11 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 
     subEl = el("div", "mmr-subtitle", phone);
     subEl.textContent = SUB_TEXT;
+    /* Bottom-right corner: 2D resize — horizontal drag sets the box
+       width, vertical drag sets the font size (Fix 3). */
     subHandle = el("div", "mmr-handle mmr-hidden", subEl);
+    /* Bottom-center: width-only resize (Fix 3). */
+    subWHandle = el("div", "mmr-handle mmr-whandle mmr-hidden", subEl);
 
     player = el("div", "mmr-player", phone);
     btnPlay = el("button", "mmr-pbtn", player);
@@ -801,6 +834,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     player.classList.toggle("mmr-hidden", e);
     subEl.classList.toggle("editing", e);
     subHandle.classList.toggle("mmr-hidden", !e);
+    subWHandle.classList.toggle("mmr-hidden", !e);
     renderBoxes();
     fitHeight();
   }
@@ -899,11 +933,18 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.sub.x = clamp(g.ox + dx2, 0, 1);
       S.sub.y = clamp(g.oy + dy2, 0, 1);
       paintSubtitle();
-    } else if (g.kind === "subsize") {
-      var d = ((e.clientX - g.sx) + (e.clientY - g.sy)) / 2;
-      /* Drag changes the size in phone px; store it as a fraction of
-         the phone width so the output matches at any resolution. */
-      S.sub.fpct = clamp((g.of + d * 0.25) / (g.pw || 400), 0.02, 0.30);
+    } else if (g.kind === "subsize2d") {
+      /* 2D corner handle (Fix 3): horizontal drag -> box width,
+         vertical drag -> font size. Width is stored as a fraction of
+         the phone width, so the renderer wraps to the same relative
+         width at any output resolution. */
+      S.sub.wpct = clamp(g.ow + (e.clientX - g.sx) / g.pw, 0.20, 0.98);
+      S.sub.fpct = clamp((g.of + (e.clientY - g.sy) * 0.25) / g.pw,
+                         0.02, 0.30);
+      paintSubtitle();
+    } else if (g.kind === "subwidth") {
+      /* Bottom-center handle (Fix 3): width only. */
+      S.sub.wpct = clamp(g.ow + (e.clientX - g.sx) / g.pw, 0.20, 0.98);
       paintSubtitle();
     }
   }
@@ -940,7 +981,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   /* ---------------- subtitle ---------------- */
   function wireSubtitle() {
     subEl.addEventListener("pointerdown", function (e) {
-      if (!S.editMode || e.target === subHandle) return;
+      if (!S.editMode || e.target === subHandle
+          || e.target === subWHandle) return;
       e.preventDefault();
       subEl.setPointerCapture(e.pointerId);
       var r = phone.getBoundingClientRect();
@@ -953,13 +995,27 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
         window.addEventListener("pointercancel", onGestureEnd);
       }
     });
+    /* Bottom-right corner: 2D resize (width + font size). */
     subHandle.addEventListener("pointerdown", function (e) {
       e.stopPropagation();
       e.preventDefault();
       subHandle.setPointerCapture(e.pointerId);
       var pw = phone.getBoundingClientRect().width || 400;
-      S.gesture = { kind: "subsize", sx: e.clientX, sy: e.clientY,
-                    of: S.sub.fpct * pw, pw: pw };
+      S.gesture = { kind: "subsize2d", sx: e.clientX, sy: e.clientY,
+                    of: S.sub.fpct * pw, pw: pw,
+                    ow: (S.sub.wpct != null ? S.sub.wpct
+                        : subEl.offsetWidth / pw) };
+    });
+    /* Bottom-center: width only. */
+    subWHandle.addEventListener("pointerdown", function (e) {
+      e.stopPropagation();
+      e.preventDefault();
+      subWHandle.setPointerCapture(e.pointerId);
+      var pw = phone.getBoundingClientRect().width || 400;
+      S.gesture = { kind: "subwidth", sx: e.clientX, sy: e.clientY,
+                    pw: pw,
+                    ow: (S.sub.wpct != null ? S.sub.wpct
+                        : subEl.offsetWidth / pw) };
     });
   }
 
@@ -969,6 +1025,17 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     subEl.style.top = (S.sub.y * r.height) + "px";
     /* Fraction of the phone width -> same relative size as the output. */
     subEl.style.fontSize = (S.sub.fpct * r.width) + "px";
+    if (S.sub.wpct != null) {
+      /* Explicit box width (Fix 3): the text wraps inside it, centred,
+         exactly like the renderer wraps to w_pct. */
+      subEl.style.width = (S.sub.wpct * r.width) + "px";
+      subEl.style.whiteSpace = "normal";
+      subEl.style.textAlign = "center";
+    } else {
+      subEl.style.width = "";
+      subEl.style.whiteSpace = "nowrap";
+      subEl.style.textAlign = "center";
+    }
   }
 
   /* ---------------- render (from Streamlit) ---------------- */
@@ -985,6 +1052,49 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 
   function onRender(args) {
     S.args = args || {};
+    /* Fix 4: reactive subtitle style from the Subtitles tab (colour +
+       font). Colour applies immediately; the font file arrives as a
+       data URL only when the selection changes, and is loaded via the
+       FontFace API (the browser has none of the bundled fonts
+       installed, so a font-family name alone would never change
+       anything). */
+    var st = S.args.subtitle_style || null;
+    if (st) {
+      if (st.color) subEl.style.color = st.color;
+      if (st.stroke) {
+        subEl.style.textShadow =
+          "-1.5px -1.5px 0 " + st.stroke + ", 1.5px -1.5px 0 " + st.stroke +
+          ", -1.5px 1.5px 0 " + st.stroke + ", 1.5px 1.5px 0 " + st.stroke +
+          ", 0 0 7px rgba(0, 0, 0, 0.9)";
+      }
+      if (st.font_family) {
+        subEl.style.fontFamily =
+          '"mmr-subtitle-font", "Noto Sans Myanmar", sans-serif';
+        if (st.font_data && st.font_family !== S.loadedFont) {
+          (function (fam, data) {
+            try {
+              var ff = new FontFace("mmr-subtitle-font",
+                                    "url(" + data + ")");
+              ff.load().then(function () {
+                if (S.loadedFace) {
+                  try { document.fonts.delete(S.loadedFace); } catch (e) {}
+                }
+                document.fonts.add(ff);
+                S.loadedFace = ff;
+                S.loadedFont = fam;
+                /* Test hook: lets the verify script read which font
+                   the canvas actually loaded. */
+                window.__mmrSubtitleFont = fam;
+                /* Ack the load back to Python so it stops resending
+                   the font payload. */
+                sendValue(null);
+                paintSubtitle();
+              }).catch(function () { /* keep the fallback font */ });
+            } catch (err) { /* FontFace unsupported: keep fallback */ }
+          })(st.font_family, st.font_data);
+        }
+      }
+    }
     /* Server acked receipt of the picked file: drop the base64 payload
        from the component value (send a small state instead) so the
        ~40MB is not re-sent on every later rerun. Runs once. */
@@ -1032,7 +1142,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.resyncSent = false;
       S.boxes = [];
       S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct,
-                fpct: DEFAULT_SUB.font_size_pct };
+                fpct: DEFAULT_SUB.font_size_pct, wpct: null };
       S.editMode = false;
       video.removeAttribute("src");
       video.load();
@@ -1086,9 +1196,12 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       var nf = (sb.font_size_pct != null ? +sb.font_size_pct
                 : (sb.font_size != null ? +sb.font_size / 400
                    : DEFAULT_SUB.font_size_pct));
+      var nw = (sb.w_pct != null ? clamp(+sb.w_pct, 0.20, 0.98) : null);
       if (Math.abs(nx - S.sub.x) > 1e-4 || Math.abs(ny - S.sub.y) > 1e-4 ||
-          Math.abs(nf - S.sub.fpct) > 1e-4) {
-        S.sub = { x: nx, y: ny, fpct: nf };
+          Math.abs(nf - S.sub.fpct) > 1e-4 ||
+          (nw == null) !== (S.sub.wpct == null) ||
+          (nw != null && Math.abs(nw - (S.sub.wpct || 0)) > 1e-4)) {
+        S.sub = { x: nx, y: ny, fpct: nf, wpct: nw };
         paintSubtitle();
       }
     }
@@ -1179,6 +1292,7 @@ def interactive_canvas(
     local_picked: bool = False,
     video_ack: Optional[str] = None,
     preview: Optional[Dict] = None,
+    subtitle_style: Optional[Dict] = None,
     key: Optional[str] = None,
 ) -> Dict:
     """Render the canvas and return the latest user-edited state.
@@ -1206,6 +1320,7 @@ def interactive_canvas(
         local_picked=bool(local_picked),
         video_ack=video_ack,
         preview=preview or {},
+        subtitle_style=subtitle_style or {},
         default=CANVAS_DEFAULT,
         key=key,
     )

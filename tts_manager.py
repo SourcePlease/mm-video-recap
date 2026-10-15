@@ -145,13 +145,20 @@ def generate_block_voiceovers(
     A block that already has an existing "audio_path" is only measured
     (not re-synthesized) — this is how offline tests inject prebuilt
     audio. A block with empty text gets 0.5s of silence so it still has
-    an audio length for the sync math. Returns the blocks with
-    "audio_path" + "audio_len" (seconds) added.
+    an audio length for the sync math.
+
+    Dynamic rate (Fix 1): a block's narration must fit its own video
+    segment, or the Pro render has to slow the video down (slow-motion).
+    If the first synthesis at the base ``rate`` runs longer than the
+    block, the block is re-synthesized once at "+20%" and the shorter
+    audio is kept. Returns the blocks with "audio_path" + "audio_len"
+    (seconds) + "tts_rate" (the rate actually used) added.
     """
     os.makedirs(out_dir, exist_ok=True)
     out: List[Dict] = []
     for i, b in enumerate(blocks):
         ap = b.get("audio_path")
+        used_rate = rate
         if ap and os.path.isfile(str(ap)):
             audio_len = measure_audio_duration(str(ap))
         else:
@@ -162,6 +169,19 @@ def generate_block_voiceovers(
                     text, ap, None,
                     voice_name=voice_name, rate=rate, proxy=proxy,
                 )
+                # Too long for its own segment -> retry faster once.
+                try:
+                    block_dur = float(b.get("end", 0)) - float(b.get("start", 0))
+                except (TypeError, ValueError):
+                    block_dur = 0.0
+                if block_dur > 0 and audio_len > block_dur and rate != "+20%":
+                    retry_len = generate_burmese_voiceover(
+                        text, ap, None,
+                        voice_name=voice_name, rate="+20%", proxy=proxy,
+                    )
+                    if retry_len < audio_len:
+                        audio_len = retry_len
+                        used_rate = "+20%"
             else:
                 proc = subprocess.run(
                     ["ffmpeg", "-y", "-v", "error",
@@ -174,7 +194,8 @@ def generate_block_voiceovers(
                         f"{proc.stderr.strip()[:200]}")
                 audio_len = measure_audio_duration(ap)
         out.append({**b, "audio_path": str(ap),
-                    "audio_len": float(audio_len)})
+                    "audio_len": float(audio_len),
+                    "tts_rate": used_rate})
     return out
 
 

@@ -5,9 +5,9 @@ render_recap_video(...) trims highlight clips from the source video,
 concatenates them, optionally re-times the video with setpts so it matches
 the Myanmar voiceover length, converts to 16:9 or 9:16, applies multiple
 user-positioned blur boxes, ducks the original audio under the voiceover,
-and burns in (or soft-muxes) Myanmar subtitles — either with the legacy
-centered style or with exact (x_pct, y_pct) position + font size via
-generated ASS (\\pos) for pixel-faithful Canvas WYSIWYG.
+and burns in Myanmar subtitles with exact (x_pct, y_pct) position + font
+size via Pillow RAQM PNG overlays (pixel-faithful Canvas WYSIWYG, correct
+Myanmar shaping) — or soft-muxes the SRT when burn-in is off.
 
 No API keys are used or stored anywhere in this module.
 """
@@ -26,6 +26,19 @@ from video_processor import get_video_metadata
 
 class VideoEditorError(Exception):
     """Raised for video editing / rendering failures."""
+
+
+# Pro AI Recap speed clamp (Fix 1): a block's video speed is the ratio
+# segment_duration / narration_length. Without a clamp, a long narration
+# over a short segment collapses the speed (e.g. 0.5x) into extreme
+# slow-motion and stretches the video far past the original length.
+# The clamp keeps every block's video between 0.85x and 1.25x, so the
+# whole output stays within [0.8x, 1.18x] of the original duration.
+# When the clamp binds, the narration is fitted to the clamped video
+# duration instead (atempo up to PRO_TTS_FIT_MAX, then trim).
+PRO_SPEED_MIN = 0.85
+PRO_SPEED_MAX = 1.25
+PRO_TTS_FIT_MAX = 1.25
 
 
 # --------------------------------------------------------------------------- #
@@ -78,7 +91,7 @@ def find_myanmar_font() -> Optional[Dict[str, str]]:
 
 # Bundled Unicode subtitle fonts (from the user's Myanmar-Unicode-Fonts
 # collection; Zawgyi fonts are never included). Key = the name shown in the
-# Subtitles tab; value = (ASS family name, regular file, bold file or None).
+# Subtitles tab; value = (font family name, regular file, bold file or None).
 # NOTE: Myanmar Thuriya's internal family name is "Myanmar Head One".
 SUBTITLE_FONTS = {
     "Padauk": ("Padauk", "Padauk.ttf", "Padauk-bold.ttf"),
@@ -106,17 +119,10 @@ SUBTITLE_FONTS = {
     "Myanmar Taungyi": ("Myanmar Taungyi", "MyanmarTaungyi.ttf", None),
 }
 
-# Subtitle text colours (ASS PrimaryColour, &HAABBGGRR — note the byte
-# order is Alpha-Blue-Green-Red, so Red is &H000000FF, NOT &H00FF0000).
-# Outline stays black.
-SUBTITLE_COLORS = {
-    "White": "&H00FFFFFF",
-    "Yellow": "&H0000FFFF",
-    "Green": "&H0000FF00",
-    "Red": "&H000000FF",
-}
-
-# Same colours as RGB tuples for the Pillow PNG subtitle renderer.
+# Subtitle text colours as RGB tuples for the Pillow PNG subtitle
+# renderer. The radio options come from these keys. Outline stays black.
+# (The old ASS &HAABBGGRR table is gone with the libass fallback —
+# Fix 5.)
 SUBTITLE_COLOR_RGB = {
     "White": (255, 255, 255),
     "Yellow": (255, 255, 0),
@@ -137,9 +143,9 @@ def _raqm_available() -> bool:
 def _subtitle_font_file(display_name: str) -> str:
     """Path to the font file used for a Subtitles-tab choice.
 
-    Prefers the Bold face when the font ships one (matches the ASS
-    Bold=-1 behaviour); otherwise the Regular face. The thick black
-    stroke adds weight for Regular-only fonts.
+    Prefers the Bold face when the font ships one (matches the
+    renderer's Bold behaviour); otherwise the Regular face. The thick
+    black stroke adds weight for Regular-only fonts.
     """
     entry = SUBTITLE_FONTS.get(display_name) or SUBTITLE_FONTS["Pyidaungsu"]
     _family, regular, bold_file = entry
@@ -169,16 +175,71 @@ def _wrap_subtitle_lines(text: str, font, max_width: int) -> List[str]:
     return lines or [text]
 
 
+def _split_subtitle_chunks(text: str, max_chars: int = 30) -> List[str]:
+    """Split a long cue into short chunks (<= max_chars), greedy on spaces.
+
+    A 5-line wall of text covering the speaker's face is unreadable, so
+    long cues are shown as short chunks in turn, each fitting at most
+    2 lines (see _split_chunk_to_pieces). Overlong single words are
+    hard-split so no chunk exceeds max_chars.
+    """
+    words = text.split(" ")
+    chunks: List[str] = []
+    cur = ""
+    for w in words:
+        while len(w) > max_chars:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(w[:max_chars])
+            w = w[max_chars:]
+        cand = (cur + " " + w).strip()
+        if cur and len(cand) > max_chars:
+            chunks.append(cur)
+            cur = w
+        else:
+            cur = cand
+    if cur:
+        chunks.append(cur)
+    return chunks or [text]
+
+
+def _split_chunk_to_pieces(chunk: str, font, max_width: int,
+                           max_lines: int = 2) -> List[List[str]]:
+    """Wrap one chunk; if it still exceeds max_lines, split its words in
+    half and wrap each half (recursively) until every piece fits in
+    max_lines. Returns a list of line-groups (one group per piece)."""
+    lines = _wrap_subtitle_lines(chunk, font, max_width)
+    words = chunk.split(" ")
+    if len(lines) <= max_lines or len(words) <= 1:
+        return [lines]
+    mid = len(words) // 2
+    out: List[List[str]] = []
+    for half in (" ".join(words[:mid]), " ".join(words[mid:])):
+        if half:
+            out.extend(_split_chunk_to_pieces(half, font, max_width, max_lines))
+    return out or [lines]
+
+
 def _render_subtitle_pngs(srt_path: str, font_file: str, font_size: int,
                           out_w: int, out_h: int, pos_x: int, pos_y: int,
-                          rgb: tuple, work_dir: str) -> List[Dict]:
-    """Render every SRT cue as a full-size transparent PNG (Pillow RAQM).
+                          rgb: tuple, work_dir: str,
+                          wrap_w_pct: Optional[float] = None) -> List[Dict]:
+    """Render every SRT cue as full-size transparent PNGs (Pillow RAQM).
 
     RAQM (HarfBuzz) shapes Myanmar correctly: the e-vowel (ေ) reorders to
     the front and stacked consonants (ပါဌ်ဆင့်/ကင်းစီး) combine with no
     "+" sign — which the server's libass cannot do. Returns a list of
     {"path", "start", "end"} for the FFmpeg overlay chain. The full cue
     text is drawn as one continuous run (no tags inside a cluster).
+
+    Chunking (Fix 2): each cue is split into short chunks (<= 30 chars),
+    each wrapping to at most 2 lines, and the cue's time window is
+    sliced equally across its chunks — so short chunks appear in turn
+    with the speech instead of one tall 5-line block covering the face.
+    ``wrap_w_pct`` (the canvas subtitle box width as a fraction of the
+    frame width) caps the wrap width; without it the wrap falls back to
+    92% of the frame width.
     """
     from PIL import Image, ImageDraw, ImageFont
 
@@ -192,21 +253,35 @@ def _render_subtitle_pngs(srt_path: str, font_file: str, font_size: int,
     stroke_w = max(2, int(round(font_size * 0.1)))
     fill = (rgb[0], rgb[1], rgb[2], 255)
     stroke = (0, 0, 0, 255)
-    max_width = int(out_w * 0.92)
+    try:
+        max_width = int(min(0.98, max(0.20, float(wrap_w_pct))) * out_w) \
+            if wrap_w_pct is not None else int(out_w * 0.92)
+    except (TypeError, ValueError):
+        max_width = int(out_w * 0.92)
     out: List[Dict] = []
-    for i, (start, end, text) in enumerate(_parse_srt_cues(srt_path)):
-        lines = _wrap_subtitle_lines(text, font, max_width)
-        img = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        # Stack lines upward from pos_y (last line's baseline sits at pos_y).
-        for li, line in enumerate(lines):
-            y = pos_y - (len(lines) - 1 - li) * line_h
-            draw.text((pos_x, y), line, font=font, fill=fill,
-                      stroke_width=stroke_w, stroke_fill=stroke,
-                      anchor="ms")
-        png_path = os.path.join(work_dir, f"sub_{i}.png")
-        img.save(png_path)
-        out.append({"path": png_path, "start": float(start), "end": float(end)})
+    png_idx = 0
+    for start, end, text in _parse_srt_cues(srt_path):
+        pieces: List[List[str]] = []
+        for chunk in _split_subtitle_chunks(text):
+            pieces.extend(_split_chunk_to_pieces(chunk, font, max_width))
+        n = len(pieces)
+        dur = float(end) - float(start)
+        for j, lines in enumerate(pieces):
+            ps = float(start) + dur * j / n
+            pe = float(start) + dur * (j + 1) / n
+            img = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            # Stack lines upward from pos_y (last line's baseline sits
+            # at pos_y).
+            for li, line in enumerate(lines):
+                y = pos_y - (len(lines) - 1 - li) * line_h
+                draw.text((pos_x, y), line, font=font, fill=fill,
+                          stroke_width=stroke_w, stroke_fill=stroke,
+                          anchor="ms")
+            png_path = os.path.join(work_dir, f"sub_{png_idx}.png")
+            png_idx += 1
+            img.save(png_path)
+            out.append({"path": png_path, "start": ps, "end": pe})
     return out
 
 
@@ -279,13 +354,6 @@ def get_subtitle_font(display_name: str):
     bold_ok = bool(bold_file) and os.path.isfile(
         os.path.join(fonts_dir, bold_file))
     return family, bold_ok, fonts_dir
-
-
-def _escape_filter_path(path: str) -> str:
-    """Escape a file path for the subtitles filter filename option."""
-    p = os.path.abspath(path)
-    return (p.replace("\\", "\\\\").replace(":", "\\:")
-             .replace("'", "\\'").replace("[", "\\[").replace("]", "\\]"))
 
 
 def _atempo_chain(factor: float) -> str:
@@ -611,42 +679,35 @@ def _subtitle_step(cur_label: str, srt_path: Optional[str],
     fs = min(200, max(8, fs))
     pos_x, pos_y = int(round(fx * out_w)), int(round(fy * out_h))
     _rgb = SUBTITLE_COLOR_RGB.get(str(cfg.get("color", "Yellow")), (255, 255, 0))
-    _colour = SUBTITLE_COLORS.get(str(cfg.get("color", "Yellow")),
-                                  SUBTITLE_COLORS["Yellow"])
     _sub_pos = {"x_pct": fx, "y_pct": fy, "font_size": fs,
                 "font_size_pct": fpct, "pos_x": pos_x, "pos_y": pos_y,
                 "font_family": font["family"],
-                "color": str(cfg.get("color", "Yellow"))}
-    if _raqm_available():
-        subtitle_pngs = _render_subtitle_pngs(
-            srt_path, font["file"], fs, out_w, out_h,
-            pos_x, pos_y, _rgb, work_dir)
-        if not subtitle_pngs:
-            raise VideoEditorError("SRT တွင် စာတန်းမတွေ့ပါ။")
-        # One concat video input + ONE overlay (see _build_subtitle_concat
-        # for why N overlays are too slow).
-        subtitle_concat = _build_subtitle_concat(
-            subtitle_pngs, out_w, out_h, work_dir)
-        return ([f"[{cur_label}][{subtitle_input_idx}:v]"
-                 f"overlay=0:0:format=auto[vout]"],
-                "burned_in",
-                dict(_sub_pos, method="raqm_png", cues=len(subtitle_pngs)),
-                subtitle_concat)
-    # Fallback: ASS burn-in (server libass shapes Myanmar poorly, but it
-    # beats no subtitles when RAQM is missing).
-    ass_path = os.path.join(work_dir, "subtitles_exact.ass")
-    n_cues = srt_to_ass(srt_path, ass_path, font["family"], fs,
-                        pos_x, pos_y, out_w, out_h,
-                        font_bold=bool(font.get("bold", True)),
-                        primary_colour=_colour)
-    if n_cues == 0:
+                "color": str(cfg.get("color", "Yellow")),
+                "w_pct": cfg.get("w_pct"),
+                "max_lines": 2}
+    if not _raqm_available():
+        # No ASS/libass fallback anymore (Fix 5): the server's libass
+        # cannot shape Myanmar (e-vowel stays at the back, stacked
+        # consonants show "+"), so a degraded fallback would silently
+        # produce WRONG subtitles. RAQM is required — it is present on
+        # Streamlit Cloud (Pillow 12.3.0 with libraqm).
+        raise VideoEditorError(
+            "Pillow RAQM (libraqm) မရှိပါ — မြန်မာစာ ပုံဖော်မှု မရပါ။")
+    subtitle_pngs = _render_subtitle_pngs(
+        srt_path, font["file"], fs, out_w, out_h,
+        pos_x, pos_y, _rgb, work_dir,
+        wrap_w_pct=cfg.get("w_pct"))
+    if not subtitle_pngs:
         raise VideoEditorError("SRT တွင် စာတန်းမတွေ့ပါ။")
-    return ([f"[{cur_label}]subtitles="
-             f"'{_escape_filter_path(ass_path)}':"
-             f"fontsdir='{_escape_filter_path(font['dir'])}'[vout]"],
+    # One concat video input + ONE overlay (see _build_subtitle_concat
+    # for why N overlays are too slow).
+    subtitle_concat = _build_subtitle_concat(
+        subtitle_pngs, out_w, out_h, work_dir)
+    return ([f"[{cur_label}][{subtitle_input_idx}:v]"
+             f"overlay=0:0:format=auto[vout]"],
             "burned_in",
-            dict(_sub_pos, method="ass", cues=n_cues),
-            None)
+            dict(_sub_pos, method="raqm_png", cues=len(subtitle_pngs)),
+            subtitle_concat)
 
 
 def _srt_timestamp(sec: float) -> str:
@@ -665,9 +726,9 @@ def _srt_timestamp(sec: float) -> str:
 def build_pro_srt(blocks: List[Dict], srt_path: str) -> Tuple[str, int]:
     """Write synced subtitles for Pro blocks (one cue per block).
 
-    Each block carries "synced_start"/"synced_end" (cumulative audio
-    lengths) — the cues follow the synced timeline exactly, not the
-    original video timestamps. Returns (path, cue count).
+    Each block carries "synced_start"/"synced_end" (cumulative block
+    VIDEO durations — the synced timeline follows the clamped video,
+    not the raw narration lengths). Returns (path, cue count).
     """
     with open(srt_path, "w", encoding="utf-8") as f:
         n = 0
@@ -731,81 +792,6 @@ def _parse_srt_cues(srt_path: str) -> List[Tuple[float, float, str]]:
     return cues
 
 
-def _ass_timestamp(sec: float) -> str:
-    sec = max(0.0, sec)
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = int(sec % 60)
-    cs = int(round((sec - int(sec)) * 100))
-    if cs == 100:  # rounding carry
-        s += 1
-        cs = 0
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
-
-
-def _escape_ass_text(text: str) -> str:
-    # Newlines become a space (NOT the ASS \N break): a \N in the middle
-    # of a consonant+diacritic cluster would split the cluster and render
-    # a dotted circle. The full cue text is sent as one continuous line.
-    return (text.replace("\\", "\\\\")
-                 .replace("{", "\\{")
-                 .replace("}", "\\}")
-                 .replace("\n", " "))
-
-
-def srt_to_ass(srt_path: str, ass_path: str, font_family: str,
-               font_size: int, pos_x: int, pos_y: int,
-               play_w: int, play_h: int,
-               font_bold: bool = True,
-               primary_colour: str = "&H00FFFFFF") -> int:
-    """Convert SRT to ASS with every cue pinned to \\pos(pos_x, pos_y).
-
-    Coloured text (primary_colour, ASS &HAABBGGRR) + black outline, exact
-    PlayResX/PlayResY so the position matches the Canvas 1:1. Bold is only
-    requested when the chosen font actually ships a Bold face — otherwise
-    libass could substitute another family's Bold and mix fonts.
-    Returns the number of cues written.
-    """
-    cues = _parse_srt_cues(srt_path)
-    with open(ass_path, "w", encoding="utf-8") as f:
-        f.write("[Script Info]\n")
-        f.write("ScriptType: v4.00+\n")
-        f.write(f"PlayResX: {play_w}\n")
-        f.write(f"PlayResY: {play_h}\n")
-        f.write("WrapStyle: 0\n")
-        f.write("ScaledBorderAndShadow: yes\n")
-        f.write("\n[V4+ Styles]\n")
-        f.write(
-            "Format: Name, Fontname, Fontsize, PrimaryColour, "
-            "SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
-            "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
-            "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, "
-            "MarginV, Encoding\n"
-        )
-        # Step 13 style: Yellow text + thick black outline + soft shadow.
-        # Bold uses the ASS boolean -1 (true) / 0 (false). FontSize stays
-        # dynamic (font_size_pct of the output width) so the burned-in size
-        # matches the canvas preview.
-        f.write(
-            f"Style: Default,{font_family},{font_size},{primary_colour},"
-            f"&H000000FF,&H00000000,&H00000000,{(-1 if font_bold else 0)},"
-            f"0,0,0,100,100,0,0,1,3.5,1,"
-            f"2,10,10,20,1\n"
-        )
-        f.write("\n[Events]\n")
-        f.write(
-            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
-            "MarginV, Effect, Text\n"
-        )
-        for start, end, text in cues:
-            f.write(
-                f"Dialogue: 0,{_ass_timestamp(start)},{_ass_timestamp(end)},"
-                f"Default,,0,0,0,,{{\\pos({pos_x},{pos_y})}}"
-                f"{_escape_ass_text(text)}\n"
-            )
-    return len(cues)
-
-
 # --------------------------------------------------------------------------- #
 # public API
 # --------------------------------------------------------------------------- #
@@ -839,9 +825,9 @@ def render_recap_video(
     subtitle_config: {"enabled": True, "x_pct": 0.5, "y_pct": 0.82,
         "font_size_pct": 0.055} — font size as a fraction of the output
         width, so the burned-in size matches the canvas preview exactly
-        (legacy "font_size" px at the 400px reference still works) — when
-        are burned via generated ASS with \\pos(x,y) so the Canvas preview
-        matches the render 1:1. Omit (None) for the legacy centered style.
+        (legacy "font_size" px at the 400px reference still works).
+        Subtitles are burned via Pillow RAQM PNG overlays so the Canvas
+        preview matches the render 1:1.
     aspect_ratio: "original", "9:16", "1:1", "4:5" or "16:9".
     fit_mode: "crop" (scale-to-fill + crop_align top/center/bottom) or
         "pad" (blurred-bg pad + inner_scale / vertical_pos / horizontal_pos).
@@ -933,8 +919,8 @@ def render_recap_video(
             steps, cur_label = _blur_filter_steps(cur_label, boxes)
             vchain.extend(steps)
 
-        # 2b) subtitles: exact position/size burn-in (RAQM PNG / ASS
-        # fallback) or none — shared helper, also used by the Pro render.
+        # 2b) subtitles: exact position/size burn-in (RAQM PNG
+        # overlay) or none — shared helper, also used by the Pro render.
         sub_steps, subtitle_mode, subtitle_position, subtitle_concat = \
             _subtitle_step(cur_label, srt_path, subtitle_config,
                            out_w, out_h, work_dir)
@@ -1030,9 +1016,14 @@ def render_pro_recap_video(
     pro_blocks: [{"start","end","text","audio_path"}, ...] — sequential
     blocks tiling the source. Each block's own video segment is
     re-timed with its OWN setpts so its duration matches its block TTS
-    audio length exactly (independent speed per block), then the blocks
-    are concatenated. Subtitles are rebuilt from the blocks on the
-    SYNCED timeline (cumulative audio lengths), not the source timeline.
+    audio length — with the speed CLAMPED to [0.85, 1.25] (Fix 1), so a
+    long narration can never drag a block into extreme slow-motion or
+    stretch the output far past the original length. When the clamp
+    binds, the narration is fitted to the clamped video duration
+    (atempo, then trim) and the synced timeline follows the video
+    durations. Then the blocks are concatenated. Subtitles are rebuilt
+    from the blocks on the SYNCED timeline (cumulative video
+    durations), not the source timeline.
 
     The same visual chain as the recap render applies to the concatenated
     result: copyright filters FIRST (source-frame stage), then aspect/fit,
@@ -1095,7 +1086,15 @@ def render_pro_recap_video(
         # 1) trim the block segments (re-encoded, like the recap path)
         seg_paths = _trim_segments(source_video_path, blocks, seg_dir)
 
-        # 2) per-block independent speed sync + audio mix
+        # 2) per-block independent speed sync + audio mix.
+        # Speed is CLAMPED to [PRO_SPEED_MIN, PRO_SPEED_MAX]: without
+        # the clamp a long narration over a short segment would drag
+        # the video into extreme slow-motion (e.g. 0.5x) and stretch
+        # the output far past the original length. When the clamp
+        # binds, the narration is fitted to the clamped video duration
+        # (atempo up to PRO_TTS_FIT_MAX, then trim the tail) and the
+        # synced timeline follows the VIDEO durations, not the raw
+        # narration lengths — so concat never drifts.
         synced: List[Dict] = []
         block_outs: List[str] = []
         cum = 0.0
@@ -1107,19 +1106,36 @@ def render_pro_recap_video(
             if audio_len <= 0:
                 raise VideoEditorError(
                     f"Pro block {i} audio duration is 0.")
-            speed = seg_dur / audio_len
             out = os.path.join(block_dir, f"block_{i:03d}.mp4")
+            raw_speed = seg_dur / audio_len
+            speed = min(PRO_SPEED_MAX, max(PRO_SPEED_MIN, raw_speed))
+            video_dur = seg_dur / speed
+            # Fit the block narration to the clamped video duration.
+            if audio_len > video_dur + 1e-3:
+                fit_factor = audio_len / video_dur
+                if fit_factor <= PRO_TTS_FIT_MAX:
+                    tts_fit = f"atempo={fit_factor:.4f}"
+                else:
+                    tts_fit = (
+                        f"atempo={PRO_TTS_FIT_MAX:.4f},"
+                        f"atrim=0:{video_dur:.3f}"
+                    )
+            elif audio_len < video_dur - 1e-3:
+                tts_fit = f"apad,atrim=0:{video_dur:.3f}"
+            else:
+                tts_fit = "anull"
             if seg_meta["has_audio"]:
                 fc = (
                     f"[0:v]setpts=PTS/{speed:.4f}[v];"
                     f"[0:a]{_atempo_chain(speed)},volume={bg_volume}[bg];"
-                    f"[bg][1:a]amix=inputs=2:duration=longest:"
+                    f"[1:a]{tts_fit},aresample=44100[tts];"
+                    f"[bg][tts]amix=inputs=2:duration=shortest:"
                     f"dropout_transition=0:normalize=0,"
                     f"alimiter=limit=0.95,aresample=44100[a]"
                 )
             else:
                 fc = (f"[0:v]setpts=PTS/{speed:.4f}[v];"
-                      f"[1:a]aresample=44100[a]")
+                      f"[1:a]{tts_fit},aresample=44100[a]")
             _run(
                 ["ffmpeg", "-y", "-v", "error",
                  "-i", seg, "-i", b["audio_path"],
@@ -1135,10 +1151,11 @@ def render_pro_recap_video(
                 **b,
                 "speed": round(speed, 4),
                 "audio_len": round(audio_len, 3),
+                "video_dur": round(video_dur, 3),
                 "synced_start": round(cum, 3),
-                "synced_end": round(cum + audio_len, 3),
+                "synced_end": round(cum + video_dur, 3),
             })
-            cum += audio_len
+            cum += video_dur
 
         # 3) concatenate the synced blocks (video + audio)
         concat_path = _concat_segments(block_outs, block_dir)

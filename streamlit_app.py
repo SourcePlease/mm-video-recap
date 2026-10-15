@@ -25,7 +25,11 @@ from streamlit_js_eval import streamlit_js_eval
 
 from canvas_component import CANVAS_DEFAULT, interactive_canvas
 from pipeline import run_full_recap_pipeline
-from video_editor import SUBTITLE_COLORS, SUBTITLE_FONTS
+from video_editor import (
+    SUBTITLE_COLOR_RGB,
+    SUBTITLE_FONTS,
+    _subtitle_font_file,
+)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEMO_SAMPLE = os.path.join(APP_DIR, "sample_test.mp4")
@@ -450,6 +454,34 @@ _preview = {
         st.session_state.get("mirror_horizontal", False)),
     "copyright_zoom": float(st.session_state.get("copyright_zoom", 1.07)),
 }
+# Fix 4: reactive subtitle style for the canvas preview — the
+# Subtitles-tab colour + font flow into the canvas live, so changing
+# the dropdown/radio immediately recolours / re-fonts the placeholder
+# ("ဒီနေရာမှာ စာတန်းထိုး ပေါ်မယ်") instead of only showing in the
+# rendered video. The font file is sent as a data URL until the canvas
+# acks the load (tracked in _canvas_font_loaded from the component
+# value's loaded_font field); otherwise font_data is None and the
+# canvas keeps its loaded font.
+_sub_font = str(st.session_state.get("subtitle_font", "Pyidaungsu"))
+_sub_rgb = SUBTITLE_COLOR_RGB.get(
+    str(st.session_state.get("subtitle_color", "Yellow")), (255, 255, 0))
+_sub_font_data = None
+if st.session_state.get("_canvas_font_loaded") != _sub_font:
+    try:
+        with open(_subtitle_font_file(_sub_font), "rb") as _ff:
+            _sub_font_data = (
+                "data:font/ttf;base64,"
+                + base64.b64encode(_ff.read()).decode()
+            )
+    except (OSError, ValueError):
+        _sub_font_data = None
+_subtitle_style = {
+    "font_family": _sub_font,
+    "color": "#%02x%02x%02x" % _sub_rgb,
+    # Stroke has no picker in the UI: always black, like the renderer.
+    "stroke": "#000000",
+    "font_data": _sub_font_data,
+}
 _val = interactive_canvas(
     video_id=_canvas_video_id,
     video_data_url=_canvas_data_url,
@@ -466,9 +498,16 @@ _val = interactive_canvas(
         else None
     ),
     preview=_preview,
+    subtitle_style=_subtitle_style,
     key="mmr_canvas",
 )
 if isinstance(_val, dict):
+    # Fix 4 ack: the canvas reports which subtitle font it actually
+    # loaded. Python keeps sending font_data until the canvas acks
+    # this font.
+    _loaded_font = _val.get("loaded_font")
+    if isinstance(_loaded_font, str) and _loaded_font:
+        st.session_state["_canvas_font_loaded"] = _loaded_font
     _action = _val.get("action")
     # Actions are sticky: the component's last value is re-returned on
     # every rerun, so consume each nonce exactly once.
@@ -566,10 +605,14 @@ if isinstance(_val, dict):
             _fpct = _s.get("font_size_pct")
             if _fpct is None:
                 _fpct = float(_s.get("font_size", 22)) / 400.0
+            _wpct = _s.get("w_pct")
             st.session_state["canvas_sub"] = {
                 "x_pct": float(_s.get("x_pct", 0.5)),
                 "y_pct": float(_s.get("y_pct", 0.82)),
                 "font_size_pct": float(_fpct),
+                # Subtitle box width (Fix 3): None = auto width.
+                "w_pct": (None if _wpct is None
+                          else float(_wpct)),
             }
         except (TypeError, ValueError):
             pass  # keep previous canvas state on malformed values
@@ -730,8 +773,8 @@ with tab_sub:
     )
     subtitle_color = st.radio(
         " စာတန်းထိုး အရောင် ရွေးပါ",
-        options=list(SUBTITLE_COLORS.keys()),
-        index=list(SUBTITLE_COLORS.keys()).index("Yellow"),
+        options=list(SUBTITLE_COLOR_RGB.keys()),
+        index=list(SUBTITLE_COLOR_RGB.keys()).index("Yellow"),
         key="subtitle_color",
     )
     _sub_info = st.session_state.get("canvas_sub") or dict(
@@ -744,6 +787,11 @@ with tab_sub:
         f"y={float(_sub_info.get('y_pct', 0.82)):.2f}, "
         f"font={float(_sub_info.get('font_size_pct', 0.055)) * 100:.1f}% "
         f"(အကျယ်၏)"
+        + (
+            f", width={float(_sub_info['w_pct']) * 100:.0f}%"
+            if _sub_info.get("w_pct") is not None
+            else ""
+        )
     )
 
 
@@ -898,6 +946,9 @@ if run_btn:
             _sub.get("font_size_pct",
                      float(_sub.get("font_size", 22)) / 400.0)
         ),
+        # Canvas subtitle box width (Fix 3): the renderer wraps to
+        # this width; None = auto (92% of the frame width).
+        "w_pct": _sub.get("w_pct"),
         # Subtitles-tab choices: bundled Unicode font + text colour.
         # Defaults are Step 13: Pyidaungsu + Yellow.
         "font_family": str(st.session_state.get("subtitle_font", "Pyidaungsu")),
