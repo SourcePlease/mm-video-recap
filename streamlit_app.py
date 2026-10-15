@@ -31,7 +31,7 @@ DEMO_SAMPLE = os.path.join(APP_DIR, "sample_test.mp4")
 
 st.set_page_config(
     page_title="100% Free Online Video Recap",
-    page_icon="🎬",
+    page_icon="⬛",
     layout="centered",
 )
 
@@ -41,25 +41,25 @@ LIQUID_GLASS_CSS = """
 /* Page: deep dark backdrop so the glass cards read as glass. */
 .stApp {
   background:
-    radial-gradient(1200px 600px at 85% -10%, rgba(59, 130, 246, 0.28), transparent 60%),
-    radial-gradient(900px 500px at -10% 20%, rgba(139, 92, 246, 0.22), transparent 55%),
-    linear-gradient(160deg, #0b1220 0%, #101a2e 45%, #0a0f1e 100%);
-  color: #e8edf7;
+    radial-gradient(1200px 600px at 85% -10%, rgba(255, 255, 255, 0.07), transparent 60%),
+    radial-gradient(900px 500px at -10% 20%, rgba(255, 255, 255, 0.05), transparent 55%),
+    linear-gradient(160deg, #000000 0%, #111111 45%, #000000 100%);
+  color: #f5f5f5;
 }
 .stApp > header[data-testid="stHeader"] {
   background: transparent;
 }
 .stApp h1, .stApp h2, .stApp h3, .stApp h4,
 .stApp p, .stApp li, .stApp label, .stApp span {
-  color: #e8edf7;
+  color: #f5f5f5;
 }
 .stApp [data-testid="stCaptionContainer"] {
-  color: #94a3b8;
+  color: #a3a3a3;
 }
 
 /* Segmented Tab Bar: black bar (matches the reference image). */
 div[data-testid="stTabs"] div[role="tablist"] {
-  background: #0b0f1a;
+  background: #000000;
   border-radius: 20px;
   padding: 6px;
   gap: 6px;
@@ -67,7 +67,7 @@ div[data-testid="stTabs"] div[role="tablist"] {
 }
 div[data-testid="stTabs"] div[role="tab"] {
   background: transparent;
-  color: #94a3b8;
+  color: #a3a3a3;
   border-radius: 18px;
   font-weight: 500;
   border: none;
@@ -75,23 +75,23 @@ div[data-testid="stTabs"] div[role="tab"] {
   cursor: pointer;
 }
 div[data-testid="stTabs"] div[role="tab"] p {
-  color: #94a3b8;
+  color: #a3a3a3;
 }
 div[data-testid="stTabs"] div[role="tab"]:hover {
-  color: #e2e8f0;
+  color: #ffffff;
 }
 div[data-testid="stTabs"] div[role="tab"]:hover p {
-  color: #e2e8f0;
+  color: #ffffff;
 }
 div[data-testid="stTabs"] div[role="tab"][aria-selected="true"] {
   background: #ffffff;
-  color: #2563eb;
+  color: #000000;
   border-radius: 18px;
   font-weight: 600;
   box-shadow: 0 4px 15px rgba(0, 0, 0, 0.25);
 }
 div[data-testid="stTabs"] div[role="tab"][aria-selected="true"] p {
-  color: #2563eb;
+  color: #000000;
 }
 /* Hide the default underline indicator — the white pill is the indicator. */
 div[data-testid="stTabs"] .react-aria-SelectionIndicator {
@@ -114,35 +114,46 @@ div[role="tabpanel"] {
 .stApp [data-testid="stTextInput"] input,
 .stApp [data-testid="stSelectbox"] > div > div {
   background: rgba(255, 255, 255, 0.08);
-  color: #f1f5f9;
+  color: #f5f5f5;
   border: 1px solid rgba(255, 255, 255, 0.14);
 }
 .stApp [data-testid="stTextInput"] input::placeholder {
-  color: #64748b;
+  color: #737373;
 }
 
-/* Action Button: Liquid glowing gradient. */
+/* Alert boxes (success / error / info): monochrome, no green/red/blue. */
+.stApp [data-testid="stAlert"] {
+  background: #ffffff;
+  color: #000000;
+  border: 1px solid #000000;
+}
+.stApp [data-testid="stAlert"] p,
+.stApp [data-testid="stAlert"] span {
+  color: #000000;
+}
+
+/* Action Button: solid white, black text (no gradient colour). */
 .stApp button[data-testid="stBaseButton-primary"] {
-  background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 50%, #ec4899 100%);
-  color: #ffffff;
+  background: #ffffff;
+  color: #000000;
   border: none;
   border-radius: 18px;
   font-weight: 700;
-  box-shadow: 0 8px 28px rgba(139, 92, 246, 0.45),
-              0 0 0 1px rgba(255, 255, 255, 0.18) inset;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5),
+              0 0 0 1px rgba(255, 255, 255, 0.3) inset;
   padding: 14px 22px;
 }
 .stApp button[data-testid="stBaseButton-primary"]:hover {
-  filter: brightness(1.12);
-  box-shadow: 0 10px 34px rgba(139, 92, 246, 0.6),
-              0 0 0 1px rgba(255, 255, 255, 0.25) inset;
+  background: #e5e5e5;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.6),
+              0 0 0 1px rgba(255, 255, 255, 0.4) inset;
 }
 </style>
 """
 st.markdown(LIQUID_GLASS_CSS, unsafe_allow_html=True)
 
 HEADER_TOP = """\
-# 🎬 100% Free Online Video Recap
+#  100% Free Online Video Recap
 
 ဗီဒီယိုအရှည်ကြီးတွေကို **မြန်မာ AI အသံ** ဖြင့် အကျဉ်းချုပ်ပေးတဲ့ အခမဲ့စနစ်။
 သင့်ရဲ့ **ကိုယ်ပိုင် Free Gemini API Key** နဲ့သာ အလုပ်လုပ်ပါတယ် —
@@ -150,8 +161,8 @@ Key ကို server မှာ သိမ်းထားခြင်း **လု�
 """
 
 KEY_GUIDE = """\
-### 🔑 Free Gemini API Key အခမဲ့ယူနည်း (၁ မိနစ်အတွင်း၊ ကတ်မလို)
-1. 👉 **[https://aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)** ကို နှိပ်ပါ
+###  Free Gemini API Key အခမဲ့ယူနည်း (၁ မိနစ်အတွင်း၊ ကတ်မလို)
+1.  **[https://aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)** ကို နှိပ်ပါ
 2. **"Create API Key"** → **"Create API key in new project"** ကို ရွေးပါ
 3. ရလာတဲ့ Key ကို copy ကူးပြီး အောက်က အကွက်မှာ paste ထည့်ပါ
 """
@@ -198,7 +209,7 @@ def verify_gemini_api_key(user_api_key: str):
     """
     key = (user_api_key or "").strip()
     if not key:
-        return False, "❌ API Key ထည့်သွင်းပေးပါ"
+        return False, "✕ API Key ထည့်သွင်းပေးပါ"
     try:
         from google import genai
 
@@ -206,11 +217,11 @@ def verify_gemini_api_key(user_api_key: str):
         # Force exactly one small HTTP request; any auth/network failure
         # raises here, which means the key is not usable.
         next(iter(client.models.list()), None)
-        return True, "✅ API Key မှန်ကန်ပါသည်"
+        return True, "✓ API Key မှန်ကန်ပါသည်"
     except Exception:  # noqa: BLE001 - any failure means the key can't be used
         return (
             False,
-            "❌ API Key မှားယွင်းနေပါသည် သို့မဟုတ် အလုပ်မလုပ်ပါ။ "
+            "✕ API Key မှားယွင်းနေပါသည် သို့မဟုတ် အလုပ်မလုပ်ပါ။ "
             "Key အမှန်ကို ပြန်စစ်ပေးပါ",
         )
 
@@ -317,10 +328,10 @@ if _canvas_video_id is not None:
 else:
     st.session_state["canvas_vid"] = None
 
-st.markdown("### 📱 Main Canvas — ဗီဒီယို ပြင်ဆင်ရန်")
+st.markdown("###  Main Canvas — ဗီဒီယို ပြင်ဆင်ရန်")
 st.caption(
-    "📹 ဗီဒီယို မရှိသေးရင် Canvas ထဲမှာပဲ ရွေးပါ / URL ထည့်ပါ။ "
-    "✏️ Edit ကို နှိပ်ပြီး Blur ထည့်ခြင်း / စာတန်းနေရာ ရွှေ့ခြင်း တို့ကို "
+    " ဗီဒီယို မရှိသေးရင် Canvas ထဲမှာပဲ ရွေးပါ / URL ထည့်ပါ။ "
+    " Edit ကို နှိပ်ပြီး Blur ထည့်ခြင်း / စာတန်းနေရာ ရွှေ့ခြင်း တို့ကို "
     "လုပ်နိုင်ပါတယ်။"
 )
 _val = interactive_canvas(
@@ -402,7 +413,7 @@ if isinstance(_val, dict):
                 pass
             _reset_canvas_state()
         except Exception:  # noqa: BLE001 - bad payload: keep previous state
-            st.error("❌ ဗီဒီယိုဖိုင် ဖတ်လို့ မရပါ။ ထပ်ကြိုးစားပေးပါ")
+            st.error("✕ ဗီဒီယိုဖိုင် ဖတ်လို့ မရပါ။ ထပ်ကြိုးစားပေးပါ")
         st.session_state["_canvas_rerun_needed"] = True
     elif _action == "video_url":
         _u = (_val.get("video_url") or "").strip()
@@ -443,7 +454,7 @@ if isinstance(_val, dict):
 
 # ---- Step 12: Segmented Settings Tabs (directly below the canvas) ----
 tab_src, tab_voice, tab_sub, tab_adv = st.tabs(
-    ["▶️ Source", "🎙️ Voice", "💬 Subtitles", "🎛️ Advanced"]
+    [" Source", " Voice", " Subtitles", " Advanced"]
 )
 
 with tab_src:
@@ -455,25 +466,25 @@ with tab_src:
         _src_name = st.session_state["src_url"]
     elif demo_active:
         _src_name = "Demo ဗီဒီယို (sample_test.mp4)"
-    st.caption(f"📹 လက်ရှိ ဗီဒီယို: {_src_name}")
+    st.caption(f" လက်ရှိ ဗီဒီယို: {_src_name}")
     demo_mode = st.checkbox(
-        "🧪 API Key မပါဘဲ Demo စမ်းသပ်မည် (Mock Mode)",
+        " API Key မပါဘဲ Demo စမ်းသပ်မည် (Mock Mode)",
         value=False,
         key="demo_mode",
         on_change=_demo_toggled,
     )
-    model_choice = st.selectbox("🤖 AI Model ရွေးပါ", MODEL_OPTIONS, index=0)
-    recap_length = st.slider("🎞️ Recap အရှည် (စက္ကန့်)", 15, 120, 30, 5)
+    model_choice = st.selectbox(" AI Model ရွေးပါ", MODEL_OPTIONS, index=0)
+    recap_length = st.slider(" Recap အရှည် (စက္ကန့်)", 15, 120, 30, 5)
 
 with tab_voice:
-    voice_choice = st.radio("🎙️ မြန်မာ AI အသံ ရွေးပါ", VOICE_CHOICES, index=0)
+    voice_choice = st.radio(" မြန်မာ AI အသံ ရွေးပါ", VOICE_CHOICES, index=0)
     bg_volume = st.slider(
-        "🔊 မူရင်းနောက်ခံအသံ အတိုးအကျယ်", 0.0, 0.5, 0.15, 0.05
+        " မူရင်းနောက်ခံအသံ အတိုးအကျယ်", 0.0, 0.5, 0.15, 0.05
     )
 
 with tab_sub:
     burn_subtitles = st.checkbox(
-        "💬 မြန်မာစာတန်းထိုး Burn-in ထည့်မည်",
+        " မြန်မာစာတန်းထိုး Burn-in ထည့်မည်",
         value=True,
         key="burn_subtitles",
     )
@@ -481,7 +492,7 @@ with tab_sub:
         CANVAS_DEFAULT["subtitle"]
     )
     st.caption(
-        "✏️ စာတန်းရဲ့ နေရာ / အရွယ်အစားကို Canvas မှာ Edit နှိပ်ပြီး "
+        " စာတန်းရဲ့ နေရာ / အရွယ်အစားကို Canvas မှာ Edit နှိပ်ပြီး "
         "စာတန်းသေတ္တာကို ဆွဲ / အရွယ်ချဲ့ ချိန်နိုင်ပါတယ်။ "
         f"လက်ရှိ: x={float(_sub_info.get('x_pct', 0.5)):.2f}, "
         f"y={float(_sub_info.get('y_pct', 0.82)):.2f}, "
@@ -499,7 +510,7 @@ with tab_adv:
         st.session_state["api_key"] = st.session_state.get("api_key_box", "")
 
     key_input = st.text_input(
-        "🔑 သင်၏ Free Gemini API Key ထည့်ပါ",
+        " သင်၏ Free Gemini API Key ထည့်ပါ",
         type="password",
         # Always start empty: the restored key is shown via the blue note,
         # never echoed back into the box (and an autofill ghost in the box
@@ -515,13 +526,13 @@ with tab_adv:
     # the restore above and by _key_changed (a real user edit).
 
     if browser_saved and st.session_state["api_key"] == browser_saved:
-        st.info("🟢 သိမ်းဆည်းထားသော API Key အသင့်ရှိနေပါသည်")
+        st.info("✓ သိမ်းဆည်းထားသော API Key အသင့်ရှိနေပါသည်")
 
     key_col1, key_col2 = st.columns(2)
     with key_col1:
-        verify_save_btn = st.button("✅ API Key စစ်ဆေးပြီး Browser မှာ သိမ်းမည်")
+        verify_save_btn = st.button("✓ API Key စစ်ဆေးပြီး Browser မှာ သိမ်းမည်")
     with key_col2:
-        forget_btn = st.button("🗑️ သိမ်းထားသော Key ဖျက်မည်")
+        forget_btn = st.button(" သိမ်းထားသော Key ဖျက်မည်")
 
     if verify_save_btn:
         _k = (st.session_state["api_key"] or "").strip()
@@ -532,7 +543,7 @@ with tab_adv:
                 key="mmr_key_save",
             )
             st.success(
-                "✅ API Key မှန်ကန်ကြောင်း စစ်ဆေးပြီး "
+                "✓ API Key မှန်ကန်ကြောင်း စစ်ဆေးပြီး "
                 "သင့် Browser တွင် သိမ်းဆည်းပြီးပါပြီ!"
             )
         else:
@@ -551,15 +562,15 @@ with tab_adv:
             del st.session_state["api_key_box"]
         st.rerun()
 
-    aspect_choice = st.radio("📐 Aspect Ratio ရွေးပါ", ASPECT_CHOICES, index=0)
+    aspect_choice = st.radio(" Aspect Ratio ရွေးပါ", ASPECT_CHOICES, index=0)
 
-run_btn = st.button("🎬 Recap ဗီဒီယို ထုတ်လုပ်မည်", type="primary")
+run_btn = st.button(" Recap ဗီဒီယို ထုတ်လုပ်မည်", type="primary")
 
 if run_btn:
     key = (st.session_state.get("api_key") or "").strip()
 
     if not demo_active and not key:
-        st.error("❌ ကျေးဇူးပြု၍ သင်၏ Free Gemini API Key ကို ထည့်သွင်းပေးပါ")
+        st.error("✕ ကျေးဇူးပြု၍ သင်၏ Free Gemini API Key ကို ထည့်သွင်းပေးပါ")
         st.stop()
 
     # Source precedence matches the canvas display: picked file > demo > URL.
@@ -571,10 +582,10 @@ if run_btn:
         if os.path.isfile(DEMO_SAMPLE):
             src_path = DEMO_SAMPLE
         else:
-            st.error("❌ Demo video မရှိပါ")
+            st.error("✕ Demo video မရှိပါ")
             st.stop()
     if not src_path and not src_url:
-        st.error("❌ Canvas ထဲမှာ ဗီဒီယို ရွေးပေးပါ သို့မဟုတ် Video URL ထည့်ပေးပါ")
+        st.error("✕ Canvas ထဲမှာ ဗီဒီယို ရွေးပေးပါ သို့မဟုတ် Video URL ထည့်ပေးပါ")
         st.stop()
 
     # Per-run isolated working directory (multi-user safety).
@@ -595,7 +606,7 @@ if run_btn:
     _blur_boxes = st.session_state.get("canvas_blur") or None
 
     try:
-        with st.spinner("⏳ Recap ဗီဒီယို ထုတ်လုပ်နေပါတယ်… ခဏစောင့်ပေးပါ"):
+        with st.spinner(" Recap ဗီဒီယို ထုတ်လုပ်နေပါတယ်… ခဏစောင့်ပေးပါ"):
             result = run_full_recap_pipeline(
                 video_path=src_path,
                 video_url=src_url,
@@ -615,36 +626,36 @@ if run_btn:
                 subtitle_config=_subtitle_config,
             )
         status = (
-            f"✅ ပြီးဆုံးပါပြီ! | {result['aspect_ratio']} | "
+            f"✓ ပြီးဆုံးပါပြီ! | {result['aspect_ratio']} | "
             f"စာတန်း: {result['subtitle_mode']} | "
             f"sync: {result['sync_method']} ({result['video_speed_factor']})"
         )
         st.success(status)
         st.video(result["final_video_path"])
-        st.text_input("📌 ခေါင်းစဉ်", value=result["title"], disabled=True)
+        st.text_input(" ခေါင်းစဉ်", value=result["title"], disabled=True)
         st.text_area(
-            "📝 ဇာတ်ကြောင်းပြော Script",
+            " ဇာတ်ကြောင်းပြော Script",
             value=result["script_text"],
             height=200,
             disabled=True,
         )
         with open(result["final_video_path"], "rb") as f:
             st.download_button(
-                "⬇️ Recap ဗီဒီယို Download (.mp4)",
+                " Recap ဗီဒီယို Download (.mp4)",
                 data=f.read(),
                 file_name="recap.mp4",
                 mime="video/mp4",
             )
         with open(result["srt_path"], "rb") as f:
             st.download_button(
-                "⬇️ မြန်မာစာတန်းထိုး Download (.srt)",
+                " မြန်မာစာတန်းထိုး Download (.srt)",
                 data=f.read(),
                 file_name="subtitles.srt",
                 mime="text/plain",
             )
     except Exception as exc:  # noqa: BLE001 - surfaced to the user in Myanmar UI
         traceback.print_exc()
-        st.error(f"❌ အမှား: {exc}")
+        st.error(f"✕ အမှား: {exc}")
 
 # A canvas action asked for a refresh. Do it now — after the Run
 # handler has had its chance — so a Run click that arrived in the same
