@@ -84,6 +84,28 @@ RECAP_JSON_SCHEMA: Dict[str, Any] = {
     "required": ["title", "highlights", "burmese_script"],
 }
 
+# Strict JSON schema for the Pro AI Recap block plan (Step 15): the whole
+# video tiled into sequential dialogue blocks, each with Myanmar text.
+PRO_BLOCKS_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "blocks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "number"},
+                    "end": {"type": "number"},
+                    "text": {"type": "string"},
+                },
+                "required": ["start", "end", "text"],
+            },
+        },
+    },
+    "required": ["title", "blocks"],
+}
+
 
 class AnalyzerError(Exception):
     """Analyzer failure carrying a user-facing Myanmar message."""
@@ -200,6 +222,91 @@ def _build_prompt(target_duration: int, style: str) -> str:
     )
 
 
+def _build_pro_prompt() -> str:
+    """Prompt for Pro AI Recap (Step 15): sequential dialogue blocks."""
+    return (
+        "သင်သည် မြန်မာ Dialogue ဗီဒီယို ပြန်ဆိုသူ (dubbing) ကျွမ်းကျင်သူဖြစ်သည်။\n"
+        "ပေးထားသော ဗီဒီယိုကို အစမှအဆုံး ကြည့်ပြီး စကားပြော (dialogue) အလိုက် "
+        "Sequential Blocks များ အဖြစ် ခွဲပေးပါ။\n\n"
+        "- Block တစ်ခုချင်းစီသည် ဗီဒီယို၏ ဆက်တိုက် အပိုင်းဖြစ်ရမည်။ "
+        "ပထမ Block က 0.0 တွင် စရမည်၊ နောက်ဆုံး Block က ဗီဒီယို၏ အဆုံးတွင် "
+        "ဆုံးရမည်။ Blocks များအကြား လစ်ဟာမှု (gap) သို့မဟုတ် ထပ်မှု "
+        "(overlap) မရှိရပါ။\n"
+        "- Block တစ်ခုချင်းစီအတွက် start/end ကို စက္ကန့်ဖြင့် (ဒသမ) ပေးပါ။ "
+        "Block တစ်ခု၏ ကြာချိန်သည် များသောအားဖြင့် ၃–၈ စက္ကန့် ဖြစ်သင့်သည်။\n"
+        "- text သည် ထို Block ၏ စကားပြောကို မြန်မာလို ပြန်ဆိုထားသော "
+        "(သို့မဟုတ် ဇာတ်ကြောင်းပြော) စာသားဖြစ်ရမည်။\n"
+        "- မြန်မာစာလုံးပေါင်း အတိအကျ မှန်ရမည်။ မြန်မာစာအဖွဲ့၏ စံစာလုံးပေါင်း "
+        "(standard Myanmar orthography) ကိုသာ သုံးပါ။ အသတ် (်)၊ ဝိသဇ္ဇနာ (း)၊ "
+        "အက္ခရာတွဲများ (stacked consonants) ကို မှန်ကန်စွာ သုံးပါ။ "
+        "စံမဟုတ်သော၊ တီထွင်ထားသော စာလုံးပေါင်းများ လုံးဝ မသုံးပါနှင့်။\n"
+        "- title နှင့် text အားလုံးသည် Unicode မြန်မာစာ (Unicode Myanmar "
+        "encoding) ဖြင့်သာ ရေးရမည်။ Zawgyi encoding လုံးဝ မသုံးပါနှင့်။\n\n"
+        "STRICT JSON ONLY ဖြင့် ပြန်ပေးပါ။ JSON မှလွဲ၍ အခြားစာသား မထည့်ပါနှင့်။\n"
+        'ပုံစံ: {"title": "...", "blocks": '
+        '[{"start": 0.0, "end": 5.0, "text": "..."}, '
+        '{"start": 5.0, "end": 10.0, "text": "..."}]}'
+    )
+
+
+def _generate_with_fallback(client: genai.Client, uploaded, prompt: str,
+                            schema: Dict[str, Any],
+                            pinned: Optional[str]) -> Dict[str, Any]:
+    """Generate strict JSON from an uploaded video, trying models in order.
+
+    Candidate order: explicit user pick -> static MODEL_CANDIDATES -> live
+    discovery of other flash models this key can access. Returns the parsed
+    JSON dict, or raises AnalyzerError when no model answers.
+    """
+    candidates: List[str] = []
+    pinned = (pinned or "").strip()
+    if pinned and pinned.lower() != "auto":
+        candidates.append(pinned)
+    for m in MODEL_CANDIDATES:
+        if m not in candidates:
+            candidates.append(m)
+
+    plan: Optional[Dict[str, Any]] = None
+    last_err: Optional[Exception] = None
+    tried: List[str] = []
+
+    def _try_generate(mid: str) -> bool:
+        nonlocal plan, last_err
+        tried.append(mid)
+        try:
+            resp = client.models.generate_content(
+                model=mid,
+                contents=[uploaded, prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_json_schema=schema,
+                ),
+            )
+            plan = json.loads(resp.text)
+            return True
+        except Exception as exc:  # noqa: BLE001 - inspected below
+            if _looks_like_model_error(exc):
+                last_err = exc
+                return False
+            raise
+
+    for mid in candidates:
+        if _try_generate(mid):
+            break
+    if plan is None:
+        # Dynamic fallback: ask the API which flash models this key
+        # can actually use, and try each of them.
+        for mid in _discover_flash_models(client, tried):
+            if _try_generate(mid):
+                break
+    if plan is None:
+        raise AnalyzerError(
+            "AI model နှင့် ချိတ်ဆက်၍ မရပါ။ "
+            f"({last_err if last_err else 'unknown error'})"
+        )
+    return plan
+
+
 # --------------------------------------------------------------------------- #
 # public API
 # --------------------------------------------------------------------------- #
@@ -229,59 +336,48 @@ def analyze_video_for_recap(
     try:
         _wait_for_active(client, uploaded.name)
         prompt = _build_prompt(target_duration, style)
-
-        # Candidate order: explicit user pick -> static list -> dynamic.
-        candidates: List[str] = []
-        pinned = (model or "").strip()
-        if pinned and pinned.lower() != "auto":
-            candidates.append(pinned)
-        for m in MODEL_CANDIDATES:
-            if m not in candidates:
-                candidates.append(m)
-
-        plan: Optional[Dict[str, Any]] = None
-        last_err: Optional[Exception] = None
-        tried: List[str] = []
-
-        def _try_generate(mid: str) -> bool:
-            nonlocal plan, last_err
-            tried.append(mid)
-            try:
-                resp = client.models.generate_content(
-                    model=mid,
-                    contents=[uploaded, prompt],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_json_schema=RECAP_JSON_SCHEMA,
-                    ),
-                )
-                plan = json.loads(resp.text)
-                return True
-            except Exception as exc:  # noqa: BLE001 - inspected below
-                if _looks_like_model_error(exc):
-                    last_err = exc
-                    return False
-                raise
-
-        for mid in candidates:
-            if _try_generate(mid):
-                break
-        if plan is None:
-            # Dynamic fallback: ask the API which flash models this key
-            # can actually use, and try each of them.
-            for mid in _discover_flash_models(client, tried):
-                if _try_generate(mid):
-                    break
-        if plan is None:
-            raise AnalyzerError(
-                "AI model နှင့် ချိတ်ဆက်၍ မရပါ။ "
-                f"({last_err if last_err else 'unknown error'})"
-            )
-
+        plan = _generate_with_fallback(
+            client, uploaded, prompt, RECAP_JSON_SCHEMA, model)
         metadata = get_video_metadata(path)
         return validate_recap_plan(plan, metadata.get("duration") or 0)
     finally:
         # Keep the user's free cloud storage clean, even on failure.
+        try:
+            client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
+
+
+def analyze_video_pro_blocks(
+    video_path,
+    user_api_key: str,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Analyze a dialogue video with the USER's own Gemini key (Step 15).
+
+    Returns a Pro block plan: {"title", "blocks": [{start, end, text}...],
+    "burmese_script"} — the blocks tile the whole video [0, duration] with
+    no gaps/overlaps (see validate_pro_blocks). ``model`` optionally pins
+    one model ID (tried first); otherwise the same fallback chain as the
+    recap analyzer runs. The uploaded remote file is always deleted in a
+    ``finally:`` block.
+    """
+    api_key = _require_key(user_api_key)
+
+    path = str(video_path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Video file not found: {path}")
+
+    client = genai.Client(api_key=api_key)
+    uploaded = client.files.upload(file=path)
+    try:
+        _wait_for_active(client, uploaded.name)
+        prompt = _build_pro_prompt()
+        plan = _generate_with_fallback(
+            client, uploaded, prompt, PRO_BLOCKS_JSON_SCHEMA, model)
+        metadata = get_video_metadata(path)
+        return validate_pro_blocks(plan, metadata.get("duration") or 0)
+    finally:
         try:
             client.files.delete(name=uploaded.name)
         except Exception:
@@ -320,6 +416,83 @@ def validate_recap_plan(
         "highlights": cleaned,
         "burmese_script": str(plan_dict.get("burmese_script", "")).strip(),
     }
+
+
+def validate_pro_blocks(
+    plan_dict: Dict[str, Any], video_duration: float
+) -> Dict[str, Any]:
+    """Normalize Pro blocks into a clean tiling of [0, video_duration].
+
+    Sorts by start, clamps into range, drops empty blocks, fills gaps by
+    extending the previous block's end (so no video is dropped), cuts
+    overlaps at the previous block's end, forces the first block to start
+    at 0.0 and extends the last block to the full duration. Returns
+    {"title", "blocks", "burmese_script"} (script = joined block texts).
+    """
+    if not isinstance(plan_dict, dict):
+        raise AnalyzerError("AI မှ ပြန်လာသော ရလဒ် ပုံစံမမှန်ပါ။")
+    duration = max(0.0, float(video_duration or 0))
+
+    raw: List[Dict[str, Any]] = []
+    for b in plan_dict.get("blocks", []) or []:
+        try:
+            start = float(b.get("start", 0))
+            end = float(b.get("end", 0))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        raw.append({"start": start, "end": end,
+                    "text": str(b.get("text", "")).strip()})
+    raw.sort(key=lambda b: b["start"])
+
+    blocks: List[Dict[str, Any]] = []
+    for b in raw:
+        s = max(0.0, min(b["start"], duration))
+        e = max(0.0, min(b["end"], duration))
+        if not blocks:
+            s = 0.0  # the first block always starts at 0
+        else:
+            prev = blocks[-1]
+            if s > prev["end"]:
+                prev["end"] = round(s, 2)  # fill the gap: extend previous
+            s = prev["end"]  # cut any overlap
+        if e <= s:
+            continue
+        blocks.append({"start": round(s, 2), "end": round(e, 2),
+                       "text": b["text"]})
+    if blocks and blocks[-1]["end"] < duration:
+        blocks[-1]["end"] = round(duration, 2)
+    return {
+        "title": str(plan_dict.get("title", "")).strip(),
+        "blocks": blocks,
+        "burmese_script": " ".join(b["text"] for b in blocks).strip(),
+    }
+
+
+def generate_mock_pro_plan(video_duration: float) -> Dict[str, Any]:
+    """Offline mock Pro block plan (no API key needed) for pipeline testing."""
+    duration = max(0.0, float(video_duration or 0))
+    blocks: List[Dict[str, Any]] = []
+    seg_len = 5.0
+    t = 0.0
+    idx = 1
+    while t < duration:
+        end = min(t + seg_len, duration)
+        blocks.append(
+            {
+                "start": round(t, 2),
+                "end": round(end, 2),
+                "text": f"အခန်း {idx}: ဗီဒီယို၏ စကားပြော အပိုင်း "
+                        f"({t:.0f}–{end:.0f} စက္ကန့်)",
+            }
+        )
+        t = end
+        idx += 1
+    plan = {
+        "title": "စမ်းသပ် Pro ဗီဒီယို",
+        "blocks": blocks,
+        "burmese_script": " ".join(b["text"] for b in blocks),
+    }
+    return validate_pro_blocks(plan, duration)
 
 
 def generate_mock_recap_plan(video_duration: float) -> Dict[str, Any]:

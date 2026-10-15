@@ -14,6 +14,7 @@ No API keys are used or stored anywhere in this module.
 from __future__ import annotations
 
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -401,6 +402,305 @@ def _blur_filter_steps(base_label: str, boxes: List[Dict]
     return steps, cur
 
 
+# --------------------------------------------------------------------------- #
+# Step 15: aspect ratios, fit modes, copyright filters, Pro blocks
+# --------------------------------------------------------------------------- #
+# Fixed output sizes for the Source tab's aspect ratios. "original" keeps
+# the source WxH (forced even for yuv420p).
+ASPECT_TARGETS: Dict[str, Tuple[int, int]] = {
+    "9:16": (720, 1280),
+    "1:1": (720, 720),
+    "4:5": (720, 900),
+    "16:9": (1280, 720),
+}
+
+# Processing modes (Source tab): "ai_recap" = narration recap (audio is
+# master, video stretches to fit it); "pro_ai_recap" = dialogue video,
+# split into sequential blocks, each block speed-synced independently.
+PROCESSING_MODES = ("ai_recap", "pro_ai_recap")
+
+
+def _resolve_aspect_target(aspect_ratio: str, src_meta: Dict) -> Tuple[int, int]:
+    """Map an aspect name to the (W, H) render target."""
+    if aspect_ratio == "original":
+        w = int(src_meta.get("width") or 0)
+        h = int(src_meta.get("height") or 0)
+        if w <= 0 or h <= 0:
+            raise VideoEditorError(
+                "Original aspect လိုအပ်သော်လည်း source အရွယ်အစား မသိရပါ။")
+        return (w - (w % 2), h - (h % 2))
+    if aspect_ratio in ASPECT_TARGETS:
+        return ASPECT_TARGETS[aspect_ratio]
+    raise ValueError(
+        "aspect_ratio must be one of 'original', '9:16', '1:1', '4:5', '16:9'.")
+
+
+def _copyright_filter_chain(
+    base_w: int, base_h: int,
+    mirror_horizontal: bool = False,
+    copyright_zoom: float = 1.0,
+    random_crop_offset: bool = False,
+) -> Tuple[str, Dict]:
+    """Source-frame copyright filters — FIRST in the chain, before fit/blur.
+
+    Order (per the Source tab rule): hflip -> zoom (scale up + crop back
+    to the base size) -> random crop offset (a 2-10px shift from the
+    centred crop window). When zoom is 1.0 but random crop is on, the frame
+    is first scaled 1.02x so there is slack to shift inside. Returns
+    (comma-joined filter string, applied-dict with the exact crop window).
+    Output dimensions are always (base_w, base_h).
+    """
+    parts: List[str] = []
+    applied = {
+        "mirror": bool(mirror_horizontal),
+        "zoom": 1.0,
+        "random_crop": bool(random_crop_offset),
+        "crop_x": None,
+        "crop_y": None,
+        "shift_x": 0,
+        "shift_y": 0,
+    }
+    if mirror_horizontal:
+        parts.append("hflip")
+    try:
+        z = float(copyright_zoom or 1.0)
+    except (TypeError, ValueError):
+        z = 1.0
+    z = min(1.25, max(1.0, z))
+    if random_crop_offset and z <= 1.0:
+        z = 1.02
+    if z > 1.0:
+        zw = int(round(base_w * z))
+        zh = int(round(base_h * z))
+        zw = max(base_w + 2, zw - (zw % 2))
+        zh = max(base_h + 2, zh - (zh % 2))
+        parts.append(f"scale={zw}:{zh}")
+        slack_x = zw - base_w
+        slack_y = zh - base_h
+        cx, cy = slack_x // 2, slack_y // 2
+        if random_crop_offset:
+            rx = random.choice((-1, 1)) * random.randint(2, 10)
+            ry = random.choice((-1, 1)) * random.randint(2, 10)
+            cx = min(max(cx + rx, 0), slack_x)
+            cy = min(max(cy + ry, 0), slack_y)
+            applied["shift_x"] = cx - slack_x // 2
+            applied["shift_y"] = cy - slack_y // 2
+        parts.append(f"crop={base_w}:{base_h}:{cx}:{cy}")
+        applied.update({"zoom": z, "crop_x": cx, "crop_y": cy})
+    return (",".join(parts), applied)
+
+
+def _fit_filter_steps(
+    input_label: str, base_w: int, base_h: int,
+    out_w: int, out_h: int, fit_mode: Optional[str],
+    crop_align: str, inner_scale: float,
+    vertical_pos: float, horizontal_pos: float,
+    aspect_ratio: str,
+) -> Tuple[List[str], str]:
+    """Aspect/fit filters. Returns (filter_strings, output_label).
+
+    fit_mode "crop": scale to fill the target, then crop to it; crop_align
+    picks the vertical window (top y=0, center, bottom y=ih-oh).
+    fit_mode "pad": blurred background (source scaled to fill the target +
+    boxblur=25:5) with the foreground overlaid at inner_scale /
+    vertical_pos / horizontal_pos (overflow auto-crops via overlay).
+    fit_mode None = legacy behaviour (16:9 pads black, rest crop-fills),
+    so existing callers that pass no fit_mode render exactly as before.
+    """
+    if fit_mode is None:
+        if aspect_ratio == "16:9":
+            return ([f"[{input_label}]scale={out_w}:{out_h}:"
+                     f"force_original_aspect_ratio=decrease,"
+                     f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                     f"setsar=1[vbase]"], "vbase")
+        fit_mode = "crop"
+    if fit_mode == "crop":
+        if crop_align == "top":
+            y_expr = "0"
+        elif crop_align == "bottom":
+            y_expr = "ih-oh"
+        else:
+            y_expr = "(ih-oh)/2"
+        return ([f"[{input_label}]scale={out_w}:{out_h}:"
+                 f"force_original_aspect_ratio=increase,"
+                 f"crop={out_w}:{out_h}:x=(iw-ow)/2:y={y_expr},"
+                 f"setsar=1[vbase]"], "vbase")
+    if fit_mode == "pad":
+        try:
+            scale_f = float(inner_scale or 1.0)
+        except (TypeError, ValueError):
+            scale_f = 1.0
+        scale_f = min(2.0, max(0.5, scale_f))
+        try:
+            vpos = min(50.0, max(-50.0, float(vertical_pos or 0.0)))
+            hpos = min(50.0, max(-50.0, float(horizontal_pos or 0.0)))
+        except (TypeError, ValueError):
+            vpos, hpos = 0.0, 0.0
+        # Foreground size: fit inside the target, then * inner_scale.
+        # (Python-computed from the known base dims — exact, no expr.)
+        base = min(out_w / base_w, out_h / base_h) if base_w and base_h else 1.0
+        fg_w = max(2, int(round(base_w * base * scale_f)))
+        fg_h = max(2, int(round(base_h * base * scale_f)))
+        fg_w -= fg_w % 2
+        fg_h -= fg_h % 2
+        ox = (out_w - fg_w) // 2 + int(round(hpos / 100.0 * out_w))
+        oy = (out_h - fg_h) // 2 + int(round(vpos / 100.0 * out_h))
+        steps = [
+            f"[{input_label}]split=2[fitbg][fitfg]",
+            f"[fitbg]scale={out_w}:{out_h}:"
+            f"force_original_aspect_ratio=increase,crop={out_w}:{out_h},"
+            f"boxblur=25:5,setsar=1[bg]",
+            f"[fitfg]scale={fg_w}:{fg_h},setsar=1[fg]",
+            f"[bg][fg]overlay={ox}:{oy},setsar=1[vbase]",
+        ]
+        return (steps, "vbase")
+    raise ValueError("fit_mode must be 'crop', 'pad', or None (legacy).")
+
+
+def _resolve_subtitle_font(cfg: Dict, srt_path: Optional[str]) -> Optional[Dict]:
+    """Resolve the subtitle font for a config (None when no SRT)."""
+    if not srt_path:
+        return None
+    _fam, _bold_ok, _fonts_dir = get_subtitle_font(
+        str(cfg.get("font_family", "Pyidaungsu")))
+    if os.path.isdir(_fonts_dir):
+        return {"family": _fam, "dir": _fonts_dir, "bold": _bold_ok,
+                "file": _subtitle_font_file(
+                    str(cfg.get("font_family", "Pyidaungsu")))}
+    _sys = find_myanmar_font()
+    if _sys:
+        return {"family": _sys["family"], "dir": _sys["dir"],
+                "bold": True, "file": _sys["path"]}
+    return None
+
+
+def _subtitle_step(cur_label: str, srt_path: Optional[str],
+                   subtitle_config: Optional[Dict],
+                   out_w: int, out_h: int, work_dir: str,
+                   subtitle_input_idx: int = 2
+                   ) -> Tuple[List[str], str, Optional[Dict], Optional[str]]:
+    """Build the subtitle burn-in step (shared by both render paths).
+
+    Returns (filter_steps, subtitle_mode, subtitle_position, concat_path).
+    The steps always end with a [vout] label (null when nothing is burned).
+    subtitle_input_idx is the FFmpeg input index of the subtitle concat
+    video (2 in the recap render, 1 in the Pro render).
+    """
+    cfg = subtitle_config or {}
+    cfg_enabled = cfg.get("enabled", True)
+    font = _resolve_subtitle_font(cfg, srt_path)
+    if not (srt_path and font and cfg_enabled):
+        return ([f"[{cur_label}]null[vout]"], "none", None, None)
+    try:
+        fx = float(cfg.get("x_pct", 0.5))
+        fy = float(cfg.get("y_pct", 0.82))
+        # Prefer font_size_pct (fraction of output width) so the burned-in
+        # size matches the canvas preview exactly at any output
+        # resolution. Legacy font_size is px at the 400px reference.
+        if cfg.get("font_size_pct") is not None:
+            fpct = float(cfg["font_size_pct"])
+            fs = int(round(fpct * out_w))
+        else:
+            fpct = float(cfg.get("font_size", 22)) / 400.0
+            fs = int(round(fpct * out_w))
+    except (TypeError, ValueError):
+        fx, fy, fpct, fs = 0.5, 0.82, 0.055, int(round(0.055 * out_w))
+    fx = min(1.0, max(0.0, fx))
+    fy = min(1.0, max(0.0, fy))
+    fpct = min(0.30, max(0.02, fpct))
+    fs = min(200, max(8, fs))
+    pos_x, pos_y = int(round(fx * out_w)), int(round(fy * out_h))
+    _rgb = SUBTITLE_COLOR_RGB.get(str(cfg.get("color", "Yellow")), (255, 255, 0))
+    _colour = SUBTITLE_COLORS.get(str(cfg.get("color", "Yellow")),
+                                  SUBTITLE_COLORS["Yellow"])
+    _sub_pos = {"x_pct": fx, "y_pct": fy, "font_size": fs,
+                "font_size_pct": fpct, "pos_x": pos_x, "pos_y": pos_y,
+                "font_family": font["family"],
+                "color": str(cfg.get("color", "Yellow"))}
+    if _raqm_available():
+        subtitle_pngs = _render_subtitle_pngs(
+            srt_path, font["file"], fs, out_w, out_h,
+            pos_x, pos_y, _rgb, work_dir)
+        if not subtitle_pngs:
+            raise VideoEditorError("SRT တွင် စာတန်းမတွေ့ပါ။")
+        # One concat video input + ONE overlay (see _build_subtitle_concat
+        # for why N overlays are too slow).
+        subtitle_concat = _build_subtitle_concat(
+            subtitle_pngs, out_w, out_h, work_dir)
+        return ([f"[{cur_label}][{subtitle_input_idx}:v]"
+                 f"overlay=0:0:format=auto[vout]"],
+                "burned_in",
+                dict(_sub_pos, method="raqm_png", cues=len(subtitle_pngs)),
+                subtitle_concat)
+    # Fallback: ASS burn-in (server libass shapes Myanmar poorly, but it
+    # beats no subtitles when RAQM is missing).
+    ass_path = os.path.join(work_dir, "subtitles_exact.ass")
+    n_cues = srt_to_ass(srt_path, ass_path, font["family"], fs,
+                        pos_x, pos_y, out_w, out_h,
+                        font_bold=bool(font.get("bold", True)),
+                        primary_colour=_colour)
+    if n_cues == 0:
+        raise VideoEditorError("SRT တွင် စာတန်းမတွေ့ပါ။")
+    return ([f"[{cur_label}]subtitles="
+             f"'{_escape_filter_path(ass_path)}':"
+             f"fontsdir='{_escape_filter_path(font['dir'])}'[vout]"],
+            "burned_in",
+            dict(_sub_pos, method="ass", cues=n_cues),
+            None)
+
+
+def _srt_timestamp(sec: float) -> str:
+    """Format seconds as an SRT timestamp (HH:MM:SS,mmm)."""
+    sec = max(0.0, float(sec))
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    ms = int(round((sec - int(sec)) * 1000))
+    if ms == 1000:  # rounding carry
+        s += 1
+        ms = 0
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def build_pro_srt(blocks: List[Dict], srt_path: str) -> Tuple[str, int]:
+    """Write synced subtitles for Pro blocks (one cue per block).
+
+    Each block carries "synced_start"/"synced_end" (cumulative audio
+    lengths) — the cues follow the synced timeline exactly, not the
+    original video timestamps. Returns (path, cue count).
+    """
+    with open(srt_path, "w", encoding="utf-8") as f:
+        n = 0
+        for i, b in enumerate(blocks):
+            text = str(b.get("text", "")).strip()
+            if not text:
+                continue
+            n += 1
+            f.write(
+                f"{n}\n"
+                f"{_srt_timestamp(b['synced_start'])} --> "
+                f"{_srt_timestamp(b['synced_end'])}\n"
+                f"{text}\n\n"
+            )
+    return srt_path, n
+
+
+def _media_duration(path: str) -> float:
+    """ffprobe duration (seconds) for any audio/video file."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error",
+         "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        raise VideoEditorError(
+            f"Could not measure duration: {proc.stderr.strip()[:200]}")
+    try:
+        return float(proc.stdout.strip())
+    except ValueError:
+        raise VideoEditorError("ffprobe returned an invalid duration.")
+
+
 _SRT_TS_RE = re.compile(
     r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)"
 )
@@ -521,6 +821,16 @@ def render_recap_video(
     work_dir: Optional[str] = None,
     blur_boxes: Optional[List[Dict]] = None,
     subtitle_config: Optional[Dict] = None,
+    # Step 15: fit mode + copyright filters (defaults preserve the old
+    # behaviour exactly — fit_mode None = legacy 16:9 pad-black / crop).
+    fit_mode: Optional[str] = None,
+    crop_align: str = "center",
+    inner_scale: float = 1.0,
+    vertical_pos: float = 0.0,
+    horizontal_pos: float = 0.0,
+    mirror_horizontal: bool = False,
+    copyright_zoom: float = 1.0,
+    random_crop_offset: bool = False,
 ) -> Dict:
     """Render the final recap video. Returns a result dict.
 
@@ -532,13 +842,26 @@ def render_recap_video(
         (legacy "font_size" px at the 400px reference still works) — when
         are burned via generated ASS with \\pos(x,y) so the Canvas preview
         matches the render 1:1. Omit (None) for the legacy centered style.
+    aspect_ratio: "original", "9:16", "1:1", "4:5" or "16:9".
+    fit_mode: "crop" (scale-to-fill + crop_align top/center/bottom) or
+        "pad" (blurred-bg pad + inner_scale / vertical_pos / horizontal_pos).
+        None = legacy (16:9 pads black, the rest crop-fills).
+    Copyright filters run FIRST (source-frame stage, before fit/blur):
+        mirror_horizontal (hflip), copyright_zoom (1.0–1.25, scale + crop
+        back), random_crop_offset (2–10px random shift; 1.02x when zoom
+        is 1.0 so there is slack to shift inside).
 
     Result keys: video_path, subtitle_mode ("burned_in"|"soft"|"none"),
     aspect_ratio, video_speed_factor, duration, width, height, has_audio,
-    blur_boxes_applied, subtitle_position.
+    blur_boxes_applied, subtitle_position, copyright_applied, fit_mode.
     """
-    if aspect_ratio not in ("16:9", "9:16"):
-        raise ValueError("aspect_ratio must be '16:9' or '9:16'.")
+    if aspect_ratio not in ("original", "16:9", "9:16", "1:1", "4:5"):
+        raise ValueError(
+            "aspect_ratio must be 'original', '16:9', '9:16', '1:1' or '4:5'.")
+    if crop_align not in ("top", "center", "bottom"):
+        raise ValueError("crop_align must be 'top', 'center' or 'bottom'.")
+    if fit_mode is not None and fit_mode not in ("crop", "pad"):
+        raise ValueError("fit_mode must be 'crop', 'pad', or None (legacy).")
     if not highlights:
         raise ValueError("highlights သည် အလွတ်ဖြစ်နေပါသည်။")
     for p, label in ((source_video_path, "source video"),
@@ -579,116 +902,43 @@ def render_recap_video(
         concat_path = _concat_segments(seg_paths, seg_dir)
 
         # 2) build the final filter graph
-        out_w, out_h = (1280, 720) if aspect_ratio == "16:9" else (720, 1280)
-        vfilters: List[str] = []
+        out_w, out_h = _resolve_aspect_target(aspect_ratio, src_meta)
+        src_w = int(src_meta.get("width") or out_w)
+        src_h = int(src_meta.get("height") or out_h)
+        base_w, base_h = src_w - (src_w % 2), src_h - (src_h % 2)
+        # Copyright filters FIRST (source-frame stage, before fit/blur).
+        copyright_str, copyright_applied = _copyright_filter_chain(
+            base_w, base_h, mirror_horizontal, copyright_zoom,
+            random_crop_offset)
+        pre: List[str] = []
+        if (base_w, base_h) != (src_w, src_h):
+            pre.append(f"scale={base_w}:{base_h}")
+        if copyright_str:
+            pre.append(copyright_str)
         if abs(factor - 1.0) > 1e-6:
-            vfilters.append(f"setpts=PTS/{factor:.4f}")
-        if aspect_ratio == "16:9":
-            vfilters.append(
-                "scale=1280:720:force_original_aspect_ratio=decrease,"
-                "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
-            )
-        else:  # 9:16 vertical center crop for TikTok/Reels/Shorts
-            vfilters.append(
-                "scale=720:1280:force_original_aspect_ratio=increase,"
-                "crop=720:1280,setsar=1"
-            )
-
-        vchain: List[str] = [f"[0:v]{','.join(vfilters)}[vbase]"]
+            pre.append(f"setpts=PTS/{factor:.4f}")
+        vchain: List[str] = []
+        fit_in = "0:v"
+        if pre:
+            vchain.append(f"[0:v]{','.join(pre)}[vpre]")
+            fit_in = "vpre"
+        fit_steps, cur_label = _fit_filter_steps(
+            fit_in, base_w, base_h, out_w, out_h, fit_mode, crop_align,
+            inner_scale, vertical_pos, horizontal_pos, aspect_ratio)
+        vchain.extend(fit_steps)
 
         # 2a) multi blur boxes at exact output-resolution positions
         boxes = _normalize_blur_boxes(blur_boxes, out_w, out_h)
-        cur_label = "vbase"
         if boxes:
             steps, cur_label = _blur_filter_steps(cur_label, boxes)
             vchain.extend(steps)
 
-        # 2b) subtitles: exact ASS position/size, legacy style, or none
-        subtitle_mode = "none"
-        subtitle_position = None
-        cfg = subtitle_config or {}
-        cfg_enabled = cfg.get("enabled", True)
-        # Subtitles-tab choices: font family + text colour. Fall back to the
-        # system Noto font only when the bundled fonts dir is missing.
-        _fam, _bold_ok, _fonts_dir = get_subtitle_font(
-            str(cfg.get("font_family", "Pyidaungsu")))
-        _colour = SUBTITLE_COLORS.get(str(cfg.get("color", "Yellow")),
-                                      SUBTITLE_COLORS["Yellow"])
-        font = None
-        if srt_path and os.path.isdir(_fonts_dir):
-            font = {"family": _fam, "dir": _fonts_dir, "bold": _bold_ok,
-                    "file": _subtitle_font_file(
-                        str(cfg.get("font_family", "Pyidaungsu")))}
-        elif srt_path:
-            _sys = find_myanmar_font()
-            if _sys:
-                font = {"family": _sys["family"], "dir": _sys["dir"],
-                        "bold": True, "file": _sys["path"]}
-        # Subtitle PNG overlays (Pillow RAQM — correct Myanmar shaping) or
-        # ASS fallback when RAQM is unavailable, or none when disabled.
-        subtitle_concat = None
-        if srt_path and font and cfg_enabled:
-            try:
-                fx = float(cfg.get("x_pct", 0.5))
-                fy = float(cfg.get("y_pct", 0.82))
-                # Prefer font_size_pct (fraction of output width) so the
-                # burned-in size matches the canvas preview exactly at
-                # any output resolution. Legacy font_size is px at the
-                # 400px reference width.
-                if cfg.get("font_size_pct") is not None:
-                    fpct = float(cfg["font_size_pct"])
-                    fs = int(round(fpct * out_w))
-                else:
-                    fpct = float(cfg.get("font_size", 22)) / 400.0
-                    fs = int(round(fpct * out_w))
-            except (TypeError, ValueError):
-                fx, fy, fpct, fs = 0.5, 0.82, 0.055, int(round(0.055 * out_w))
-            fx = min(1.0, max(0.0, fx))
-            fy = min(1.0, max(0.0, fy))
-            fpct = min(0.30, max(0.02, fpct))
-            fs = min(200, max(8, fs))
-            pos_x, pos_y = int(round(fx * out_w)), int(round(fy * out_h))
-            _rgb = SUBTITLE_COLOR_RGB.get(
-                str(cfg.get("color", "Yellow")), (255, 255, 0))
-            _sub_pos = {"x_pct": fx, "y_pct": fy, "font_size": fs,
-                        "font_size_pct": fpct, "pos_x": pos_x, "pos_y": pos_y,
-                        "font_family": font["family"],
-                        "color": str(cfg.get("color", "Yellow"))}
-            if _raqm_available():
-                subtitle_pngs = _render_subtitle_pngs(
-                    srt_path, font["file"], fs, out_w, out_h,
-                    pos_x, pos_y, _rgb, work_dir)
-                if not subtitle_pngs:
-                    raise VideoEditorError("SRT တွင် စာတန်းမတွေ့ပါ။")
-                # One concat video input + ONE overlay (see
-                # _build_subtitle_concat for why N overlays are too slow).
-                subtitle_concat = _build_subtitle_concat(
-                    subtitle_pngs, out_w, out_h, work_dir)
-                vchain.append(
-                    f"[{cur_label}][2:v]overlay=0:0:format=auto[vout]"
-                )
-                subtitle_mode = "burned_in"
-                subtitle_position = dict(_sub_pos, method="raqm_png",
-                                         cues=len(subtitle_pngs))
-            else:
-                # Fallback: ASS burn-in (server libass shapes Myanmar
-                # poorly, but it beats no subtitles when RAQM is missing).
-                ass_path = os.path.join(work_dir, "subtitles_exact.ass")
-                n_cues = srt_to_ass(srt_path, ass_path, font["family"], fs,
-                                    pos_x, pos_y, out_w, out_h,
-                                    font_bold=bool(font.get("bold", True)),
-                                    primary_colour=_colour)
-                if n_cues == 0:
-                    raise VideoEditorError("SRT တွင် စာတန်းမတွေ့ပါ။")
-                vchain.append(
-                    f"[{cur_label}]subtitles="
-                    f"'{_escape_filter_path(ass_path)}':"
-                    f"fontsdir='{_escape_filter_path(font['dir'])}'[vout]"
-                )
-                subtitle_mode = "burned_in"
-                subtitle_position = dict(_sub_pos, method="ass", cues=n_cues)
-        else:
-            vchain.append(f"[{cur_label}]null[vout]")
+        # 2b) subtitles: exact position/size burn-in (RAQM PNG / ASS
+        # fallback) or none — shared helper, also used by the Pro render.
+        sub_steps, subtitle_mode, subtitle_position, subtitle_concat = \
+            _subtitle_step(cur_label, srt_path, subtitle_config,
+                           out_w, out_h, work_dir)
+        vchain.extend(sub_steps)
 
         afilters: List[str] = []
         if has_src_audio:
@@ -744,6 +994,222 @@ def render_recap_video(
             "sidecar_srt": soft_srt_out,
             "blur_boxes_applied": len(boxes),
             "subtitle_position": subtitle_position,
+            "copyright_applied": copyright_applied,
+            "fit_mode": fit_mode or ("pad_black_legacy"
+                                     if aspect_ratio == "16:9" else "crop"),
+            "crop_align": crop_align,
         }
     finally:
         shutil.rmtree(seg_dir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# Step 15: Pro AI Recap render (per-block independent speed sync)
+# --------------------------------------------------------------------------- #
+def render_pro_recap_video(
+    source_video_path: str,
+    pro_blocks: List[Dict],
+    output_path: Optional[str] = None,
+    aspect_ratio: str = "9:16",
+    fit_mode: Optional[str] = None,
+    crop_align: str = "center",
+    inner_scale: float = 1.0,
+    vertical_pos: float = 0.0,
+    horizontal_pos: float = 0.0,
+    mirror_horizontal: bool = False,
+    copyright_zoom: float = 1.0,
+    random_crop_offset: bool = False,
+    bg_volume: float = 0.15,
+    work_dir: Optional[str] = None,
+    blur_boxes: Optional[List[Dict]] = None,
+    subtitle_config: Optional[Dict] = None,
+    srt_path: Optional[str] = None,
+) -> Dict:
+    """Render a Pro AI Recap video (dialogue video, Step 15).
+
+    pro_blocks: [{"start","end","text","audio_path"}, ...] — sequential
+    blocks tiling the source. Each block's own video segment is
+    re-timed with its OWN setpts so its duration matches its block TTS
+    audio length exactly (independent speed per block), then the blocks
+    are concatenated. Subtitles are rebuilt from the blocks on the
+    SYNCED timeline (cumulative audio lengths), not the source timeline.
+
+    The same visual chain as the recap render applies to the concatenated
+    result: copyright filters FIRST (source-frame stage), then aspect/fit,
+    then blur boxes, then subtitles. srt_path is the path the rebuilt
+    synced SRT is written to (default: work_dir/pro_subtitles.srt).
+
+    Result keys: video_path, subtitle_mode, aspect_ratio,
+    processing_mode ("pro_ai_recap"), blocks (with synced_start/end +
+    speed), duration, width, height, has_audio, blur_boxes_applied,
+    subtitle_position, copyright_applied, fit_mode, srt_path.
+    """
+    if aspect_ratio not in ("original", "16:9", "9:16", "1:1", "4:5"):
+        raise ValueError(
+            "aspect_ratio must be 'original', '16:9', '9:16', '1:1' or '4:5'.")
+    if crop_align not in ("top", "center", "bottom"):
+        raise ValueError("crop_align must be 'top', 'center' or 'bottom'.")
+    if fit_mode is not None and fit_mode not in ("crop", "pad"):
+        raise ValueError("fit_mode must be 'crop', 'pad', or None (legacy).")
+    if not pro_blocks:
+        raise ValueError("pro_blocks သည် အလွတ်ဖြစ်နေပါသည်။")
+    if not os.path.isfile(str(source_video_path)):
+        raise FileNotFoundError(f"source video not found: {source_video_path}")
+
+    if work_dir is None:
+        work_dir = tempfile.mkdtemp(prefix="video_recap_pro_")
+    seg_dir = os.path.join(work_dir, "segments")
+    block_dir = os.path.join(work_dir, "blocks")
+    os.makedirs(block_dir, exist_ok=True)
+    if output_path is None:
+        output_path = os.path.join(
+            work_dir, f"final_pro_{aspect_ratio.replace(':', 'x')}.mp4")
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    if srt_path is None:
+        srt_path = os.path.join(work_dir, "pro_subtitles.srt")
+
+    src_meta = get_video_metadata(source_video_path)
+    src_dur = src_meta["duration"] or 0
+
+    # Normalize + clamp blocks (sorted, inside the source).
+    blocks: List[Dict] = []
+    for b in pro_blocks:
+        try:
+            s = max(0.0, float(b.get("start", 0)))
+            e = float(b.get("end", 0))
+            if src_dur:
+                e = min(e, src_dur)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        ap = b.get("audio_path")
+        if e <= s or not ap or not os.path.isfile(str(ap)):
+            continue
+        blocks.append({"start": s, "end": e,
+                       "text": str(b.get("text", "")).strip(),
+                       "audio_path": str(ap)})
+    blocks.sort(key=lambda b: b["start"])
+    if not blocks:
+        raise VideoEditorError("No valid Pro blocks after clamping.")
+
+    try:
+        # 1) trim the block segments (re-encoded, like the recap path)
+        seg_paths = _trim_segments(source_video_path, blocks, seg_dir)
+
+        # 2) per-block independent speed sync + audio mix
+        synced: List[Dict] = []
+        block_outs: List[str] = []
+        cum = 0.0
+        for i, b in enumerate(blocks):
+            seg = seg_paths[i]
+            seg_meta = get_video_metadata(seg)
+            seg_dur = seg_meta["duration"] or (b["end"] - b["start"])
+            audio_len = _media_duration(b["audio_path"])
+            if audio_len <= 0:
+                raise VideoEditorError(
+                    f"Pro block {i} audio duration is 0.")
+            speed = seg_dur / audio_len
+            out = os.path.join(block_dir, f"block_{i:03d}.mp4")
+            if seg_meta["has_audio"]:
+                fc = (
+                    f"[0:v]setpts=PTS/{speed:.4f}[v];"
+                    f"[0:a]{_atempo_chain(speed)},volume={bg_volume}[bg];"
+                    f"[bg][1:a]amix=inputs=2:duration=longest:"
+                    f"dropout_transition=0:normalize=0,"
+                    f"alimiter=limit=0.95,aresample=44100[a]"
+                )
+            else:
+                fc = (f"[0:v]setpts=PTS/{speed:.4f}[v];"
+                      f"[1:a]aresample=44100[a]")
+            _run(
+                ["ffmpeg", "-y", "-v", "error",
+                 "-i", seg, "-i", b["audio_path"],
+                 "-filter_complex", fc,
+                 "-map", "[v]", "-map", "[a]",
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-pix_fmt", "yuv420p", "-r", "30",
+                 "-c:a", "aac", "-b:a", "128k", out],
+                f"pro block {i} sync",
+            )
+            block_outs.append(out)
+            synced.append({
+                **b,
+                "speed": round(speed, 4),
+                "audio_len": round(audio_len, 3),
+                "synced_start": round(cum, 3),
+                "synced_end": round(cum + audio_len, 3),
+            })
+            cum += audio_len
+
+        # 3) concatenate the synced blocks (video + audio)
+        concat_path = _concat_segments(block_outs, block_dir)
+
+        # 4) rebuilt subtitles on the SYNCED timeline
+        build_pro_srt(synced, srt_path)
+
+        # 5) visual chain on the concatenated result
+        out_w, out_h = _resolve_aspect_target(aspect_ratio, src_meta)
+        src_w = int(src_meta.get("width") or out_w)
+        src_h = int(src_meta.get("height") or out_h)
+        base_w, base_h = src_w - (src_w % 2), src_h - (src_h % 2)
+        copyright_str, copyright_applied = _copyright_filter_chain(
+            base_w, base_h, mirror_horizontal, copyright_zoom,
+            random_crop_offset)
+        pre: List[str] = []
+        if (base_w, base_h) != (src_w, src_h):
+            pre.append(f"scale={base_w}:{base_h}")
+        if copyright_str:
+            pre.append(copyright_str)
+        vchain: List[str] = []
+        fit_in = "0:v"
+        if pre:
+            vchain.append(f"[0:v]{','.join(pre)}[vpre]")
+            fit_in = "vpre"
+        fit_steps, cur_label = _fit_filter_steps(
+            fit_in, base_w, base_h, out_w, out_h, fit_mode, crop_align,
+            inner_scale, vertical_pos, horizontal_pos, aspect_ratio)
+        vchain.extend(fit_steps)
+        boxes = _normalize_blur_boxes(blur_boxes, out_w, out_h)
+        if boxes:
+            steps, cur_label = _blur_filter_steps(cur_label, boxes)
+            vchain.extend(steps)
+        sub_steps, subtitle_mode, subtitle_position, subtitle_concat = \
+            _subtitle_step(cur_label, srt_path, subtitle_config,
+                           out_w, out_h, work_dir, subtitle_input_idx=1)
+        vchain.extend(sub_steps)
+        filtergraph = ";".join(vchain)
+
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", concat_path]
+        if subtitle_concat:
+            cmd += ["-f", "concat", "-safe", "0", "-i", subtitle_concat]
+        cmd += ["-filter_complex", filtergraph,
+                "-map", "[vout]", "-map", "0:a",
+                "-c:v", "libx264", "-preset", "veryfast",
+                "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:a", "copy",
+                "-movflags", "+faststart"]
+        cmd.append(output_path)
+        _run(cmd, "pro final render")
+
+        meta = get_video_metadata(output_path)
+        return {
+            "video_path": output_path,
+            "subtitle_mode": subtitle_mode,
+            "aspect_ratio": aspect_ratio,
+            "processing_mode": "pro_ai_recap",
+            "blocks": synced,
+            "duration": meta["duration"],
+            "width": meta["width"],
+            "height": meta["height"],
+            "has_audio": meta["has_audio"],
+            "file_size_mb": meta["file_size_mb"],
+            "srt_path": srt_path,
+            "blur_boxes_applied": len(boxes),
+            "subtitle_position": subtitle_position,
+            "copyright_applied": copyright_applied,
+            "fit_mode": fit_mode or ("pad_black_legacy"
+                                     if aspect_ratio == "16:9" else "crop"),
+            "crop_align": crop_align,
+        }
+    finally:
+        shutil.rmtree(seg_dir, ignore_errors=True)
+        shutil.rmtree(block_dir, ignore_errors=True)

@@ -132,6 +132,52 @@ def generate_burmese_voiceover(
     return measure_audio_duration(output_audio_path)
 
 
+def generate_block_voiceovers(
+    blocks: List[Dict],
+    out_dir: str,
+    voice_name: str = "my-MM-ThihaNeural",
+    rate: str = "+0%",
+    proxy: Optional[str] = None,
+) -> List[Dict]:
+    """Synthesize one Myanmar voiceover per Pro block (Step 15).
+
+    Each input block is {"start","end","text", optional "audio_path"}.
+    A block that already has an existing "audio_path" is only measured
+    (not re-synthesized) — this is how offline tests inject prebuilt
+    audio. A block with empty text gets 0.5s of silence so it still has
+    an audio length for the sync math. Returns the blocks with
+    "audio_path" + "audio_len" (seconds) added.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    out: List[Dict] = []
+    for i, b in enumerate(blocks):
+        ap = b.get("audio_path")
+        if ap and os.path.isfile(str(ap)):
+            audio_len = measure_audio_duration(str(ap))
+        else:
+            ap = os.path.join(out_dir, f"block_{i:03d}.mp3")
+            text = str(b.get("text", "")).strip()
+            if text:
+                audio_len = generate_burmese_voiceover(
+                    text, ap, None,
+                    voice_name=voice_name, rate=rate, proxy=proxy,
+                )
+            else:
+                proc = subprocess.run(
+                    ["ffmpeg", "-y", "-v", "error",
+                     "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                     "-t", "0.5", "-c:a", "libmp3lame", "-q:a", "4", ap],
+                    capture_output=True, text=True, timeout=60)
+                if proc.returncode != 0:
+                    raise TTSManagerError(
+                        "Silent block audio failed: "
+                        f"{proc.stderr.strip()[:200]}")
+                audio_len = measure_audio_duration(ap)
+        out.append({**b, "audio_path": str(ap),
+                    "audio_len": float(audio_len)})
+    return out
+
+
 def sync_highlights_with_audio(
     highlights: List[Dict],
     audio_duration: float,
