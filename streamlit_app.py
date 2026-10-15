@@ -497,13 +497,13 @@ with tab_sub:
     subtitle_font = st.selectbox(
         " စာတန်းထိုး Font ရွေးပါ",
         options=list(SUBTITLE_FONTS.keys()),
-        index=0,
+        index=list(SUBTITLE_FONTS.keys()).index("Pyidaungsu"),
         key="subtitle_font",
     )
     subtitle_color = st.radio(
         " စာတန်းထိုး အရောင် ရွေးပါ",
         options=list(SUBTITLE_COLORS.keys()),
-        index=0,
+        index=list(SUBTITLE_COLORS.keys()).index("Yellow"),
         key="subtitle_color",
     )
     _sub_info = st.session_state.get("canvas_sub") or dict(
@@ -627,8 +627,9 @@ if run_btn:
                      float(_sub.get("font_size", 22)) / 400.0)
         ),
         # Subtitles-tab choices: bundled Unicode font + text colour.
-        "font_family": str(st.session_state.get("subtitle_font", "Padauk")),
-        "color": str(st.session_state.get("subtitle_color", "White")),
+        # Defaults are Step 13: Pyidaungsu + Yellow.
+        "font_family": str(st.session_state.get("subtitle_font", "Pyidaungsu")),
+        "color": str(st.session_state.get("subtitle_color", "Yellow")),
     }
     _blur_boxes = st.session_state.get("canvas_blur") or None
 

@@ -295,10 +295,13 @@ def _ass_timestamp(sec: float) -> str:
 
 
 def _escape_ass_text(text: str) -> str:
+    # Newlines become a space (NOT the ASS \N break): a \N in the middle
+    # of a consonant+diacritic cluster would split the cluster and render
+    # a dotted circle. The full cue text is sent as one continuous line.
     return (text.replace("\\", "\\\\")
                  .replace("{", "\\{")
                  .replace("}", "\\}")
-                 .replace("\n", "\\N"))
+                 .replace("\n", " "))
 
 
 def srt_to_ass(srt_path: str, ass_path: str, font_family: str,
@@ -330,11 +333,15 @@ def srt_to_ass(srt_path: str, ass_path: str, font_family: str,
             "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, "
             "MarginV, Encoding\n"
         )
+        # Step 13 style: Yellow text + thick black outline + soft shadow.
+        # Bold uses the ASS boolean -1 (true) / 0 (false). FontSize stays
+        # dynamic (font_size_pct of the output width) so the burned-in size
+        # matches the canvas preview.
         f.write(
             f"Style: Default,{font_family},{font_size},{primary_colour},"
-            f"&H000019FF,&HFF000000,&H80000000,{1 if font_bold else 0},"
-            f"0,0,0,100,100,0,0,1,2,0,"
-            f"2,10,10,10,1\n"
+            f"&H000000FF,&H00000000,&H00000000,{(-1 if font_bold else 0)},"
+            f"0,0,0,100,100,0,0,1,3.5,1,"
+            f"2,10,10,20,1\n"
         )
         f.write("\n[Events]\n")
         f.write(
@@ -455,9 +462,9 @@ def render_recap_video(
         # Subtitles-tab choices: font family + text colour. Fall back to the
         # system Noto font only when the bundled fonts dir is missing.
         _fam, _bold_ok, _fonts_dir = get_subtitle_font(
-            str(cfg.get("font_family", "Padauk")))
-        _colour = SUBTITLE_COLORS.get(str(cfg.get("color", "White")),
-                                      SUBTITLE_COLORS["White"])
+            str(cfg.get("font_family", "Pyidaungsu")))
+        _colour = SUBTITLE_COLORS.get(str(cfg.get("color", "Yellow")),
+                                      SUBTITLE_COLORS["Yellow"])
         font = None
         if srt_path and os.path.isdir(_fonts_dir):
             font = {"family": _fam, "dir": _fonts_dir, "bold": _bold_ok}
@@ -513,7 +520,7 @@ def render_recap_video(
                                      "pos_x": pos_x, "pos_y": pos_y,
                                      "cues": n_cues,
                                      "font_family": font["family"],
-                                     "color": str(cfg.get("color", "White"))}
+                                     "color": str(cfg.get("color", "Yellow"))}
             else:
                 # Legacy centred style: same font + colour as the ASS path.
                 # force_style colours are &HBBGGRR& (no alpha byte).
