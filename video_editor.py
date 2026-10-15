@@ -261,7 +261,7 @@ def srt_to_ass(srt_path: str, ass_path: str, font_family: str,
         )
         f.write(
             f"Style: Default,{font_family},{font_size},&H00FFFFFF,"
-            f"&H000019FF,&HFF000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,"
+            f"&H000019FF,&HFF000000,&H80000000,1,0,0,0,100,100,0,0,1,2,0,"
             f"2,10,10,10,1\n"
         )
         f.write("\n[Events]\n")
@@ -427,7 +427,7 @@ def render_recap_video(
                                      "cues": n_cues}
             else:
                 style = (
-                    f"FontName={font['family']},FontSize=22,"
+                    f"FontName={font['family']},FontSize=22,Bold=1,"
                     "PrimaryColour=&HFFFFFF&,OutlineColour=&H80000000&,"
                     "BorderStyle=1,Outline=2,Shadow=0,MarginV=28"
                 )

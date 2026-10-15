@@ -616,6 +616,9 @@ if run_btn:
     }
     _blur_boxes = st.session_state.get("canvas_blur") or None
 
+    # A new Run invalidates the previous result immediately, so a failed
+    # run never shows a stale result.
+    st.session_state["recap_result"] = None
     try:
         with st.spinner(" Recap ဗီဒီယို ထုတ်လုပ်နေပါတယ်… ခဏစောင့်ပေးပါ"):
             result = run_full_recap_pipeline(
@@ -636,37 +639,55 @@ if run_btn:
                 blur_boxes=_blur_boxes,
                 subtitle_config=_subtitle_config,
             )
-        status = (
-            f"✓ ပြီးဆုံးပါပြီ! | {result['aspect_ratio']} | "
-            f"စာတန်း: {result['subtitle_mode']} | "
-            f"sync: {result['sync_method']} ({result['video_speed_factor']})"
+        st.session_state["recap_result"] = {
+            "status": (
+                f"✓ ပြီးဆုံးပါပြီ! | {result['aspect_ratio']} | "
+                f"စာတန်း: {result['subtitle_mode']} | "
+                f"sync: {result['sync_method']} ({result['video_speed_factor']})"
+            ),
+            "video_path": result["final_video_path"],
+            "srt_path": result["srt_path"],
+            "title": result["title"],
+            "script_text": result["script_text"],
+        }
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user in Myanmar UI
+        traceback.print_exc()
+        st.error(f"✕ အမှား: {exc}")
+
+# Render the last successful result on EVERY run — not only the run in
+# which Run was clicked — so a download click or any other rerun does
+# not wipe the output (the previous bug: the result lived only in a
+# local variable, so the first download click cleared the whole section).
+_saved = st.session_state.get("recap_result")
+if _saved and os.path.isfile(_saved.get("video_path", "")):
+    st.success(_saved["status"])
+    st.video(_saved["video_path"])
+    st.text_input(" ခေါင်းစဉ်", value=_saved["title"], disabled=True)
+    st.text_area(
+        " ဇာတ်ကြောင်းပြော Script",
+        value=_saved["script_text"],
+        height=200,
+        disabled=True,
+    )
+    with open(_saved["video_path"], "rb") as f:
+        st.download_button(
+            " Recap ဗီဒီယို Download (.mp4)",
+            data=f.read(),
+            file_name="recap.mp4",
+            mime="video/mp4",
         )
-        st.success(status)
-        st.video(result["final_video_path"])
-        st.text_input(" ခေါင်းစဉ်", value=result["title"], disabled=True)
-        st.text_area(
-            " ဇာတ်ကြောင်းပြော Script",
-            value=result["script_text"],
-            height=200,
-            disabled=True,
-        )
-        with open(result["final_video_path"], "rb") as f:
-            st.download_button(
-                " Recap ဗီဒီယို Download (.mp4)",
-                data=f.read(),
-                file_name="recap.mp4",
-                mime="video/mp4",
-            )
-        with open(result["srt_path"], "rb") as f:
+    if os.path.isfile(_saved.get("srt_path", "")):
+        with open(_saved["srt_path"], "rb") as f:
             st.download_button(
                 " မြန်မာစာတန်းထိုး Download (.srt)",
                 data=f.read(),
                 file_name="subtitles.srt",
                 mime="text/plain",
             )
-    except Exception as exc:  # noqa: BLE001 - surfaced to the user in Myanmar UI
-        traceback.print_exc()
-        st.error(f"✕ အမှား: {exc}")
+elif _saved:
+    # Output files are gone (session temp cleaned): ask for a fresh run.
+    st.info("ထုတ်လုပ်ထားတဲ့ ဗီဒီယိုဖိုင် သက်တမ်းကုန်သွားပါပြီ။ Run ကို ထပ်နှိပ်ပေးပါ။")
+    st.session_state["recap_result"] = None
 
 # A canvas action asked for a refresh. Do it now — after the Run
 # handler has had its chance — so a Run click that arrived in the same
