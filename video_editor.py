@@ -75,6 +75,62 @@ def find_myanmar_font() -> Optional[Dict[str, str]]:
     return None
 
 
+# Bundled Unicode subtitle fonts (from the user's Myanmar-Unicode-Fonts
+# collection; Zawgyi fonts are never included). Key = the name shown in the
+# Subtitles tab; value = (ASS family name, regular file, bold file or None).
+# NOTE: Myanmar Thuriya's internal family name is "Myanmar Head One".
+SUBTITLE_FONTS = {
+    "Padauk": ("Padauk", "Padauk.ttf", "Padauk-bold.ttf"),
+    "Noto Sans Myanmar": ("Noto Sans Myanmar", "NotoSansMyanmar.ttf",
+                          "NotoSansMyanmar-Bold.ttf"),
+    "Pyidaungsu": ("Pyidaungsu", "Pyidaungsu.ttf", None),
+    "Myanmar Text": ("Myanmar Text", "MyanmarText.ttf",
+                     "MyanmarText-Bold.ttf"),
+    "Myanmar3": ("Myanmar3", "Myanmar3.ttf", None),
+    "Masterpiece Uni Round": ("Masterpiece Uni Round",
+                              "MasterpieceUniRound.ttf", None),
+    "Myanmar Sagar": ("Myanmar Sagar", "MyanmarSagar.ttf", None),
+    "Myanmar Sans Pro": ("Myanmar Sans Pro", "MyanmarSansPro.ttf", None),
+    "Myanmar Square": ("Myanmar Square", "MyanmarSquare.ttf", None),
+    "Myanmar Thuriya": ("Myanmar Head One", "MyanmarThuriya.ttf", None),
+    "TharLon": ("TharLon", "TharLon.ttf", None),
+    "ThanLwin": ("ThanLwin", "ThanLwin.ttf", None),
+    "Cherry Unicode": ("Cherry Unicode", "CherryUnicode.ttf", None),
+    "Gantgaw": ("Gantgaw", "Gantgaw.ttf", None),
+    "Jasmine Unicode": ("Jasmine Unicode", "JasmineUnicode.ttf", None),
+    "YoeYar-One": ("YoeYar-One", "YoeYarOne.ttf", None),
+    "Myanmar Angoun": ("Myanmar Angoun", "MyanmarAngoun.ttf", None),
+    "Myanmar Sabae": ("Myanmar Sabae", "MyanmarSabae.ttf", None),
+    "Myanmar Tagu": ("Myanmar Tagu", "MyanmarTagu.ttf", None),
+    "Myanmar Taungyi": ("Myanmar Taungyi", "MyanmarTaungyi.ttf", None),
+}
+
+# Subtitle text colours (ASS PrimaryColour, &HAABBGGRR — note the byte
+# order is Alpha-Blue-Green-Red, so Red is &H000000FF, NOT &H00FF0000).
+# Outline stays black.
+SUBTITLE_COLORS = {
+    "White": "&H00FFFFFF",
+    "Yellow": "&H0000FFFF",
+    "Green": "&H0000FF00",
+    "Red": "&H000000FF",
+}
+
+
+def get_subtitle_font(display_name: str):
+    """Resolve a Subtitles-tab font choice to (family, bold_ok, fonts_dir).
+
+    Falls back to Padauk for an unknown name. Bold is only reported
+    available when the chosen font actually ships a Bold file.
+    """
+    entry = SUBTITLE_FONTS.get(display_name) or SUBTITLE_FONTS["Padauk"]
+    family, _regular, bold_file = entry
+    fonts_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "fonts")
+    bold_ok = bool(bold_file) and os.path.isfile(
+        os.path.join(fonts_dir, bold_file))
+    return family, bold_ok, fonts_dir
+
+
 def _escape_filter_path(path: str) -> str:
     """Escape a file path for the subtitles filter filename option."""
     p = os.path.abspath(path)
@@ -247,11 +303,16 @@ def _escape_ass_text(text: str) -> str:
 
 def srt_to_ass(srt_path: str, ass_path: str, font_family: str,
                font_size: int, pos_x: int, pos_y: int,
-               play_w: int, play_h: int) -> int:
+               play_w: int, play_h: int,
+               font_bold: bool = True,
+               primary_colour: str = "&H00FFFFFF") -> int:
     """Convert SRT to ASS with every cue pinned to \\pos(pos_x, pos_y).
 
-    White text + black outline, exact PlayResX/PlayResY so the position
-    matches the Canvas 1:1. Returns the number of cues written.
+    Coloured text (primary_colour, ASS &HAABBGGRR) + black outline, exact
+    PlayResX/PlayResY so the position matches the Canvas 1:1. Bold is only
+    requested when the chosen font actually ships a Bold face — otherwise
+    libass could substitute another family's Bold and mix fonts.
+    Returns the number of cues written.
     """
     cues = _parse_srt_cues(srt_path)
     with open(ass_path, "w", encoding="utf-8") as f:
@@ -270,8 +331,9 @@ def srt_to_ass(srt_path: str, ass_path: str, font_family: str,
             "MarginV, Encoding\n"
         )
         f.write(
-            f"Style: Default,{font_family},{font_size},&H00FFFFFF,"
-            f"&H000019FF,&HFF000000,&H80000000,1,0,0,0,100,100,0,0,1,2,0,"
+            f"Style: Default,{font_family},{font_size},{primary_colour},"
+            f"&H000019FF,&HFF000000,&H80000000,{1 if font_bold else 0},"
+            f"0,0,0,100,100,0,0,1,2,0,"
             f"2,10,10,10,1\n"
         )
         f.write("\n[Events]\n")
@@ -388,9 +450,22 @@ def render_recap_video(
         # 2b) subtitles: exact ASS position/size, legacy style, or none
         subtitle_mode = "none"
         subtitle_position = None
-        font = find_myanmar_font() if srt_path else None
         cfg = subtitle_config or {}
         cfg_enabled = cfg.get("enabled", True)
+        # Subtitles-tab choices: font family + text colour. Fall back to the
+        # system Noto font only when the bundled fonts dir is missing.
+        _fam, _bold_ok, _fonts_dir = get_subtitle_font(
+            str(cfg.get("font_family", "Padauk")))
+        _colour = SUBTITLE_COLORS.get(str(cfg.get("color", "White")),
+                                      SUBTITLE_COLORS["White"])
+        font = None
+        if srt_path and os.path.isdir(_fonts_dir):
+            font = {"family": _fam, "dir": _fonts_dir, "bold": _bold_ok}
+        elif srt_path:
+            _sys = find_myanmar_font()
+            if _sys:
+                font = {"family": _sys["family"], "dir": _sys["dir"],
+                        "bold": True}
         use_exact = (
             cfg.get("x_pct") is not None
             or cfg.get("y_pct") is not None
@@ -421,7 +496,9 @@ def render_recap_video(
                 pos_x, pos_y = int(round(fx * out_w)), int(round(fy * out_h))
                 ass_path = os.path.join(work_dir, "subtitles_exact.ass")
                 n_cues = srt_to_ass(srt_path, ass_path, font["family"], fs,
-                                    pos_x, pos_y, out_w, out_h)
+                                    pos_x, pos_y, out_w, out_h,
+                                    font_bold=bool(font.get("bold", True)),
+                                    primary_colour=_colour)
                 if n_cues == 0:
                     raise VideoEditorError("SRT တွင် စာတန်းမတွေ့ပါ။")
                 vchain.append(
@@ -434,11 +511,18 @@ def render_recap_video(
                                      "font_size": fs,
                                      "font_size_pct": fpct,
                                      "pos_x": pos_x, "pos_y": pos_y,
-                                     "cues": n_cues}
+                                     "cues": n_cues,
+                                     "font_family": font["family"],
+                                     "color": str(cfg.get("color", "White"))}
             else:
+                # Legacy centred style: same font + colour as the ASS path.
+                # force_style colours are &HBBGGRR& (no alpha byte).
+                _legacy_colour = f"&H{_colour[-6:]}&"
                 style = (
-                    f"FontName={font['family']},FontSize=22,Bold=1,"
-                    "PrimaryColour=&HFFFFFF&,OutlineColour=&H80000000&,"
+                    f"FontName={font['family']},FontSize=22,"
+                    f"Bold={1 if font.get('bold', True) else 0},"
+                    f"PrimaryColour={_legacy_colour},"
+                    "OutlineColour=&H80000000&,"
                     "BorderStyle=1,Outline=2,Shadow=0,MarginV=28"
                 )
                 vchain.append(

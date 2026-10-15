@@ -25,6 +25,7 @@ from streamlit_js_eval import streamlit_js_eval
 
 from canvas_component import CANVAS_DEFAULT, interactive_canvas
 from pipeline import run_full_recap_pipeline
+from video_editor import SUBTITLE_COLORS, SUBTITLE_FONTS
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DEMO_SAMPLE = os.path.join(APP_DIR, "sample_test.mp4")
@@ -493,6 +494,18 @@ with tab_sub:
         value=True,
         key="burn_subtitles",
     )
+    subtitle_font = st.selectbox(
+        " စာတန်းထိုး Font ရွေးပါ",
+        options=list(SUBTITLE_FONTS.keys()),
+        index=0,
+        key="subtitle_font",
+    )
+    subtitle_color = st.radio(
+        " စာတန်းထိုး အရောင် ရွေးပါ",
+        options=list(SUBTITLE_COLORS.keys()),
+        index=0,
+        key="subtitle_color",
+    )
     _sub_info = st.session_state.get("canvas_sub") or dict(
         CANVAS_DEFAULT["subtitle"]
     )
@@ -613,6 +626,9 @@ if run_btn:
             _sub.get("font_size_pct",
                      float(_sub.get("font_size", 22)) / 400.0)
         ),
+        # Subtitles-tab choices: bundled Unicode font + text colour.
+        "font_family": str(st.session_state.get("subtitle_font", "Padauk")),
+        "color": str(st.session_state.get("subtitle_color", "White")),
     }
     _blur_boxes = st.session_state.get("canvas_blur") or None
 
