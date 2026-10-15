@@ -37,7 +37,17 @@ def _run(cmd: List[str], step: str) -> None:
 
 
 def find_myanmar_font() -> Optional[Dict[str, str]]:
-    """Return {'path','dir','family'} for a Myanmar font, or None."""
+    """Return {'path','dir','family'} for a Myanmar font, or None.
+
+    Preference: the Unicode font bundled with the app (Padauk, from the
+    user's Myanmar-Unicode-Fonts collection — Zawgyi fonts are never used),
+    then the system Noto fonts, then any fontconfig Myanmar font.
+    """
+    bundled_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "fonts")
+    bundled = os.path.join(bundled_dir, "Padauk.ttf")
+    if os.path.isfile(bundled):
+        return {"path": bundled, "dir": bundled_dir, "family": "Padauk"}
     candidates = [
         ("/usr/share/fonts/truetype/noto/NotoSansMyanmar-Regular.ttf",
          "Noto Sans Myanmar"),
