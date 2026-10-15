@@ -299,7 +299,9 @@ def render_recap_video(
     blur_boxes: [{"x_pct","y_pct","w_pct","h_pct","strength" 1..50}, ...] —
         each box is blurred onto the final frame at its exact position.
     subtitle_config: {"enabled": True, "x_pct": 0.5, "y_pct": 0.82,
-        "font_size": 22} — when position/size keys are present, subtitles
+        "font_size_pct": 0.055} — font size as a fraction of the output
+        width, so the burned-in size matches the canvas preview exactly
+        (legacy "font_size" px at the 400px reference still works) — when
         are burned via generated ASS with \\pos(x,y) so the Canvas preview
         matches the render 1:1. Omit (None) for the legacy centered style.
 
@@ -383,18 +385,29 @@ def render_recap_video(
             cfg.get("x_pct") is not None
             or cfg.get("y_pct") is not None
             or cfg.get("font_size") is not None
+            or cfg.get("font_size_pct") is not None
         )
         if srt_path and font and cfg_enabled:
             if use_exact:
                 try:
                     fx = float(cfg.get("x_pct", 0.5))
                     fy = float(cfg.get("y_pct", 0.82))
-                    fs = int(float(cfg.get("font_size", 22)))
+                    # Prefer font_size_pct (fraction of output width) so the
+                    # burned-in size matches the canvas preview exactly at
+                    # any output resolution. Legacy font_size is px at the
+                    # 400px reference width.
+                    if cfg.get("font_size_pct") is not None:
+                        fpct = float(cfg["font_size_pct"])
+                        fs = int(round(fpct * out_w))
+                    else:
+                        fpct = float(cfg.get("font_size", 22)) / 400.0
+                        fs = int(round(fpct * out_w))
                 except (TypeError, ValueError):
-                    fx, fy, fs = 0.5, 0.82, 22
+                    fx, fy, fpct, fs = 0.5, 0.82, 0.055, int(round(0.055 * out_w))
                 fx = min(1.0, max(0.0, fx))
                 fy = min(1.0, max(0.0, fy))
-                fs = min(120, max(8, fs))
+                fpct = min(0.30, max(0.02, fpct))
+                fs = min(200, max(8, fs))
                 pos_x, pos_y = int(round(fx * out_w)), int(round(fy * out_h))
                 ass_path = os.path.join(work_dir, "subtitles_exact.ass")
                 n_cues = srt_to_ass(srt_path, ass_path, font["family"], fs,
@@ -409,6 +422,7 @@ def render_recap_video(
                 subtitle_mode = "burned_in"
                 subtitle_position = {"x_pct": fx, "y_pct": fy,
                                      "font_size": fs,
+                                     "font_size_pct": fpct,
                                      "pos_x": pos_x, "pos_y": pos_y,
                                      "cues": n_cues}
             else:

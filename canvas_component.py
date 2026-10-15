@@ -13,7 +13,7 @@ string by hand.
 
 Value shape returned to Python:
     {"blur_boxes": [{"x_pct","y_pct","w_pct","h_pct","strength"}, ...],
-     "subtitle": {"x_pct","y_pct","font_size"},
+     "subtitle": {"x_pct","y_pct","font_size_pct"},
      "action": None | "remove_video" | "video_selected" | "video_url" | "video_meta",
      ... plus action-specific fields (video_data/video_name/video_id,
      video_url, video_w/video_h).}
@@ -316,7 +316,10 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 (function () {
   "use strict";
 
-  var DEFAULT_SUB = { x_pct: 0.5, y_pct: 0.82, font_size: 22 };
+  /* font_size_pct: subtitle size as a FRACTION of the phone/video
+     width, so the burned-in size matches the canvas preview exactly
+     at any output resolution (22px at the 400px reference = 0.055). */
+  var DEFAULT_SUB = { x_pct: 0.5, y_pct: 0.82, font_size_pct: 0.055 };
   var SUB_TEXT = "\u1012\u102E\u1014\u1031\u101B\u102C\u1019\u103E\u102C \u1005\u102C\u1010\u1014\u103A\u1038\u1011\u102D\u102F \u1015\u1031\u102B\u1019\u101A\u103A";
 
   var S = {
@@ -350,6 +353,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 
   function clamp(v, a, b) { return Math.min(b, Math.max(a, v)); }
   function r3(v) { return Math.round(v * 1000) / 1000; }
+  function r4(v) { return Math.round(v * 10000) / 10000; }
   /* Mirror of video_editor.py strength mapping (preview only). */
   function cssBlurPx(strength) {
     var s = clamp(Math.round(strength), 1, 50);
@@ -377,7 +381,10 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       }),
       subtitle: {
         x_pct: r3(S.sub.x), y_pct: r3(S.sub.y),
-        font_size: clamp(Math.round(S.sub.fs), 8, 120),
+        /* Authoritative: fraction of width. font_size is the same size
+           at the 400px reference width, kept for backward compat. */
+        font_size_pct: r4(S.sub.fpct),
+        font_size: clamp(Math.round(S.sub.fpct * 400), 8, 200),
       },
       action: action || null,
     };
@@ -407,7 +414,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   /* Fresh canvas for a newly picked / newly entered video. */
   function resetForNewVideo() {
     S.boxes = [];
-    S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct, fs: DEFAULT_SUB.font_size };
+    S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct,
+              fpct: DEFAULT_SUB.font_size_pct };
     S.editMode = false;
     renderBoxes();
     paintSubtitle();
@@ -791,7 +799,9 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       paintSubtitle();
     } else if (g.kind === "subsize") {
       var d = ((e.clientX - g.sx) + (e.clientY - g.sy)) / 2;
-      S.sub.fs = clamp(Math.round(g.of + d * 0.25), 8, 120);
+      /* Drag changes the size in phone px; store it as a fraction of
+         the phone width so the output matches at any resolution. */
+      S.sub.fpct = clamp((g.of + d * 0.25) / (g.pw || 400), 0.02, 0.30);
       paintSubtitle();
     }
   }
@@ -845,7 +855,9 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       e.stopPropagation();
       e.preventDefault();
       subHandle.setPointerCapture(e.pointerId);
-      S.gesture = { kind: "subsize", sx: e.clientX, sy: e.clientY, of: S.sub.fs };
+      var pw = phone.getBoundingClientRect().width || 400;
+      S.gesture = { kind: "subsize", sx: e.clientX, sy: e.clientY,
+                    of: S.sub.fpct * pw, pw: pw };
     });
   }
 
@@ -853,7 +865,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     var r = phone.getBoundingClientRect();
     subEl.style.left = (S.sub.x * r.width) + "px";
     subEl.style.top = (S.sub.y * r.height) + "px";
-    subEl.style.fontSize = S.sub.fs + "px";
+    /* Fraction of the phone width -> same relative size as the output. */
+    subEl.style.fontSize = (S.sub.fpct * r.width) + "px";
   }
 
   /* ---------------- render (from Streamlit) ---------------- */
@@ -917,7 +930,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.resyncSent = false;
       S.boxes = [];
       S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct,
-                fs: DEFAULT_SUB.font_size };
+                fpct: DEFAULT_SUB.font_size_pct };
       S.editMode = false;
       video.removeAttribute("src");
       video.load();
@@ -963,10 +976,13 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       var sb = S.args.subtitle || {};
       var nx = (sb.x_pct != null ? +sb.x_pct : DEFAULT_SUB.x_pct);
       var ny = (sb.y_pct != null ? +sb.y_pct : DEFAULT_SUB.y_pct);
-      var nf = (sb.font_size != null ? +sb.font_size : DEFAULT_SUB.font_size);
+      /* Prefer font_size_pct; legacy font_size (px at 400px) converts. */
+      var nf = (sb.font_size_pct != null ? +sb.font_size_pct
+                : (sb.font_size != null ? +sb.font_size / 400
+                   : DEFAULT_SUB.font_size_pct));
       if (Math.abs(nx - S.sub.x) > 1e-4 || Math.abs(ny - S.sub.y) > 1e-4 ||
-          Math.abs(nf - S.sub.fs) > 0.5) {
-        S.sub = { x: nx, y: ny, fs: nf };
+          Math.abs(nf - S.sub.fpct) > 1e-4) {
+        S.sub = { x: nx, y: ny, fpct: nf };
         paintSubtitle();
       }
     }
@@ -1042,7 +1058,7 @@ _canvas = components.declare_component(
 
 CANVAS_DEFAULT: Dict = {
     "blur_boxes": [],
-    "subtitle": {"x_pct": 0.5, "y_pct": 0.82, "font_size": 22},
+    "subtitle": {"x_pct": 0.5, "y_pct": 0.82, "font_size_pct": 0.055},
     "action": None,
 }
 

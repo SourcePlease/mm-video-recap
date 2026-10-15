@@ -444,10 +444,15 @@ if isinstance(_val, dict):
         try:
             st.session_state["canvas_blur"] = list(_val.get("blur_boxes") or [])
             _s = _val.get("subtitle") or {}
+            # Prefer font_size_pct (fraction of width); legacy font_size
+            # (px at the 400px reference) converts.
+            _fpct = _s.get("font_size_pct")
+            if _fpct is None:
+                _fpct = float(_s.get("font_size", 22)) / 400.0
             st.session_state["canvas_sub"] = {
                 "x_pct": float(_s.get("x_pct", 0.5)),
                 "y_pct": float(_s.get("y_pct", 0.82)),
-                "font_size": int(_s.get("font_size", 22)),
+                "font_size_pct": float(_fpct),
             }
         except (TypeError, ValueError):
             pass  # keep previous canvas state on malformed values
@@ -496,7 +501,8 @@ with tab_sub:
         "စာတန်းသေတ္တာကို ဆွဲ / အရွယ်ချဲ့ ချိန်နိုင်ပါတယ်။ "
         f"လက်ရှိ: x={float(_sub_info.get('x_pct', 0.5)):.2f}, "
         f"y={float(_sub_info.get('y_pct', 0.82)):.2f}, "
-        f"font={int(_sub_info.get('font_size', 22))}"
+        f"font={float(_sub_info.get('font_size_pct', 0.055)) * 100:.1f}% "
+        f"(အကျယ်၏)"
     )
 
 with tab_adv:
@@ -601,7 +607,12 @@ if run_btn:
         "enabled": bool(burn_subtitles),
         "x_pct": float(_sub.get("x_pct", 0.5)),
         "y_pct": float(_sub.get("y_pct", 0.82)),
-        "font_size": int(_sub.get("font_size", 22)),
+        # Fraction of the output width — the burned-in size matches the
+        # canvas preview exactly at any output resolution.
+        "font_size_pct": float(
+            _sub.get("font_size_pct",
+                     float(_sub.get("font_size", 22)) / 400.0)
+        ),
     }
     _blur_boxes = st.session_state.get("canvas_blur") or None
 
