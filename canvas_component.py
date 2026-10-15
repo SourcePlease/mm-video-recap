@@ -66,6 +66,20 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   object-fit: cover;
   background: #111;
 }
+/* Step 16: the stage holds the video(s) only — copyright transforms
+   (mirror / zoom) apply here, never to blur boxes / subtitle. */
+.mmr-stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+/* Pad (blur bg) background video: same source, blurred, full-bleed.
+   Slight scale hides the transparent edges the CSS blur creates. */
+.mmr-bgvideo {
+  filter: blur(25px);
+  -webkit-filter: blur(25px);
+  transform: scale(1.1);
+}
 /* ---------- top buttons ---------- */
 .mmr-topbtn {
   position: absolute;
@@ -423,9 +437,9 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   }
 
   /* ---------------- DOM ---------------- */
-  var wrap, phone, video, player, btnPlay, prog, progFill, timeEl,
-      btnMute, btnFs, btnX, btnEdit, btnAddBlur, btnDone, subEl, subHandle,
-      emptyEl, emptyUrl, fileInput;
+  var wrap, phone, stage, video, bgVideo, player, btnPlay, prog, progFill,
+      timeEl, btnMute, btnFs, btnX, btnEdit, btnAddBlur, btnDone, subEl,
+      subHandle, emptyEl, emptyUrl, fileInput;
 
   function el(tag, cls, parent) {
     var e = document.createElement(tag);
@@ -443,9 +457,19 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   function buildDOM() {
     wrap = el("div", "mmr-wrap", document.body);
     phone = el("div", "mmr-phone", wrap);
-    video = el("video", "mmr-video", phone);
+    /* Stage: holds the video(s) only. Copyright transforms (mirror /
+       zoom) apply to the stage — never to the blur boxes / subtitle,
+       which are output-frame coordinates. */
+    stage = el("div", "mmr-stage", phone);
+    video = el("video", "mmr-video", stage);
     video.setAttribute("playsinline", "");
     video.preload = "metadata";
+    /* Pad (blur bg) background: same source, blurred, full-bleed. */
+    bgVideo = el("video", "mmr-video mmr-bgvideo", stage);
+    bgVideo.setAttribute("playsinline", "");
+    bgVideo.preload = "metadata";
+    bgVideo.muted = true;
+    bgVideo.classList.add("mmr-hidden");
 
     btnX = el("button", "mmr-topbtn mmr-xbtn", phone);
     btnX.textContent = "\u2715";
@@ -510,13 +534,84 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       fitHeight();
       paintSubtitle();
       S.boxes.forEach(paintBox);
+      /* Pad fg geometry depends on the phone size. */
+      applyPreview();
     });
+  }
+
+  /* ---------------- Step 16: live preview of the Source settings ------- */
+  var PREVIEW_ASPECTS = {
+    "9:16": "720 / 1280", "1:1": "720 / 720",
+    "4:5": "720 / 900", "16:9": "1280 / 720",
+  };
+  function previewArgs() {
+    return (S.args && S.args.preview) || {};
+  }
+  function applyPreview() {
+    var p = previewArgs();
+    /* Phone shape: the OUTPUT aspect (Original = the source video's
+       own ratio, i.e. the old canvas_aspect behaviour). */
+    var ar = p.aspect_ratio || "9:16";
+    if (ar === "original" || !PREVIEW_ASPECTS[ar]) {
+      phone.style.aspectRatio = S.args.canvas_aspect || "9 / 16";
+    } else {
+      phone.style.aspectRatio = PREVIEW_ASPECTS[ar];
+    }
+    /* Copyright filters FIRST (source-frame stage): mirror + zoom
+       apply to the stage (both videos), never to the blur boxes /
+       subtitle — those are output-frame coordinates. */
+    var mirror = !!p.mirror_horizontal;
+    var zoom = clamp(parseFloat(p.copyright_zoom) || 1.0, 1.0, 1.25);
+    stage.style.transform =
+      "scale(" + zoom + ") scaleX(" + (mirror ? -1 : 1) + ")";
+    /* Fit: crop = one video, cover + object-position by align;
+       pad = blurred bg video + sized/foreground video. */
+    var fit = p.fit_mode || "crop";
+    if (fit === "pad") {
+      bgVideo.classList.remove("mmr-hidden");
+      layoutPad(p);
+    } else {
+      bgVideo.classList.add("mmr-hidden");
+      video.style.left = "0px"; video.style.top = "0px";
+      video.style.right = ""; video.style.bottom = "";
+      video.style.width = "100%"; video.style.height = "100%";
+      video.style.objectFit = "cover";
+      var align = p.crop_align || "center";
+      video.style.objectPosition = align === "top" ? "50% 0%"
+        : align === "bottom" ? "50% 100%" : "50% 50%";
+    }
+  }
+  function layoutPad(p) {
+    var r = phone.getBoundingClientRect();
+    var sw = video.videoWidth || r.width || 400;
+    var sh = video.videoHeight || r.height || 400;
+    /* Fit the source inside the phone, then scale by inner_scale. */
+    var base = Math.min(r.width / sw, r.height / sh);
+    var inner = clamp(parseFloat(p.inner_scale) || 1.0, 0.5, 2.0);
+    var fw = sw * base * inner, fh = sh * base * inner;
+    var hp = clamp(parseFloat(p.horizontal_pos) || 0, -50, 50);
+    var vp = clamp(parseFloat(p.vertical_pos) || 0, -50, 50);
+    var left = (r.width - fw) / 2 + (hp / 100) * r.width;
+    var top = (r.height - fh) / 2 + (vp / 100) * r.height;
+    video.style.left = left + "px"; video.style.top = top + "px";
+    video.style.right = "auto"; video.style.bottom = "auto";
+    video.style.width = fw + "px"; video.style.height = fh + "px";
+    /* Exact dims: no object-fit cropping inside the fg box. */
+    video.style.objectFit = "fill";
+    video.style.objectPosition = "50% 50%";
+    /* Bg: same source, full-bleed cover + blur (backend boxblur=25:5). */
+    bgVideo.style.left = "0px"; bgVideo.style.top = "0px";
+    bgVideo.style.right = ""; bgVideo.style.bottom = "";
+    bgVideo.style.width = "100%"; bgVideo.style.height = "100%";
+    bgVideo.style.objectFit = "cover";
   }
 
   /* ---------------- player ---------------- */
   function wirePlayer() {
     btnPlay.addEventListener("click", function () {
-      if (video.paused) { video.play(); } else { video.pause(); }
+      /* Both videos follow the same play state (bg is muted). */
+      if (video.paused) { video.play(); bgVideo.play(); }
+      else { video.pause(); bgVideo.pause(); }
     });
     video.addEventListener("play", function () { btnPlay.textContent = "\u23F8"; });
     video.addEventListener("pause", function () { btnPlay.textContent = "\u25B6"; });
@@ -528,6 +623,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     video.addEventListener("loadedmetadata", function () {
       timeEl.textContent = fmt(0) + " / " + fmt(video.duration || 0);
       fitHeight();
+      /* Pad fg geometry needs the real video dimensions. */
+      applyPreview();
       /* URL videos only: report real dimensions so Python can size
          the canvas to the video's ratio. Local files are ffprobed
          server-side, so they never send this. */
@@ -544,7 +641,10 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     function seekTo(clientX) {
       var r = prog.getBoundingClientRect();
       var frac = clamp((clientX - r.left) / r.width, 0, 1);
-      if (video.duration) video.currentTime = frac * video.duration;
+      if (video.duration) {
+        video.currentTime = frac * video.duration;
+        bgVideo.currentTime = frac * (bgVideo.duration || video.duration);
+      }
     }
     prog.addEventListener("pointerdown", function (e) {
       seeking = true;
@@ -642,6 +742,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.hasVideo = true;
       video.src = dataUrl;
       video.load();
+      bgVideo.src = dataUrl;
+      bgVideo.load();
       S.videoDataPending = vid;
       S.pickTime = Date.now();
       S.localDataUrl = dataUrl;
@@ -890,9 +992,9 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.videoDataPending = null;
       sendValue(null);
     }
-    /* The phone's shape follows the VIDEO's own ratio (arg), not the
-       output aspect setting. */
-    phone.style.aspectRatio = S.args.canvas_aspect || "9 / 16";
+    /* The phone's shape follows the OUTPUT aspect (Original = the
+       source video's own ratio) — see applyPreview. */
+    applyPreview();
     S.subsEnabled = S.args.subtitles_enabled !== false;
 
     var vid = S.args.video_id || null;
@@ -934,6 +1036,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.editMode = false;
       video.removeAttribute("src");
       video.load();
+      bgVideo.removeAttribute("src");
+      bgVideo.load();
       renderBoxes();
       paintSubtitle();
       applyEmpty();
@@ -955,6 +1059,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       if (S.args.video_data_url) {
         video.src = S.args.video_data_url;
         video.load();
+        bgVideo.src = S.args.video_data_url;
+        bgVideo.load();
       } else {
         /* No data URL: the video is already loaded in this frame
            (picked locally), so keep it. */
@@ -1072,6 +1178,7 @@ def interactive_canvas(
     canvas_aspect: str = "9 / 16",
     local_picked: bool = False,
     video_ack: Optional[str] = None,
+    preview: Optional[Dict] = None,
     key: Optional[str] = None,
 ) -> Dict:
     """Render the canvas and return the latest user-edited state.
@@ -1083,6 +1190,11 @@ def interactive_canvas(
     ``video_ack`` tells the frontend the server has saved the picked
     file, so it can drop the base64 payload from its component value
     (otherwise the ~40MB would be re-sent on every rerun).
+    ``preview`` (Step 16) is the Source-tab settings dict
+    (aspect_ratio / fit_mode / crop_align / inner_scale / vertical_pos /
+    horizontal_pos / mirror_horizontal / copyright_zoom) — the frontend
+    applies them as a live CSS preview (phone aspect, crop framing,
+    pad layout, mirror, zoom) without touching the edit coordinates.
     """
     value = _canvas(
         video_id=video_id,
@@ -1093,6 +1205,7 @@ def interactive_canvas(
         canvas_aspect=canvas_aspect,
         local_picked=bool(local_picked),
         video_ack=video_ack,
+        preview=preview or {},
         default=CANVAS_DEFAULT,
         key=key,
     )

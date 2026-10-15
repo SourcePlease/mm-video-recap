@@ -149,6 +149,73 @@ div[role="tabpanel"] {
   box-shadow: 0 10px 34px rgba(0, 0, 0, 0.6),
               0 0 0 1px rgba(255, 255, 255, 0.4) inset;
 }
+
+/* ---- Step 16: Source tab controls (blue accents, per the reference) ---- */
+/* Processing Mode cards: the radio whose option labels contain a bold
+   title (<strong>) is the mode radio — its options render as cards;
+   the checked card gets a light-blue border + tint. The Voice/Color
+   radios have plain-text options, so they are never matched. */
+.stApp [data-testid="stRadio"]:has(label strong)
+  label:not([data-testid="stWidgetLabel"]) {
+  display: block;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 16px;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  cursor: pointer;
+}
+.stApp [data-testid="stRadio"]:has(label strong)
+  label:not([data-testid="stWidgetLabel"]):has(input[type="radio"]:checked) {
+  border: 2px solid #5b9dff;
+  background: rgba(91, 157, 255, 0.14);
+}
+.stApp [data-testid="stRadio"]:has(label strong)
+  label:not([data-testid="stWidgetLabel"]) p {
+  margin: 0;
+}
+.stApp [data-testid="stRadio"]:has(label strong)
+  label:not([data-testid="stWidgetLabel"]) p + p {
+  margin-top: 4px;
+  color: #a3a3a3;
+  font-size: 14px;
+}
+/* Hide the radio circle inside the mode cards (the card IS the control). */
+.stApp [data-testid="stRadio"]:has(label strong)
+  label:not([data-testid="stWidgetLabel"]) > span:first-child {
+  display: none;
+}
+/* Pills (aspect / fit / align): unselected = dark chip, selected = blue.
+   In Streamlit 1.65 pills render as stButtonGroup buttons with
+   data-variant="pills" and data-selected on the chosen one. */
+.stApp [data-testid="stButtonGroup"] button[data-variant="pills"] {
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+  color: #d4d4d4;
+  font-weight: 500;
+}
+.stApp [data-testid="stButtonGroup"] button[data-variant="pills"][data-selected="true"] {
+  background: #3b82f6;
+  border-color: #3b82f6;
+  color: #ffffff;
+  font-weight: 600;
+}
+.stApp [data-testid="stButtonGroup"] button[data-variant="pills"]:hover {
+  border-color: #3b82f6;
+  color: #ffffff;
+}
+/* Toggles (Mirror / random crop): blue track when ON. st.toggle renders
+   as stCheckbox with an input[role="switch"]; the track is the label's
+   first div. Regular checkboxes (role="checkbox") are never matched. */
+.stApp [data-testid="stCheckbox"] label:has(input[role="switch"]:checked) > div:nth-of-type(1) {
+  background-color: #3b82f6;
+}
+/* Sliders in the Source tab: blue thumb. The thumb is the only div
+   positioned with translate(-50%, -50%) inside the slider. */
+.stApp [data-testid="stSlider"] div[style*="translate(-50%, -50%)"] {
+  background-color: #3b82f6;
+}
 </style>
 """
 st.markdown(LIQUID_GLASS_CSS, unsafe_allow_html=True)
@@ -172,18 +239,10 @@ VOICE_CHOICES = [
     "my-MM-ThihaNeural — ကျားအသံ",
     "my-MM-NilarNeural — မအသံ",
 ]
-ASPECT_CHOICES = [
-    "9:16 (TikTok / Reels / Shorts)",
-    "16:9 (YouTube / Landscape)",
-]
 
 
 def _parse_voice(choice: str) -> str:
     return (choice or "").split(" — ")[0].strip() or "my-MM-ThihaNeural"
-
-
-def _parse_aspect(choice: str) -> str:
-    return "9:16" if (choice or "").startswith("9:16") else "16:9"
 
 
 MODEL_OPTIONS = [
@@ -268,6 +327,23 @@ if "canvas_aspect" not in st.session_state:
 # like "demo_mode" cannot be written after the widget is created).
 if "demo_suppressed" not in st.session_state:
     st.session_state["demo_suppressed"] = False
+# Step 16: Source-tab engine defaults (set here, before the canvas call,
+# so the canvas preview sees them on the very first run too).
+_STEP16_DEFAULTS = {
+    "processing_mode": "ai_recap",
+    "aspect_ratio": "9:16",
+    "fit_mode": "crop",
+    "crop_align": "center",
+    "inner_scale": 1.22,
+    "vertical_pos": 0.0,
+    "horizontal_pos": 0.0,
+    "mirror_horizontal": False,
+    "copyright_zoom": 1.07,
+    "random_crop_offset": False,
+}
+for _k, _v in _STEP16_DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 # Persistent per-session dir for the canvas-picked source file.
 if "session_dir" not in st.session_state:
     st.session_state["session_dir"] = tempfile.mkdtemp(prefix="recap_session_")
@@ -361,6 +437,19 @@ st.caption(
     " Edit ကို နှိပ်ပြီး Blur ထည့်ခြင်း / စာတန်းနေရာ ရွှေ့ခြင်း တို့ကို "
     "လုပ်နိုင်ပါတယ်။"
 )
+# Step 16: live canvas preview of the Source settings (read from
+# session_state — the widgets below update it on every rerun).
+_preview = {
+    "aspect_ratio": str(st.session_state.get("aspect_ratio", "9:16")),
+    "fit_mode": str(st.session_state.get("fit_mode", "crop")),
+    "crop_align": str(st.session_state.get("crop_align", "center")),
+    "inner_scale": float(st.session_state.get("inner_scale", 1.22)),
+    "vertical_pos": float(st.session_state.get("vertical_pos", 0.0)),
+    "horizontal_pos": float(st.session_state.get("horizontal_pos", 0.0)),
+    "mirror_horizontal": bool(
+        st.session_state.get("mirror_horizontal", False)),
+    "copyright_zoom": float(st.session_state.get("copyright_zoom", 1.07)),
+}
 _val = interactive_canvas(
     video_id=_canvas_video_id,
     video_data_url=_canvas_data_url,
@@ -376,6 +465,7 @@ _val = interactive_canvas(
         if st.session_state.get("src_path")
         else None
     ),
+    preview=_preview,
     key="mmr_canvas",
 )
 if isinstance(_val, dict):
@@ -489,6 +579,42 @@ tab_src, tab_voice, tab_sub, tab_adv = st.tabs(
     [" Source", " Voice", " Subtitles", " Advanced"]
 )
 
+
+def _mode_label(mode: str) -> str:
+    """Processing-mode card label: bold title + subtitle (markdown)."""
+    if mode == "pro_ai_recap":
+        return (
+            "**Pro AI Recap**\n\nDialogue ဗီဒီယိုအတွက် — ဘာမှ မဖြတ်ဘူး။ "
+            "block တစ်ခုစီရဲ့ ဗီဒီယို အပိုင်းကို အသံ length နဲ့ အတိအကျ "
+            "ကိုက်အောင် independent speed နဲ့ ချိန်တယ်။"
+        )
+    return (
+        "**AI Recap**\n\nNarration / recap ဗီဒီယို — အသံက master ဖြစ်ပြီး "
+        "ဗီဒီယိုကို အသံနဲ့ကိုက်အောင် ဆွဲချိန်တယ်။"
+    )
+
+
+def _bump(key: str, delta: float, lo: float, hi: float) -> None:
+    """Step 16 −/+ buttons: nudge a slider's session_state value."""
+    v = float(st.session_state.get(key, 0.0))
+    st.session_state[key] = round(min(hi, max(lo, v + delta)), 4)
+
+
+def _stepper_slider(label: str, key: str, lo: float, hi: float,
+                    step: float, fmt: str) -> None:
+    """A slider flanked by − / + buttons (Step 16 reference layout)."""
+    c1, c2, c3 = st.columns([1, 6, 1])
+    with c1:
+        st.button("−", key=f"{key}_minus", on_click=_bump,
+                  args=(key, -step, lo, hi))
+    with c2:
+        st.slider(label, lo, hi, key=key, step=step, format=fmt,
+                  label_visibility="collapsed")
+    with c3:
+        st.button("+", key=f"{key}_plus", on_click=_bump,
+                  args=(key, step, lo, hi))
+
+
 with tab_src:
     # Current video source (picked inside the canvas, or demo / URL).
     _src_name = "—"
@@ -505,8 +631,84 @@ with tab_src:
         key="demo_mode",
         on_change=_demo_toggled,
     )
+
+    # ---- Step 16: Processing Mode (2 cards) ----
+    st.markdown("### Processing Mode")
+    st.radio(
+        "Processing Mode",
+        options=["ai_recap", "pro_ai_recap"],
+        format_func=_mode_label,
+        key="processing_mode",
+        label_visibility="collapsed",
+    )
+
+    # ---- Step 16: Aspect Ratio (5 pills) + Fit Mode (2 pills) ----
+    st.markdown("### Aspect Ratio")
+    st.pills(
+        "Aspect Ratio",
+        options=["Original", "9:16", "1:1", "4:5", "16:9"],
+        key="aspect_ratio",
+        label_visibility="collapsed",
+    )
+    st.markdown("### Fit Mode")
+    st.pills(
+        "Fit Mode",
+        options=["crop", "pad"],
+        format_func=lambda m: (
+            "Crop (fill)" if m == "crop" else "Pad (blur bg)"),
+        key="fit_mode",
+        label_visibility="collapsed",
+    )
+    if st.session_state.get("fit_mode", "crop") == "crop":
+        st.pills(
+            "Crop alignment",
+            options=["top", "center", "bottom"],
+            format_func=lambda a: a.capitalize(),
+            key="crop_align",
+            label_visibility="collapsed",
+        )
+    else:  # Pad (blur bg): inner scale + vertical/horizontal position
+        st.markdown(
+            f"**Inner scale** — "
+            f"{float(st.session_state.get('inner_scale', 1.22)):.2f}×"
+        )
+        _stepper_slider("Inner scale", "inner_scale", 0.5, 2.0, 0.01,
+                        "%.2f×")
+        st.markdown(
+            f"**Vertical position** — "
+            f"{float(st.session_state.get('vertical_pos', 0.0)):+.0f}%"
+        )
+        _stepper_slider("Vertical position", "vertical_pos", -50.0, 50.0,
+                        1.0, "%+.0f%%")
+        st.markdown(
+            f"**Horizontal position** — "
+            f"{float(st.session_state.get('horizontal_pos', 0.0)):+.0f}%"
+        )
+        _stepper_slider("Horizontal position", "horizontal_pos", -50.0,
+                        50.0, 1.0, "%+.0f%%")
+        st.caption(
+            "Source ကို pad frame ထဲမှာ ချဲ့/ရွှေ့ချင်ရင် — မြင်ပပျောက်တဲ့ "
+            "အပိုင်းကို crop လုပ်ပါတယ်။ Preview မှာ တိုက်ရိုက် မြင်ရပါတယ်။"
+        )
+
+    # ---- Step 16: Copyright ----
+    st.markdown("### Copyright")
+    st.toggle("Mirror horizontally", key="mirror_horizontal")
+    st.markdown(
+        f"**Zoom (copyright nudge)** — "
+        f"{float(st.session_state.get('copyright_zoom', 1.07)):.2f}×"
+    )
+    _stepper_slider("Zoom (copyright nudge)", "copyright_zoom", 1.0, 1.25,
+                    0.01, "%.2f×")
+    st.toggle("Small random crop offset", key="random_crop_offset")
+    st.caption(
+        "Mirror ကို bounding box/pad position တွေထက် အရင်ချမှတ်ပါတယ် — "
+        "box တွေနဲ့ pad position ဟာ မှန်ရိပ်ပြီးတဲ့ frame အတိုင်းသာ "
+        "အလုပ်လုပ်ပါတယ်။ Random crop က render တစ်ခါစီ pixel အနည်းငယ် "
+        "ကွဲပြားစေတယ်။"
+    )
+
     model_choice = st.selectbox(" AI Model ရွေးပါ", MODEL_OPTIONS, index=0)
-    recap_length = st.slider(" Recap အရှည် (စက္ကန့်)", 15, 120, 30, 5)
 
 with tab_voice:
     voice_choice = st.radio(" မြန်မာ AI အသံ ရွေးပါ", VOICE_CHOICES, index=0)
@@ -646,8 +848,6 @@ with tab_adv:
         )
         st.session_state["forget_just_clicked"] = False
 
-    aspect_choice = st.radio(" Aspect Ratio ရွေးပါ", ASPECT_CHOICES, index=0)
-
 run_btn = st.button(" Recap ဗီဒီယို ထုတ်လုပ်မည်", type="primary")
 
 if run_btn:
@@ -714,9 +914,34 @@ if run_btn:
                 video_path=src_path,
                 video_url=src_url,
                 user_api_key=key or None,
-                target_duration=int(recap_length),
+                # Recap length slider removed (user order): AI Recap +
+                # Pro AI Recap both fully work, so the length is fixed
+                # at 30s (AI Recap narration target; Pro ignores it —
+                # it uses the full video).
+                target_duration=30,
                 voice_name=_parse_voice(voice_choice),
-                aspect_ratio=_parse_aspect(aspect_choice),
+                # Step 16: all Source-tab settings flow into the Step 15
+                # backend exactly as chosen (aspect is now the Source
+                # tab's 5-way pill selector, not the old Advanced radio).
+                processing_mode=str(
+                    st.session_state.get("processing_mode", "ai_recap")),
+                aspect_ratio=str(
+                    st.session_state.get("aspect_ratio", "9:16")),
+                fit_mode=str(st.session_state.get("fit_mode", "crop")),
+                crop_align=str(
+                    st.session_state.get("crop_align", "center")),
+                inner_scale=float(
+                    st.session_state.get("inner_scale", 1.22)),
+                vertical_pos=float(
+                    st.session_state.get("vertical_pos", 0.0)),
+                horizontal_pos=float(
+                    st.session_state.get("horizontal_pos", 0.0)),
+                mirror_horizontal=bool(
+                    st.session_state.get("mirror_horizontal", False)),
+                copyright_zoom=float(
+                    st.session_state.get("copyright_zoom", 1.07)),
+                random_crop_offset=bool(
+                    st.session_state.get("random_crop_offset", False)),
                 bg_volume=float(bg_volume),
                 burn_subtitles=bool(burn_subtitles),
                 work_dir=session_dir,
@@ -728,11 +953,16 @@ if run_btn:
                 blur_boxes=_blur_boxes,
                 subtitle_config=_subtitle_config,
             )
+        # Pro runs have no single video_speed_factor (per-block speeds)
+        # — don't show "(None)".
+        _sync_note = str(result["sync_method"])
+        if result.get("video_speed_factor") is not None:
+            _sync_note += f" ({result['video_speed_factor']})"
         st.session_state["recap_result"] = {
             "status": (
                 f"✓ ပြီးဆုံးပါပြီ! | {result['aspect_ratio']} | "
                 f"စာတန်း: {result['subtitle_mode']} | "
-                f"sync: {result['sync_method']} ({result['video_speed_factor']})"
+                f"sync: {_sync_note}"
             ),
             "video_path": result["final_video_path"],
             "srt_path": result["srt_path"],
