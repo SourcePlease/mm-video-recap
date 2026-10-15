@@ -35,6 +35,112 @@ st.set_page_config(
     layout="centered",
 )
 
+# ---- Step 12: iOS 27 Liquid Glass Design System ----
+LIQUID_GLASS_CSS = """
+<style>
+/* Page: deep dark backdrop so the glass cards read as glass. */
+.stApp {
+  background:
+    radial-gradient(1200px 600px at 85% -10%, rgba(59, 130, 246, 0.28), transparent 60%),
+    radial-gradient(900px 500px at -10% 20%, rgba(139, 92, 246, 0.22), transparent 55%),
+    linear-gradient(160deg, #0b1220 0%, #101a2e 45%, #0a0f1e 100%);
+  color: #e8edf7;
+}
+.stApp > header[data-testid="stHeader"] {
+  background: transparent;
+}
+.stApp h1, .stApp h2, .stApp h3, .stApp h4,
+.stApp p, .stApp li, .stApp label, .stApp span {
+  color: #e8edf7;
+}
+.stApp [data-testid="stCaptionContainer"] {
+  color: #94a3b8;
+}
+
+/* Segmented Tab Bar: black bar (matches the reference image). */
+div[data-testid="stTabs"] div[role="tablist"] {
+  background: #0b0f1a;
+  border-radius: 20px;
+  padding: 6px;
+  gap: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+div[data-testid="stTabs"] div[role="tab"] {
+  background: transparent;
+  color: #94a3b8;
+  border-radius: 18px;
+  font-weight: 500;
+  border: none;
+  padding: 10px 14px;
+  cursor: pointer;
+}
+div[data-testid="stTabs"] div[role="tab"] p {
+  color: #94a3b8;
+}
+div[data-testid="stTabs"] div[role="tab"]:hover {
+  color: #e2e8f0;
+}
+div[data-testid="stTabs"] div[role="tab"]:hover p {
+  color: #e2e8f0;
+}
+div[data-testid="stTabs"] div[role="tab"][aria-selected="true"] {
+  background: #ffffff;
+  color: #2563eb;
+  border-radius: 18px;
+  font-weight: 600;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.25);
+}
+div[data-testid="stTabs"] div[role="tab"][aria-selected="true"] p {
+  color: #2563eb;
+}
+/* Hide the default underline indicator — the white pill is the indicator. */
+div[data-testid="stTabs"] .react-aria-SelectionIndicator {
+  display: none;
+}
+
+/* Tab content: Dark Liquid Glass Card. */
+div[role="tabpanel"] {
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(25px) saturate(180%);
+  -webkit-backdrop-filter: blur(25px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 24px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+  padding: 20px;
+  margin-top: 12px;
+}
+
+/* Inputs on dark glass: keep them dark so they don't glow white. */
+.stApp [data-testid="stTextInput"] input,
+.stApp [data-testid="stSelectbox"] > div > div {
+  background: rgba(255, 255, 255, 0.08);
+  color: #f1f5f9;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+}
+.stApp [data-testid="stTextInput"] input::placeholder {
+  color: #64748b;
+}
+
+/* Action Button: Liquid glowing gradient. */
+.stApp button[data-testid="stBaseButton-primary"] {
+  background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 50%, #ec4899 100%);
+  color: #ffffff;
+  border: none;
+  border-radius: 18px;
+  font-weight: 700;
+  box-shadow: 0 8px 28px rgba(139, 92, 246, 0.45),
+              0 0 0 1px rgba(255, 255, 255, 0.18) inset;
+  padding: 14px 22px;
+}
+.stApp button[data-testid="stBaseButton-primary"]:hover {
+  filter: brightness(1.12);
+  box-shadow: 0 10px 34px rgba(139, 92, 246, 0.6),
+              0 0 0 1px rgba(255, 255, 255, 0.25) inset;
+}
+</style>
+"""
+st.markdown(LIQUID_GLASS_CSS, unsafe_allow_html=True)
+
 HEADER_TOP = """\
 # 🎬 100% Free Online Video Recap
 
@@ -162,13 +268,11 @@ def _demo_toggled() -> None:
     st.session_state["demo_suppressed"] = False
 
 
-demo_mode = st.checkbox(
-    "🧪 API Key မပါဘဲ Demo စမ်းသပ်မည် (Mock Mode)",
-    value=False,
-    key="demo_mode",
-    on_change=_demo_toggled,
-)
-demo_active = bool(demo_mode) and not st.session_state.get("demo_suppressed")
+# Demo state is read from session_state here (the checkbox itself lives
+# in the Source tab, below the canvas). Streamlit sets widget state from
+# the frontend before the script runs, so this already reflects the
+# current checkbox value.
+demo_active = bool(st.session_state.get("demo_mode", False)) and not st.session_state.get("demo_suppressed")
 
 # ---- Step 11: Interactive Main Canvas (TOP; video input lives inside it) ----
 _sub_default = dict(CANVAS_DEFAULT["subtitle"])
@@ -337,81 +441,117 @@ if isinstance(_val, dict):
         except (TypeError, ValueError):
             pass  # keep previous canvas state on malformed values
 
-# ---- API Key (below the canvas) ----
-st.markdown(KEY_GUIDE)
-
-
-def _key_changed() -> None:
-    # Fires ONLY when the user actually edits the key box. Browser
-    # autofill does not trigger this, so a stale autofill ghost can
-    # never clobber the restored key. The restored key lives in
-    # "api_key" (a plain key); the box itself always starts empty.
-    st.session_state["api_key"] = st.session_state.get("api_key_box", "")
-
-
-key_input = st.text_input(
-    "🔑 သင်၏ Free Gemini API Key ထည့်ပါ",
-    type="password",
-    # Always start empty: the restored key is shown via the blue note,
-    # never echoed back into the box (and an autofill ghost in the box
-    # must not become the app's key).
-    value="",
-    key="api_key_box",
-    placeholder="AIza...",
-    on_change=_key_changed,
+# ---- Step 12: Segmented Settings Tabs (directly below the canvas) ----
+tab_src, tab_voice, tab_sub, tab_adv = st.tabs(
+    ["▶️ Source", "🎙️ Voice", "💬 Subtitles", "🎛️ Advanced"]
 )
-# NOTE: do NOT copy key_input into api_key here. The box is empty on
-# every fresh load; copying it would wipe the localStorage-restored
-# key (the "enter the key every time" bug). api_key is set only by
-# the restore above and by _key_changed (a real user edit).
 
-if browser_saved and st.session_state["api_key"] == browser_saved:
-    st.info("🟢 သိမ်းဆည်းထားသော API Key အသင့်ရှိနေပါသည်")
-
-key_col1, key_col2 = st.columns(2)
-with key_col1:
-    verify_save_btn = st.button("✅ API Key စစ်ဆေးပြီး Browser မှာ သိမ်းမည်")
-with key_col2:
-    forget_btn = st.button("🗑️ သိမ်းထားသော Key ဖျက်မည်")
-
-if verify_save_btn:
-    _k = (st.session_state["api_key"] or "").strip()
-    _ok, _msg = verify_gemini_api_key(_k)
-    if _ok:
-        streamlit_js_eval(
-            js_expressions=f"localStorage.setItem('{LS_KEY}',{json.dumps(_k)})",
-            key="mmr_key_save",
-        )
-        st.success(
-            "✅ API Key မှန်ကန်ကြောင်း စစ်ဆေးပြီး "
-            "သင့် Browser တွင် သိမ်းဆည်းပြီးပါပြီ!"
-        )
-    else:
-        # Invalid key: show the error and do NOT save anything.
-        st.error(_msg)
-
-if forget_btn:
-    streamlit_js_eval(
-        js_expressions=f"localStorage.removeItem('{LS_KEY}')",
-        key="mmr_key_del",
+with tab_src:
+    # Current video source (picked inside the canvas, or demo / URL).
+    _src_name = "—"
+    if st.session_state.get("src_path"):
+        _src_name = os.path.basename(st.session_state["src_path"])
+    elif (st.session_state.get("src_url") or "").strip():
+        _src_name = st.session_state["src_url"]
+    elif demo_active:
+        _src_name = "Demo ဗီဒီယို (sample_test.mp4)"
+    st.caption(f"📹 လက်ရှိ ဗီဒီယို: {_src_name}")
+    demo_mode = st.checkbox(
+        "🧪 API Key မပါဘဲ Demo စမ်းသပ်မည် (Mock Mode)",
+        value=False,
+        key="demo_mode",
+        on_change=_demo_toggled,
     )
-    st.session_state["api_key"] = ""
-    # Don't re-restore the (now stale) cached browser value on rerun.
-    st.session_state["key_restored"] = True
-    if "api_key_box" in st.session_state:
-        del st.session_state["api_key_box"]
-    st.rerun()
+    model_choice = st.selectbox("🤖 AI Model ရွေးပါ", MODEL_OPTIONS, index=0)
+    recap_length = st.slider("🎞️ Recap အရှည် (စက္ကန့်)", 15, 120, 30, 5)
 
-recap_length = st.slider("🎞️ Recap အရှည် (စက္ကန့်)", 15, 120, 30, 5)
-voice_choice = st.radio("🎙️ မြန်မာ AI အသံ ရွေးပါ", VOICE_CHOICES, index=0)
-aspect_choice = st.radio("📐 Aspect Ratio ရွေးပါ", ASPECT_CHOICES, index=0)
-bg_volume = st.slider("🔊 မူရင်းနောက်ခံအသံ အတိုးအကျယ်", 0.0, 0.5, 0.15, 0.05)
-burn_subtitles = st.checkbox(
-    "💬 မြန်မာစာတန်းထိုး Burn-in ထည့်မည်",
-    value=True,
-    key="burn_subtitles",
-)
-model_choice = st.selectbox("🤖 AI Model ရွေးပါ", MODEL_OPTIONS, index=0)
+with tab_voice:
+    voice_choice = st.radio("🎙️ မြန်မာ AI အသံ ရွေးပါ", VOICE_CHOICES, index=0)
+    bg_volume = st.slider(
+        "🔊 မူရင်းနောက်ခံအသံ အတိုးအကျယ်", 0.0, 0.5, 0.15, 0.05
+    )
+
+with tab_sub:
+    burn_subtitles = st.checkbox(
+        "💬 မြန်မာစာတန်းထိုး Burn-in ထည့်မည်",
+        value=True,
+        key="burn_subtitles",
+    )
+    _sub_info = st.session_state.get("canvas_sub") or dict(
+        CANVAS_DEFAULT["subtitle"]
+    )
+    st.caption(
+        "✏️ စာတန်းရဲ့ နေရာ / အရွယ်အစားကို Canvas မှာ Edit နှိပ်ပြီး "
+        "စာတန်းသေတ္တာကို ဆွဲ / အရွယ်ချဲ့ ချိန်နိုင်ပါတယ်။ "
+        f"လက်ရှိ: x={float(_sub_info.get('x_pct', 0.5)):.2f}, "
+        f"y={float(_sub_info.get('y_pct', 0.82)):.2f}, "
+        f"font={int(_sub_info.get('font_size', 22))}"
+    )
+
+with tab_adv:
+    st.markdown(KEY_GUIDE)
+
+    def _key_changed() -> None:
+        # Fires ONLY when the user actually edits the key box. Browser
+        # autofill does not trigger this, so a stale autofill ghost can
+        # never clobber the restored key. The restored key lives in
+        # "api_key" (a plain key); the box itself always starts empty.
+        st.session_state["api_key"] = st.session_state.get("api_key_box", "")
+
+    key_input = st.text_input(
+        "🔑 သင်၏ Free Gemini API Key ထည့်ပါ",
+        type="password",
+        # Always start empty: the restored key is shown via the blue note,
+        # never echoed back into the box (and an autofill ghost in the box
+        # must not become the app's key).
+        value="",
+        key="api_key_box",
+        placeholder="AIza...",
+        on_change=_key_changed,
+    )
+    # NOTE: do NOT copy key_input into api_key here. The box is empty on
+    # every fresh load; copying it would wipe the localStorage-restored
+    # key (the "enter the key every time" bug). api_key is set only by
+    # the restore above and by _key_changed (a real user edit).
+
+    if browser_saved and st.session_state["api_key"] == browser_saved:
+        st.info("🟢 သိမ်းဆည်းထားသော API Key အသင့်ရှိနေပါသည်")
+
+    key_col1, key_col2 = st.columns(2)
+    with key_col1:
+        verify_save_btn = st.button("✅ API Key စစ်ဆေးပြီး Browser မှာ သိမ်းမည်")
+    with key_col2:
+        forget_btn = st.button("🗑️ သိမ်းထားသော Key ဖျက်မည်")
+
+    if verify_save_btn:
+        _k = (st.session_state["api_key"] or "").strip()
+        _ok, _msg = verify_gemini_api_key(_k)
+        if _ok:
+            streamlit_js_eval(
+                js_expressions=f"localStorage.setItem('{LS_KEY}',{json.dumps(_k)})",
+                key="mmr_key_save",
+            )
+            st.success(
+                "✅ API Key မှန်ကန်ကြောင်း စစ်ဆေးပြီး "
+                "သင့် Browser တွင် သိမ်းဆည်းပြီးပါပြီ!"
+            )
+        else:
+            # Invalid key: show the error and do NOT save anything.
+            st.error(_msg)
+
+    if forget_btn:
+        streamlit_js_eval(
+            js_expressions=f"localStorage.removeItem('{LS_KEY}')",
+            key="mmr_key_del",
+        )
+        st.session_state["api_key"] = ""
+        # Don't re-restore the (now stale) cached browser value on rerun.
+        st.session_state["key_restored"] = True
+        if "api_key_box" in st.session_state:
+            del st.session_state["api_key_box"]
+        st.rerun()
+
+    aspect_choice = st.radio("📐 Aspect Ratio ရွေးပါ", ASPECT_CHOICES, index=0)
 
 run_btn = st.button("🎬 Recap ဗီဒီယို ထုတ်လုပ်မည်", type="primary")
 
