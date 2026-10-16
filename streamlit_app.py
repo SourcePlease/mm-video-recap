@@ -31,7 +31,15 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-16 job-persist v2"
+BUILD_VERSION = "2026-10-16 render-fixes v1"
+# Server boot time: set ONCE when this module is imported (i.e. when
+# the app process starts). A server restart re-imports the module, so
+# BOOT_TIME jumps forward. The re-attach logic compares it with a
+# remembered job's saved_at: if the server booted AFTER the job was
+# saved, the job died with the old process (its /tmp status file is
+# gone) — that is a server restart, not a stalled worker, and the user
+# deserves the exact message instead of a silent idle page.
+BOOT_TIME = time.time()
 from video_editor import (
     SUBTITLE_COLOR_RGB,
     SUBTITLE_FONTS,
@@ -506,9 +514,33 @@ _JOB_LOST_MSG = (
     "ထုတ်လုပ်မှု အလယ်မှာ ပြတ်သွားပါပြီ — app က ပြန်စသွားလို့ "
     "ဒီ Run ရဲ့ ရလဒ် ပျောက်သွားပါပြီ။ Run ကို ထပ်နှိပ်ပြီး ပြန်စပေးပါ။"
 )
+# Distinct message when the SERVER itself restarted mid-run (the job
+# died with the old process; its /tmp status file is gone). The user
+# deserves the exact cause, not a vague "lost".
+_JOB_RESTART_MSG = (
+    "Server ပြန်စသွားလို့ ဒီ Run ရဲ့ အလုပ် ပျောက်သွားပါပြီ — "
+    "Server restart ဖြစ်သွားတာပါ။ Run ကို ထပ်နှိပ်ပြီး ပြန်စပေးပါ။"
+)
 _JOB_STALE_RUNNING_S = 15 * 60  # file untouched this long -> worker dead
 _JOB_LOST_MIN_S = 60  # file missing sooner -> worker may not have started yet
 _JOB_LOST_MAX_S = 30 * 60  # file missing later -> stale entry, ignore
+
+
+def _classify_lost_job(saved_at, boot_time=BOOT_TIME) -> str:
+    """Classify a remembered job whose status file is gone / stale.
+
+    Returns "server_restart" when the server process booted AFTER the
+    job was saved (the job died with the old process), else "lost"
+    (worker died without a restart, or the file was never written).
+    Pure function — unit-testable without Streamlit.
+    """
+    try:
+        _saved = float(saved_at or 0)
+    except (TypeError, ValueError):
+        _saved = 0.0
+    if _saved and float(boot_time) > _saved:
+        return "server_restart"
+    return "lost"
 
 
 def _job_status_path(run_dir) -> str:
@@ -689,12 +721,12 @@ def _run_pipeline_job(job: Dict) -> None:
         })
 
 
-# Phone-hang fix: poll every 3s, not every 1s. A 1s interval meant
-# ~360 fragment reruns over a 6-min Pro run — constant network +
+# Phone-hang fix: poll every 5s, not every 1s (was 3s). A 1s interval
+# meant ~360 fragment reruns over a 6-min Pro run — constant network +
 # CPU on the phone for a progress bar that only changes in bursts
-# anyway. 3s is still live (progress + elapsed tick every 3s) with
-# 3x less load.
-@st.fragment(run_every=3)
+# anyway. 5s is still live (progress + elapsed tick every 5s) with
+# 5x less load than 1s; renders take minutes, so a 5s tick is plenty.
+@st.fragment(run_every=5)
 def _render_run_progress() -> None:
     """Poll the async job and render live progress / finalize it.
 
@@ -746,8 +778,14 @@ def _render_run_progress() -> None:
                     except OSError:
                         _fage = 0.0
                     if _fage > _JOB_STALE_RUNNING_S:
-                        if st.session_state.get("run_error") != _JOB_LOST_MSG:
-                            st.session_state["run_error"] = _JOB_LOST_MSG
+                        _msg = (
+                            _JOB_RESTART_MSG
+                            if _classify_lost_job(
+                                _fstatus.get("started_at")
+                                or _stored.get("saved_at")) == "server_restart"
+                            else _JOB_LOST_MSG)
+                        if st.session_state.get("run_error") != _msg:
+                            st.session_state["run_error"] = _msg
                             st.rerun(scope="app")
                     else:
                         _fpct = float(_fstatus.get("pct", 0.0))
@@ -775,8 +813,13 @@ def _render_run_progress() -> None:
                 _saved_at = float(_stored.get("saved_at") or 0)
                 _fage = time.time() - _saved_at if _saved_at else 0.0
                 if _JOB_LOST_MIN_S < _fage < _JOB_LOST_MAX_S:
-                    if st.session_state.get("run_error") != _JOB_LOST_MSG:
-                        st.session_state["run_error"] = _JOB_LOST_MSG
+                    _msg = (
+                        _JOB_RESTART_MSG
+                        if _classify_lost_job(
+                            _stored.get("saved_at")) == "server_restart"
+                        else _JOB_LOST_MSG)
+                    if st.session_state.get("run_error") != _msg:
+                        st.session_state["run_error"] = _msg
                         st.rerun(scope="app")
                 elif _fage <= _JOB_LOST_MIN_S:
                     # The worker may not have written its status file
@@ -928,6 +971,10 @@ _val = interactive_canvas(
     # Pick re-announce: tell the canvas which pick Python knows, so
     # it can re-announce a local pick lost to a session reset.
     pending_ack=st.session_state.get("pending_video_id"),
+    # Fix 3: pause the canvas preview while a Run is in progress —
+    # decoding during a minutes-long render burns phone resources.
+    paused=bool(st.session_state.get("run_job")
+                or st.session_state.get("pending_job")),
     key="mmr_canvas",
 )
 if isinstance(_val, dict):

@@ -452,6 +452,36 @@ def _trim_segments(source: str, highlights: List[Dict], seg_dir: str) -> List[st
     return seg_paths
 
 
+def _highlights_tile(highlights: List[Dict], src_dur: float,
+                     tol: float = 0.05) -> bool:
+    """True when highlights tile [0, src_dur] with no real gaps.
+
+    Full-duration AI Recap (and Pro) guarantee this tiling, so the
+    render can use the source video directly instead of re-encoding
+    every highlight into a segment and concatenating them — that was
+    N+1 full encodes for an N-highlight video (the main reason an
+    8-min render took ~14 min). Tiny overlaps/gaps (<= tol, from
+    2-decimal rounding) still count as tiling. Returns False for an
+    empty list or any real gap, so partial-highlight renders keep the
+    exact old trim+concat path.
+    """
+    if not highlights or not src_dur or src_dur <= 0:
+        return False
+    try:
+        segs = sorted((float(h["start"]), float(h["end"]))
+                      for h in highlights)
+    except (KeyError, TypeError, ValueError):
+        return False
+    if segs[0][0] > tol:
+        return False
+    if segs[-1][1] < src_dur - tol:
+        return False
+    for (_, prev_end), (nxt_start, _) in zip(segs, segs[1:]):
+        if nxt_start - prev_end > tol:
+            return False
+    return True
+
+
 def _concat_segments(seg_paths: List[str], seg_dir: str) -> str:
     list_file = os.path.join(seg_dir, "concat_list.txt")
     with open(list_file, "w", encoding="utf-8") as f:
@@ -1055,9 +1085,16 @@ def render_recap_video(
         raise VideoEditorError("No valid highlight segments after clamping.")
 
     try:
-        # 1) trim + concat
-        seg_paths = _trim_segments(source_video_path, safe_highlights, seg_dir)
-        concat_path = _concat_segments(seg_paths, seg_dir)
+        # 1) trim + concat — SKIPPED when highlights tile the whole
+        # video (full-duration AI Recap): the source IS the concat,
+        # so re-encoding every highlight first was pure waste
+        # (N+1 encodes). Partial highlights keep the exact old path.
+        if _highlights_tile(safe_highlights, src_dur):
+            concat_path = source_video_path
+        else:
+            seg_paths = _trim_segments(source_video_path, safe_highlights,
+                                       seg_dir)
+            concat_path = _concat_segments(seg_paths, seg_dir)
 
         # 2) build the final filter graph
         out_w, out_h = _resolve_aspect_target(aspect_ratio, src_meta)

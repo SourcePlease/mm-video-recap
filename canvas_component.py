@@ -381,6 +381,14 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
        the same nonce must NOT re-send the ~40MB payload. */
     localDataUrl: null,
     localName: null,
+    /* The picked File object itself (a small reference, NOT the
+       bytes). After Python acks the upload, localDataUrl (the ~44MB
+       base64 string) is freed to stop the phone browser holding it
+       in memory for the whole session (Aw, Snap! / OOM); if Python
+       ever requests the payload again (new nonce, e.g. after a
+       session reset), it is re-read from localFile on demand. */
+    localFile: null,
+    restoringDataUrl: false,
     uploadServedNonce: null,
     /* videoId whose base64 video_data is still sitting in the component
        value — cleared once Python acks receipt, so the ~40MB payload
@@ -464,6 +472,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 
   /* Fresh canvas for a newly picked / newly entered video. */
   function resetForNewVideo() {
+    S.localFile = null;
+    S.restoringDataUrl = false;
     S.boxes = [];
     S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct,
               fpct: DEFAULT_SUB.font_size_pct, wpct: null };
@@ -825,6 +835,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
          when the user clicks Run (args.upload_request). */
       S.localDataUrl = dataUrl;
       S.localName = name;
+      S.localFile = file;
       sendValue("video_picked", {
         video_id: vid, video_name: name,
       });
@@ -1141,9 +1152,15 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     }
     /* Server acked receipt of the picked file: drop the base64 payload
        from the component value (send a small state instead) so the
-       ~40MB is not re-sent on every later rerun. Runs once. */
+       ~40MB is not re-sent on every later rerun. Runs once. Also free
+       the ~44MB base64 string itself from JS memory (the phone was
+       holding it for the whole session → Aw, Snap! / OOM); the picked
+       File object stays, so the payload can be re-read on demand if
+       Python ever requests it again (new nonce). The <video> element
+       keeps its own decoded buffers, so playback is unaffected. */
     if (S.videoDataPending && S.args.video_ack === S.videoDataPending) {
       S.videoDataPending = null;
+      S.localDataUrl = null;
       sendValue(null);
     }
     /* The phone's shape follows the OUTPUT aspect (Original = the
@@ -1156,7 +1173,26 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
        args.upload_request — a fresh nonce per request. Send the stored
        data URL exactly once per nonce; the in-flight guard below keeps
        the video displayed while Python saves it. No request, no
-       upload: picking / editing never sends the video on its own. */
+       upload: picking / editing never sends the video on its own.
+       If the base64 was freed after an earlier ack (Fix 2), re-read
+       it from the kept File object, then re-run onRender so this
+       same upload block sends it. */
+    if (S.args.upload_request != null
+        && S.args.upload_request !== S.uploadServedNonce
+        && S.localPicked && S.videoId && !S.expectRemove
+        && !S.localDataUrl && S.localFile && !S.restoringDataUrl) {
+      S.restoringDataUrl = true;
+      (function (f) {
+        var r = new FileReader();
+        r.onload = function () {
+          S.localDataUrl = r.result;
+          S.restoringDataUrl = false;
+          onRender(S.args);
+        };
+        r.onerror = function () { S.restoringDataUrl = false; };
+        r.readAsDataURL(f);
+      })(S.localFile);
+    }
     if (S.args.upload_request != null
         && S.args.upload_request !== S.uploadServedNonce
         && S.localPicked && S.videoId && !S.expectRemove
@@ -1199,6 +1235,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.expectRemove = false;
       S.localDataUrl = null;
       S.localName = null;
+      S.localFile = null;
+      S.restoringDataUrl = false;
       S.uploadServedNonce = null;
       S.boxes = [];
       S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct,
@@ -1237,6 +1275,15 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
         /* No data URL: the video is already loaded in this frame
            (picked locally), so keep it. */
       }
+    }
+
+    /* A Run is in progress: pause the preview video(s) — decoding
+       during a minutes-long render burns phone CPU/battery/memory
+       for a video nobody is watching. Never auto-resume: when the
+       run ends, paused=false and the user presses play. */
+    if (S.args.paused) {
+      try { if (!video.paused) video.pause(); } catch (e) {}
+      try { if (!bgVideo.paused) bgVideo.pause(); } catch (e) {}
     }
 
     /* Adopt incoming state only for a new video (fresh canvas) and
@@ -1366,6 +1413,11 @@ def interactive_canvas(
     # without this, Run would error "select a video" while the video
     # is still displayed in the canvas.
     pending_ack: Optional[str] = None,
+    # Pause the canvas video while a Run is in progress (Fix 3):
+    # decoding the preview during a minutes-long render burns phone
+    # CPU/battery/memory for a video nobody is watching. The frontend
+    # pauses (never auto-resumes — the user presses play).
+    paused: bool = False,
     key: Optional[str] = None,
 ) -> Dict:
     """Render the canvas and return the latest user-edited state.
@@ -1396,6 +1448,7 @@ def interactive_canvas(
         subtitle_style=subtitle_style or {},
         upload_request=upload_request,
         pending_ack=pending_ack,
+        paused=bool(paused),
         default=CANVAS_DEFAULT,
         key=key,
     )

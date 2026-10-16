@@ -118,6 +118,25 @@ def run_full_recap_pipeline(
         output_dir = work_dir
     os.makedirs(output_dir, exist_ok=True)
 
+    # Server-restart guard (part 1): fail FAST with a clear message
+    # when the disk is essentially full — a render that runs the disk
+    # dry can OOM/crash the container (Streamlit Cloud restarts it,
+    # and the job is unrecoverable). The precise per-video estimate
+    # runs after ingest (part 2), once the duration is known. A guard
+    # failure itself must never block a run.
+    try:
+        _free_mb = shutil.disk_usage(work_dir).free / (1024 * 1024)
+        if _free_mb < 50:
+            raise PipelineError(
+                "Server မှာ နေရာလွတ် မလောက်တော့ပါ "
+                f"({_free_mb:.0f}MB သာ ကျန်သည်) — "
+                "ခဏစောင့်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။"
+            )
+    except PipelineError:
+        raise
+    except Exception:
+        pass
+
     # Progress reporting: phase weights as (base, span) — analyze
     # 0–30, TTS 30–55, render 55–100. Single calls (Gemini analyze,
     # one-shot TTS) report only phase start/end — no faked creep.
@@ -136,6 +155,26 @@ def run_full_recap_pipeline(
     local_path, metadata = prepare_video_source(
         uploaded_file_path=video_path, video_url=video_url, work_dir=work_dir
     )
+
+    # Disk guard (part 2): estimate what THIS run will newly write —
+    # output (~0.4 MB/s at ~3.2 Mbps, crf 20) + intermediates + margin.
+    # A fixed threshold misfires (a 20s test needs ~150MB, an 8-min
+    # video ~350MB), so scale by duration. Fail fast, not mid-render.
+    try:
+        _dur = float(metadata.get("duration") or 0)
+        _need_mb = _dur * 0.4 + 150.0
+        _free2_mb = shutil.disk_usage(work_dir).free / (1024 * 1024)
+        if _free2_mb < _need_mb:
+            raise PipelineError(
+                "Server မှာ နေရာလွတ် မလောက်တော့ပါ "
+                f"({_free2_mb:.0f}MB သာ ကျန်သည်၊ "
+                f"ဒီ video အတွက် ~{_need_mb:.0f}MB လိုသည်) — "
+                "ခဏစောင့်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။"
+            )
+    except PipelineError:
+        raise
+    except Exception:
+        pass
 
     # 2) recap plan (live AI or mock / prebuilt) — mode-aware.
     # Plans are re-validated here so even a directly-passed plan gets
