@@ -22,7 +22,7 @@ import asyncio
 import os
 import re
 import subprocess
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import edge_tts
 from edge_tts import SubMaker
@@ -138,6 +138,8 @@ def generate_block_voiceovers(
     voice_name: str = "my-MM-ThihaNeural",
     rate: str = "+0%",
     proxy: Optional[str] = None,
+    # Progress callback: called with 0..1 after each block finishes.
+    on_progress: Optional[Callable[[float], None]] = None,
 ) -> List[Dict]:
     """Synthesize one Myanmar voiceover per Pro block (Step 15).
 
@@ -196,6 +198,8 @@ def generate_block_voiceovers(
         out.append({**b, "audio_path": str(ap),
                     "audio_len": float(audio_len),
                     "tts_rate": used_rate})
+        if on_progress is not None:
+            on_progress((i + 1) / max(1, len(blocks)))
     return out
 
 

@@ -373,13 +373,15 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     /* Set when the user taps the canvas ✕ (remove): the next no-video
        render is the real removal, not an in-flight pick. */
     expectRemove: false,
-    /* Stale-pick re-sync: the browser may keep a video the server
-       forgot (session reset). pickTime = when the pick was sent;
-       localDataUrl/localName let JS re-send it once. */
-    pickTime: 0,
+    /* Deferred upload: the picked video stays LOCAL in the browser
+       until the user clicks Run. localDataUrl/localName let
+       JS send it once when Python requests it (args.upload_request,
+       a fresh nonce per Run click). uploadServedNonce = the last
+       upload-request nonce JS already answered — a re-render with
+       the same nonce must NOT re-send the ~40MB payload. */
     localDataUrl: null,
     localName: null,
-    resyncSent: false,
+    uploadServedNonce: null,
     /* videoId whose base64 video_data is still sitting in the component
        value — cleared once Python acks receipt, so the ~40MB payload
        is not re-sent on every later rerun (phone-data burn). */
@@ -658,11 +660,13 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       fitHeight();
       /* Pad fg geometry needs the real video dimensions. */
       applyPreview();
-      /* URL videos only: report real dimensions so Python can size
-         the canvas to the video's ratio. Local files are ffprobed
-         server-side, so they never send this. */
-      if (!S.localPicked && video.src && /^https?:/.test(video.src) &&
-          video.videoWidth > 0 && S.metaSentFor !== S.videoId) {
+      /* Report real dimensions so Python can size the canvas to
+         the video's ratio. URL videos AND locally-picked videos both
+         send this: local files are no longer ffprobed at pick time
+         (upload is deferred until Run), so the canvas would
+         otherwise not know the source ratio for Original mode. */
+      if (video.src && video.videoWidth > 0
+          && S.metaSentFor !== S.videoId) {
         S.metaSentFor = S.videoId;
         sendValue("video_meta", {
           video_id: S.videoId,
@@ -760,7 +764,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
        the subtitle, and the user can tap Edit/Add-blur on top of it. */
     S.hasVideo = true;
     S.expectRemove = false;
-    S.resyncSent = false;
+    S.uploadServedNonce = null;
     applyEmpty();
     var reader = new FileReader();
     reader.onload = function () {
@@ -777,12 +781,14 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       video.load();
       bgVideo.src = dataUrl;
       bgVideo.load();
-      S.videoDataPending = vid;
-      S.pickTime = Date.now();
+      /* Deferred upload: the video stays LOCAL — no video_data is
+         sent yet. Python learns about the pick from the lightweight
+         video_picked action below, and requests the payload only
+         when the user clicks Run (args.upload_request). */
       S.localDataUrl = dataUrl;
       S.localName = name;
-      sendValue("video_selected", {
-        video_id: vid, video_data: dataUrl, video_name: name,
+      sendValue("video_picked", {
+        video_id: vid, video_name: name,
       });
     };
     reader.readAsDataURL(file);
@@ -1108,15 +1114,17 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     S.subsEnabled = S.args.subtitles_enabled !== false;
 
     var vid = S.args.video_id || null;
-    /* Session-reset heal: Python says "no video" but the browser has
-       held a locally-picked video for a while (Python should have
-       saved it by now) — the server session must have been lost.
-       Re-send the video once so Python recovers it; the in-flight
-       guard below keeps it displayed meanwhile. */
-    if (!vid && S.localPicked && S.videoId && !S.expectRemove
-        && S.localDataUrl && !S.resyncSent
-        && Date.now() - (S.pickTime || 0) > 30000) {
-      S.resyncSent = true;
+    /* Deferred upload: Python requests the video (Run clicked) via
+       args.upload_request — a fresh nonce per request. Send the stored
+       data URL exactly once per nonce; the in-flight guard below keeps
+       the video displayed while Python saves it. No request, no
+       upload: picking / editing never sends the video on its own. */
+    if (S.args.upload_request != null
+        && S.args.upload_request !== S.uploadServedNonce
+        && S.localPicked && S.videoId && !S.expectRemove
+        && S.localDataUrl) {
+      S.uploadServedNonce = S.args.upload_request;
+      S.videoDataPending = S.videoId;
       sendValue("video_selected", {
         video_id: S.videoId, video_data: S.localDataUrl,
         video_name: S.localName || "video",
@@ -1136,10 +1144,9 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.metaSentFor = null;
       S.videoDataPending = null;
       S.expectRemove = false;
-      S.pickTime = 0;
       S.localDataUrl = null;
       S.localName = null;
-      S.resyncSent = false;
+      S.uploadServedNonce = null;
       S.boxes = [];
       S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct,
                 fpct: DEFAULT_SUB.font_size_pct, wpct: null };
@@ -1293,6 +1300,10 @@ def interactive_canvas(
     video_ack: Optional[str] = None,
     preview: Optional[Dict] = None,
     subtitle_style: Optional[Dict] = None,
+    # Deferred upload: a fresh nonce per Run click when Python needs
+    # the picked video. None = no upload requested; the frontend sends
+    # the stored video_data exactly once per nonce.
+    upload_request: Optional[int] = None,
     key: Optional[str] = None,
 ) -> Dict:
     """Render the canvas and return the latest user-edited state.
@@ -1321,6 +1332,7 @@ def interactive_canvas(
         video_ack=video_ack,
         preview=preview or {},
         subtitle_style=subtitle_style or {},
+        upload_request=upload_request,
         default=CANVAS_DEFAULT,
         key=key,
     )

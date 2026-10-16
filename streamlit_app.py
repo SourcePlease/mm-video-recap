@@ -17,7 +17,10 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import tempfile
+import threading
+import time
 import traceback
 
 import streamlit as st
@@ -401,6 +404,220 @@ def _reset_canvas_state() -> None:
     st.session_state["canvas_sub"] = dict(_sub_default)
 
 
+def _delete_quietly(path) -> None:
+    """Delete one file, ignoring missing files / errors."""
+    try:
+        if path and os.path.isfile(str(path)):
+            os.remove(str(path))
+    except OSError:
+        pass
+
+
+def _delete_input_file() -> None:
+    """Delete the currently uploaded picked video (if any).
+
+    Only a locally-picked upload is deleted — never the bundled demo
+    sample. Called when the input is superseded (new pick / remove /
+    new URL) or after a successful result (auto-delete). While a job
+    is running, the file itself is left alone (the worker is still
+    reading it) — the fragment deletes the job's own input path on
+    completion — but the session pointer is still cleared.
+    """
+    _p = st.session_state.get("src_path")
+    if _p and st.session_state.get("src_local_picked"):
+        if not st.session_state.get("run_job"):
+            _delete_quietly(_p)
+    st.session_state["src_path"] = None
+    st.session_state["src_local_picked"] = False
+    st.session_state["src_video_id"] = None
+
+
+def _delete_result_files() -> None:
+    """Delete the previous run's output files (video + SRT), if any."""
+    _r = st.session_state.get("recap_result") or {}
+    _delete_quietly(_r.get("video_path"))
+    _delete_quietly(_r.get("srt_path"))
+    st.session_state["recap_result"] = None
+
+
+def _cleanup_run_workdir(run_dir, keep_paths) -> None:
+    """Delete everything in a run's working dir except keep_paths.
+
+    After a successful result the final video + SRT stay (the user
+    still needs to download them); the voiceover, subtitle PNGs,
+    concat lists and any other intermediates are deleted.
+    """
+    if not run_dir or not os.path.isdir(str(run_dir)):
+        return
+    _keep = {os.path.abspath(str(p)) for p in keep_paths if p}
+    try:
+        for _name in os.listdir(run_dir):
+            _p = os.path.join(run_dir, _name)
+            try:
+                if os.path.abspath(_p) in _keep:
+                    continue
+                if os.path.isfile(_p):
+                    os.remove(_p)
+                elif os.path.isdir(_p):
+                    shutil.rmtree(_p, ignore_errors=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+# ---- Async Run: the pipeline runs in a worker thread so the UI can
+# show live progress (percentage + elapsed + estimated remaining).
+# The worker NEVER touches st.session_state — it only mutates the
+# plain job dict (under its lock). The progress fragment (script
+# thread) reads the dict, and on completion stores the result in
+# session_state and reruns.
+_RUN_PHASE_LABELS = {
+    "uploading": "ဗီဒီယို တင်နေသည်…",
+    "analyze": "AI က ဗီဒီယို စိစစ်နေသည်…",
+    "tts": "မြန်မာအသံ ထုတ်နေသည်…",
+    "render": "ဗီဒီယို ပေါင်းနေသည်…",
+    "done": "ပြီးဆုံးပါပြီ",
+}
+
+
+def _run_pipeline_job(job: Dict) -> None:
+    """Worker-thread body: run the pipeline, report progress into job."""
+    snap = job["snapshot"]
+    lock = job["lock"]
+
+    def _cb(pct, phase, detail):
+        with lock:
+            job["pct"] = float(pct)
+            job["phase"] = phase
+            job["detail"] = detail
+
+    try:
+        result = run_full_recap_pipeline(
+            video_path=snap["src_path"],
+            video_url=snap["src_url"],
+            user_api_key=snap["key"] or None,
+            target_duration=30,
+            voice_name=snap["voice_name"],
+            processing_mode=snap["processing_mode"],
+            aspect_ratio=snap["aspect_ratio"],
+            fit_mode=snap["fit_mode"],
+            crop_align=snap["crop_align"],
+            inner_scale=snap["inner_scale"],
+            vertical_pos=snap["vertical_pos"],
+            horizontal_pos=snap["horizontal_pos"],
+            mirror_horizontal=snap["mirror_horizontal"],
+            copyright_zoom=snap["copyright_zoom"],
+            random_crop_offset=snap["random_crop_offset"],
+            bg_volume=snap["bg_volume"],
+            burn_subtitles=snap["burn_subtitles"],
+            work_dir=snap["run_dir"],
+            output_dir=snap["run_dir"],
+            output_name="recap.mp4",
+            use_mock_plan=snap["demo_active"],
+            tts_proxy=snap["tts_proxy"],
+            model=snap["model"],
+            blur_boxes=snap["blur_boxes"],
+            subtitle_config=snap["subtitle_config"],
+            on_progress=_cb,
+        )
+        with lock:
+            job["status"] = "done"
+            job["pct"] = 100.0
+            job["phase"] = "done"
+            job["detail"] = "ပြီးဆုံးပါပြီ"
+            job["result"] = result
+    except Exception as exc:  # noqa: BLE001 - surfaced in the fragment
+        traceback.print_exc()
+        with lock:
+            job["status"] = "error"
+            job["error"] = str(exc)
+
+
+@st.fragment(run_every=1)
+def _render_run_progress() -> None:
+    """Poll the async job and render live progress / finalize it.
+
+    While a Run is pending upload (video not on the server yet) the
+    bar shows the upload wait; while the pipeline runs it shows the
+    measured percentage + elapsed + estimated remaining. On
+    completion (script thread): auto-delete the uploaded input +
+    run intermediates (keep final video + SRT for download), store
+    the result, clear the job, and full-rerun to show it.
+    """
+    job = st.session_state.get("run_job")
+    pending = st.session_state.get("pending_job")
+    if job is None and pending is not None and pending.get("needs_upload"):
+        elapsed = max(0.0, time.time() - float(pending.get("clicked_at", time.time())))
+        st.progress(0.0,
+                    text=f"ဗီဒီယို တင်နေသည်… — 0% | {elapsed:.0f}s ကြာပြီး")
+        st.caption("ဗီဒီယို server ကို တင်နေသည်… Run နှိပ်ပြီးမှ တင်တာပါ။")
+        return
+    if not job:
+        return
+    with job["lock"]:
+        status = job["status"]
+        pct = float(job.get("pct", 0.0))
+        phase = job.get("phase", "analyze")
+        detail = job.get("detail", "")
+        started = float(job.get("started_at", time.time()))
+        result = job.get("result")
+        error = job.get("error")
+    if status == "running":
+        elapsed = max(0.0, time.time() - started)
+        # ETA: linear projection from the measured fraction; only
+        # shown once there is real progress (pct >= 10) — before
+        # that it would be a guess, not a measurement.
+        eta = ""
+        if pct >= 10.0:
+            remain = elapsed * (100.0 - pct) / pct
+            eta = f" | ခန့်မှန်း ကျန်ချိန် ~{remain:.0f}s"
+        label = _RUN_PHASE_LABELS.get(phase, detail or phase)
+        st.progress(min(1.0, pct / 100.0),
+                    text=f"{label} — {pct:.0f}% | {elapsed:.0f}s ကြာပြီး{eta}")
+        st.caption(detail or "")
+        return
+    if status == "done" and result is not None:
+        _sync_note = str(result["sync_method"])
+        if result.get("video_speed_factor") is not None:
+            _sync_note += f" ({result['video_speed_factor']})"
+        st.session_state["recap_result"] = {
+            "status": (
+                f"✓ ပြီးဆုံးပါပြီ! | {result['aspect_ratio']} | "
+                f"စာတန်း: {result['subtitle_mode']} | "
+                f"sync: {_sync_note}"
+            ),
+            "video_path": result["final_video_path"],
+            "srt_path": result["srt_path"],
+            "title": result["title"],
+            "script_text": result["script_text"],
+        }
+        _cleanup_run_workdir(
+            job["snapshot"]["run_dir"],
+            [result["final_video_path"], result["srt_path"]])
+        # Auto-delete the uploaded input (the result no longer needs
+        # it; a re-Run re-uploads from the canvas if asked).
+        if job["snapshot"].get("src_local_picked_at_start"):
+            _delete_quietly(job["snapshot"].get("input_path"))
+            if st.session_state.get("src_path") == job["snapshot"].get(
+                    "input_path"):
+                st.session_state["src_path"] = None
+                st.session_state["src_local_picked"] = False
+                st.session_state["src_video_id"] = None
+        st.session_state["run_job"] = None
+        # Full-app rerun: a fragment-scoped rerun would NOT re-execute
+        # the main script, so the result below would never render.
+        st.rerun(scope="app")
+    if status == "error":
+        # Persist the error in session state and let the MAIN script
+        # render it: rendering it here + a fragment-scoped rerun would
+        # flash it for <1s and then wipe it (the fragment would
+        # re-execute with run_job=None and render nothing).
+        st.session_state["run_error"] = error or "အမည်မသိ အမှား"
+        st.session_state["run_job"] = None
+        st.rerun(scope="app")
+
+
 # Source precedence matches the canvas display: picked file > demo > URL.
 _canvas_video_id = None
 _canvas_data_url = None
@@ -499,6 +716,9 @@ _val = interactive_canvas(
     ),
     preview=_preview,
     subtitle_style=_subtitle_style,
+    # Deferred upload: a fresh nonce when a Run click needs the
+    # picked video (None = no upload requested).
+    upload_request=st.session_state.get("upload_nonce"),
     key="mmr_canvas",
 )
 if isinstance(_val, dict):
@@ -520,10 +740,14 @@ if isinstance(_val, dict):
     _fresh_action = _action is not None
     if _action == "remove_video":
         # Canvas ✕: drop the current video and reset the canvas.
-        st.session_state["src_path"] = None
+        # The picked upload + any previous result are superseded.
+        _delete_input_file()
+        _delete_result_files()
         st.session_state["src_url"] = None
-        st.session_state["src_video_id"] = None
-        st.session_state["src_local_picked"] = False
+        st.session_state["pending_video_id"] = None
+        st.session_state["pending_video_name"] = None
+        st.session_state["pending_job"] = None
+        st.session_state["upload_nonce"] = None
         st.session_state["canvas_aspect"] = "9 / 16"
         st.session_state["demo_suppressed"] = True
         _reset_canvas_state()
@@ -533,6 +757,25 @@ if isinstance(_val, dict):
         # (see bottom) so a Run click coalesced with this action is
         # not swallowed by an early st.rerun().
         st.session_state["_canvas_rerun_needed"] = True
+    elif _action == "video_picked":
+        # A file picked inside the canvas: it stays LOCAL in the
+        # browser (deferred upload — no video_data is sent yet).
+        # Python only records that a local video is waiting; the
+        # payload is requested when the user clicks Run.
+        _vid = _val.get("video_id")
+        if _vid and _vid != st.session_state.get("pending_video_id"):
+            # A NEW local video supersedes any previous upload /
+            # result / pending run.
+            _delete_input_file()
+            _delete_result_files()
+            st.session_state["src_url"] = None
+            st.session_state["pending_video_id"] = _vid
+            st.session_state["pending_video_name"] = (
+                _val.get("video_name") or "video")
+            st.session_state["pending_job"] = None
+            st.session_state["upload_nonce"] = None
+            _reset_canvas_state()
+            st.session_state["_canvas_rerun_needed"] = True
     elif _action == "video_selected":
         # A file picked inside the canvas: save it, ffprobe its ratio.
         try:
@@ -567,24 +810,35 @@ if isinstance(_val, dict):
                     )
             except Exception:  # noqa: BLE001 - aspect stays at the default
                 pass
-            _reset_canvas_state()
+            # NOTE: no _reset_canvas_state() here — the upload landing
+            # is NOT a new video (the user may already have edited
+            # blur/subtitle after picking). The reset for a new video
+            # happens in the video_picked handler.
         except Exception:  # noqa: BLE001 - bad payload: keep previous state
             st.error("✕ ဗီဒီယိုဖိုင် ဖတ်လို့ မရပါ။ ထပ်ကြိုးစားပေးပါ")
         st.session_state["_canvas_rerun_needed"] = True
     elif _action == "video_url":
         _u = (_val.get("video_url") or "").strip()
         if _u:
+            # A URL supersedes any picked upload / previous result.
+            _delete_input_file()
+            _delete_result_files()
             st.session_state["src_url"] = _u
-            st.session_state["src_path"] = None
-            st.session_state["src_video_id"] = None
-            st.session_state["src_local_picked"] = False
+            st.session_state["pending_video_id"] = None
+            st.session_state["pending_video_name"] = None
+            st.session_state["pending_job"] = None
+            st.session_state["upload_nonce"] = None
             st.session_state["canvas_aspect"] = "9 / 16"
             _reset_canvas_state()
         st.session_state["_canvas_rerun_needed"] = True
     elif _action == "video_meta":
-        # URL video's real dimensions -> canvas follows its ratio.
+        # URL video's real dimensions — or a locally-picked video's
+        # (deferred upload: local files are no longer ffprobed at
+        # pick, so the canvas reports the ratio via loadedmetadata).
         if (
-            _val.get("video_id") == st.session_state.get("canvas_vid")
+            (_val.get("video_id") == st.session_state.get("canvas_vid")
+             or _val.get("video_id")
+             == st.session_state.get("pending_video_id"))
             and _val.get("video_w")
             and _val.get("video_h")
         ):
@@ -660,6 +914,8 @@ def _stepper_slider(label: str, key: str, lo: float, hi: float,
 
 with tab_src:
     # Current video source (picked inside the canvas, or demo / URL).
+    # A picked-but-not-yet-uploaded video (deferred upload) has no
+    # src_path/src_url yet — show its pending name, not "—".
     _src_name = "—"
     if st.session_state.get("src_path"):
         _src_name = os.path.basename(st.session_state["src_path"])
@@ -667,6 +923,11 @@ with tab_src:
         _src_name = st.session_state["src_url"]
     elif demo_active:
         _src_name = "Demo ဗီဒီယို (sample_test.mp4)"
+    elif st.session_state.get("pending_video_id"):
+        _src_name = (
+            f"{st.session_state.get('pending_video_name') or 'ဗီဒီယို'}"
+            " (ဖုန်းထဲမှာ — Run နှိပ်ရင် တင်မည်)"
+        )
     st.caption(f" လက်ရှိ ဗီဒီယို: {_src_name}")
     demo_mode = st.checkbox(
         " API Key မပါဘဲ Demo စမ်းသပ်မည် (Mock Mode)",
@@ -896,9 +1157,33 @@ with tab_adv:
         )
         st.session_state["forget_just_clicked"] = False
 
+# A locally-picked video waits on the phone until Run is clicked
+# (deferred upload) — say so, so the user knows nothing has been
+# sent yet. Hidden once a result exists / a run is pending / active.
+if (
+    st.session_state.get("pending_video_id")
+    and not st.session_state.get("src_path")
+    and not st.session_state.get("run_job")
+    and not st.session_state.get("pending_job")
+    and not st.session_state.get("recap_result")
+):
+    st.caption("ဗီဒီယို ရွေးပြီး — Run နှိပ်ရင် server ကို တင်မည်")
+
 run_btn = st.button(" Recap ဗီဒီယို ထုတ်လုပ်မည်", type="primary")
 
-if run_btn:
+# A Run already in progress (or just finished, not yet finalized by
+# the fragment) blocks a new Run — the fragment clears the job
+# within ~1s, then Run works again.
+_run_blocked = bool(
+    (st.session_state.get("run_job") or {}).get("status")
+    in ("running", "done", "error")
+)
+if run_btn and _run_blocked:
+    st.info(" ထုတ်လုပ်နေဆဲပါ — ခဏစောင့်ပေးပါ")
+
+if run_btn and not _run_blocked:
+    # A new Run supersedes any previous run's error.
+    st.session_state["run_error"] = None
     # Fall back to the browser-saved key if session_state lost it
     # (e.g. a session reset) but the browser still has it. A key the
     # user just deleted (Forget) is never used, even if a stale cached
@@ -913,23 +1198,29 @@ if run_btn:
         st.stop()
 
     # Source precedence matches the canvas display: picked file > demo > URL.
+    # A picked file may still be LOCAL (deferred upload) — then the
+    # Run only queues the job and requests the upload; the starter
+    # below launches the pipeline once the video lands.
     src_path = st.session_state.get("src_path") or None
     src_url = (st.session_state.get("src_url") or "").strip() or None
+    _has_pending_video = bool(st.session_state.get("pending_video_id"))
     if src_path:
         src_url = None
     elif demo_active and not src_url:
-        if os.path.isfile(DEMO_SAMPLE):
-            src_path = DEMO_SAMPLE
-        else:
+        if not os.path.isfile(DEMO_SAMPLE):
             st.error("✕ Demo video မရှိပါ")
             st.stop()
-    if not src_path and not src_url:
+    elif not src_url and not _has_pending_video:
         st.error("✕ Canvas ထဲမှာ ဗီဒီယို ရွေးပေးပါ သို့မဟုတ် Video URL ထည့်ပေးပါ")
         st.stop()
 
-    # Per-run isolated working directory (multi-user safety).
-    session_dir = tempfile.mkdtemp(prefix="recap_session_")
-
+    # Snapshot ALL settings at click time — the worker runs async,
+    # so later widget changes must not leak into this run.
+    _prev_pending = st.session_state.get("pending_job") or {}
+    _run_dir = (
+        (_prev_pending.get("snapshot") or {}).get("run_dir")
+        or tempfile.mkdtemp(prefix="recap_session_")
+    )
     # Streamlit Cloud has no egress proxy; the env lookup is harmless there
     # and keeps local/dev parity with app.py.
     tts_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
@@ -956,73 +1247,108 @@ if run_btn:
     }
     _blur_boxes = st.session_state.get("canvas_blur") or None
 
+    _snap = {
+        "key": key,
+        "demo_active": bool(demo_active),
+        "src_url": src_url,
+        "voice_name": _parse_voice(voice_choice),
+        # Step 16: all Source-tab settings flow into the Step 15
+        # backend exactly as chosen (aspect is now the Source
+        # tab's 5-way pill selector, not the old Advanced radio).
+        "processing_mode": str(
+            st.session_state.get("processing_mode", "ai_recap")),
+        "aspect_ratio": str(
+            st.session_state.get("aspect_ratio", "9:16")),
+        "fit_mode": str(st.session_state.get("fit_mode", "crop")),
+        "crop_align": str(
+            st.session_state.get("crop_align", "center")),
+        "inner_scale": float(
+            st.session_state.get("inner_scale", 1.22)),
+        "vertical_pos": float(
+            st.session_state.get("vertical_pos", 0.0)),
+        "horizontal_pos": float(
+            st.session_state.get("horizontal_pos", 0.0)),
+        "mirror_horizontal": bool(
+            st.session_state.get("mirror_horizontal", False)),
+        "copyright_zoom": float(
+            st.session_state.get("copyright_zoom", 1.07)),
+        "random_crop_offset": bool(
+            st.session_state.get("random_crop_offset", False)),
+        "bg_volume": float(bg_volume),
+        "burn_subtitles": bool(burn_subtitles),
+        "tts_proxy": tts_proxy,
+        "model": _parse_model(model_choice),
+        "blur_boxes": _blur_boxes,
+        "subtitle_config": _subtitle_config,
+        "run_dir": _run_dir,
+        # src_path is resolved at worker start (the upload may land
+        # in a later rerun than the click).
+        "src_path": None,
+    }
+    _needs_upload = bool(_has_pending_video and not src_path)
+    st.session_state["pending_job"] = {
+        "snapshot": _snap,
+        "needs_upload": _needs_upload,
+        "clicked_at": time.time(),
+    }
+    if _needs_upload:
+        # Fresh nonce -> the canvas sends the stored video_data once.
+        st.session_state["upload_nonce"] = (
+            int(st.session_state.get("upload_nonce") or 0) + 1)
+        # The canvas call already ran with the old nonce this rerun,
+        # so ask for one more rerun to pass the fresh nonce to it.
+        st.session_state["_rerun_needed"] = True
     # A new Run invalidates the previous result immediately, so a failed
-    # run never shows a stale result.
-    st.session_state["recap_result"] = None
-    try:
-        with st.spinner(" Recap ဗီဒီယို ထုတ်လုပ်နေပါတယ်… ခဏစောင့်ပေးပါ"):
-            result = run_full_recap_pipeline(
-                video_path=src_path,
-                video_url=src_url,
-                user_api_key=key or None,
-                # Recap length slider removed (user order): AI Recap +
-                # Pro AI Recap both fully work, so the length is fixed
-                # at 30s (AI Recap narration target; Pro ignores it —
-                # it uses the full video).
-                target_duration=30,
-                voice_name=_parse_voice(voice_choice),
-                # Step 16: all Source-tab settings flow into the Step 15
-                # backend exactly as chosen (aspect is now the Source
-                # tab's 5-way pill selector, not the old Advanced radio).
-                processing_mode=str(
-                    st.session_state.get("processing_mode", "ai_recap")),
-                aspect_ratio=str(
-                    st.session_state.get("aspect_ratio", "9:16")),
-                fit_mode=str(st.session_state.get("fit_mode", "crop")),
-                crop_align=str(
-                    st.session_state.get("crop_align", "center")),
-                inner_scale=float(
-                    st.session_state.get("inner_scale", 1.22)),
-                vertical_pos=float(
-                    st.session_state.get("vertical_pos", 0.0)),
-                horizontal_pos=float(
-                    st.session_state.get("horizontal_pos", 0.0)),
-                mirror_horizontal=bool(
-                    st.session_state.get("mirror_horizontal", False)),
-                copyright_zoom=float(
-                    st.session_state.get("copyright_zoom", 1.07)),
-                random_crop_offset=bool(
-                    st.session_state.get("random_crop_offset", False)),
-                bg_volume=float(bg_volume),
-                burn_subtitles=bool(burn_subtitles),
-                work_dir=session_dir,
-                output_dir=session_dir,
-                output_name="recap.mp4",
-                use_mock_plan=bool(demo_active),
-                tts_proxy=tts_proxy,
-                model=_parse_model(model_choice),
-                blur_boxes=_blur_boxes,
-                subtitle_config=_subtitle_config,
-            )
-        # Pro runs have no single video_speed_factor (per-block speeds)
-        # — don't show "(None)".
-        _sync_note = str(result["sync_method"])
-        if result.get("video_speed_factor") is not None:
-            _sync_note += f" ({result['video_speed_factor']})"
-        st.session_state["recap_result"] = {
-            "status": (
-                f"✓ ပြီးဆုံးပါပြီ! | {result['aspect_ratio']} | "
-                f"စာတန်း: {result['subtitle_mode']} | "
-                f"sync: {_sync_note}"
-            ),
-            "video_path": result["final_video_path"],
-            "srt_path": result["srt_path"],
-            "title": result["title"],
-            "script_text": result["script_text"],
+    # run never shows a stale result — and its files are deleted (they
+    # are superseded; the new run's outputs replace them).
+    _delete_result_files()
+
+# Starter: launch a pending Run once its source is ready. For a
+# deferred upload the video arrives in a later rerun than the Run
+# click (the canvas sends it when it sees the upload nonce); for an
+# already-uploaded / URL / demo source it starts in the same rerun.
+_pending = st.session_state.get("pending_job")
+if _pending and not st.session_state.get("run_job"):
+    _src = st.session_state.get("src_path")
+    _url = (st.session_state.get("src_url") or "").strip() or None
+    _demo = bool((_pending.get("snapshot") or {}).get("demo_active"))
+    if _src or _url or _demo:
+        _snap = dict(_pending["snapshot"])
+        _snap["src_path"] = (
+            _src if _src else (DEMO_SAMPLE if _demo else None))
+        _snap["src_url"] = _url if not _src else None
+        _snap["input_path"] = _src
+        _snap["src_local_picked_at_start"] = bool(
+            st.session_state.get("src_local_picked"))
+        job = {
+            "lock": threading.Lock(),
+            "status": "running",
+            "phase": "analyze",
+            "pct": 0.0,
+            "detail": "AI က ဗီဒီယို စိစစ်နေသည်…",
+            "started_at": time.time(),
+            "result": None,
+            "error": None,
+            "snapshot": _snap,
         }
-    except Exception as exc:  # noqa: BLE001 - surfaced to the user in Myanmar UI
-        traceback.print_exc()
-        st.error(f"✕ အမှား: {exc}")
+        st.session_state["run_job"] = job
+        st.session_state["pending_job"] = None
+        threading.Thread(
+            target=_run_pipeline_job, args=(job,), daemon=True).start()
+    elif not st.session_state.get("pending_video_id"):
+        # No source and no local video waiting to upload: the video
+        # vanished (e.g. removed) — drop the pending run.
+        st.session_state["pending_job"] = None
+        st.error("✕ ဗီဒီယို မရှိတော့ပါ။ Canvas ထဲမှာ ဗီဒီယို ပြန်ရွေးပေးပါ")
+
+# Live progress (upload wait / pipeline % + elapsed + ETA) and
+# completion finalizing (auto-delete + result + rerun).
+_render_run_progress()
+
+# A failed run's error persists (rendered by the main script) until
+# the next Run — the fragment stores it, it does not render it.
+if st.session_state.get("run_error"):
+    st.error(f"✕ အမှား: {st.session_state['run_error']}")
 
 # Render the last successful result on EVERY run — not only the run in
 # which Run was clicked — so a download click or any other rerun does
@@ -1065,4 +1391,9 @@ elif _saved:
 # immediately) is not swallowed by an early st.rerun(). When Run did
 # run, skip the refresh: the recap result must stay on screen.
 if st.session_state.pop("_canvas_rerun_needed", False) and not run_btn:
+    st.rerun()
+# A Run click that needs an upload asked for one more rerun so the
+# canvas call above re-renders with the fresh upload nonce (the
+# canvas call already ran with the old nonce this rerun).
+if st.session_state.pop("_rerun_needed", False):
     st.rerun()

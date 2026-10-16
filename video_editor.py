@@ -19,7 +19,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from video_processor import get_video_metadata
 
@@ -48,6 +48,63 @@ def _run(cmd: List[str], step: str) -> None:
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
     if proc.returncode != 0:
         raise VideoEditorError(f"{step} failed: {proc.stderr.strip()[-500:]}")
+
+
+def _run_ffmpeg_progress(cmd: List[str], step: str, total_s: float,
+                          on_progress: Optional[Callable[[float], None]]
+                          ) -> None:
+    """Run an ffmpeg command, reporting 0..1 progress via -progress.
+
+    ``total_s`` is the expected output duration (seconds); progress is
+    out_time_ms / total. ``on_progress`` is called only when the
+    fraction advances by >= 0.01 (or at completion), so callers are
+    not flooded. stderr goes to a temp file (never a pipe) so a big
+    error dump cannot deadlock the stdout reader. Raises
+    VideoEditorError with the tail of stderr on failure, like _run.
+    """
+    if on_progress is None:
+        _run(cmd, step)
+        return
+    cmd = list(cmd)
+    # -progress must come before the output file; insert it right
+    # after the leading "ffmpeg" token.
+    if cmd and cmd[0] == "ffmpeg":
+        cmd[1:1] = ["-progress", "pipe:1", "-nostats"]
+    else:
+        cmd = ["ffmpeg", "-progress", "pipe:1", "-nostats"] + cmd
+    total_us = max(1.0, float(total_s)) * 1_000_000.0
+    last = -1.0
+    err_fd, err_path = tempfile.mkstemp(prefix="mmr_ffmpeg_err_")
+    os.close(err_fd)
+    try:
+        with open(err_path, "w") as err_f:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=err_f, text=True)
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.strip()
+                if line.startswith("out_time_ms="):
+                    try:
+                        frac = int(line.split("=", 1)[1]) / total_us
+                    except ValueError:
+                        continue
+                    frac = min(1.0, max(0.0, frac))
+                    if frac - last >= 0.01:
+                        last = frac
+                        on_progress(frac)
+            rc = proc.wait(timeout=3600)
+        if rc != 0:
+            with open(err_path, "r", errors="replace") as ef:
+                tail = ef.read().strip()[-500:]
+            raise VideoEditorError(f"{step} failed: {tail}")
+        if last < 1.0:
+            on_progress(1.0)
+    finally:
+        if err_path:
+            try:
+                os.remove(err_path)
+            except OSError:
+                pass
 
 
 def find_myanmar_font() -> Optional[Dict[str, str]]:
@@ -357,7 +414,12 @@ def get_subtitle_font(display_name: str):
 
 
 def _atempo_chain(factor: float) -> str:
-    """Build an atempo filter chain valid for any positive factor."""
+    """Build an atempo filter chain valid for any positive factor.
+
+    A single atempo only accepts 0.5–100.0, so chain 0.5x steps below
+    0.5 and 100x steps above 100 (e.g. 0.2 -> "atempo=0.5,atempo=0.4";
+    250 -> "atempo=100,atempo=2.5").
+    """
     if factor <= 0:
         raise VideoEditorError(f"Invalid speed factor: {factor}")
     parts: List[str] = []
@@ -365,6 +427,9 @@ def _atempo_chain(factor: float) -> str:
     while f < 0.5:
         parts.append("atempo=0.5")
         f /= 0.5
+    while f > 100.0:
+        parts.append("atempo=100")
+        f /= 100.0
     parts.append(f"atempo={f:.4f}")
     return ",".join(parts)
 
@@ -717,9 +782,15 @@ def _srt_timestamp(sec: float) -> str:
     m = int((sec % 3600) // 60)
     s = int(sec % 60)
     ms = int(round((sec - int(sec)) * 1000))
-    if ms == 1000:  # rounding carry
-        s += 1
+    if ms == 1000:  # rounding carry — cascade through s, m, h
         ms = 0
+        s += 1
+        if s == 60:
+            s = 0
+            m += 1
+            if m == 60:
+                m = 0
+                h += 1
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
@@ -817,6 +888,10 @@ def render_recap_video(
     mirror_horizontal: bool = False,
     copyright_zoom: float = 1.0,
     random_crop_offset: bool = False,
+    # Progress callback for the render phase: called with a 0..1
+    # fraction measured from ffmpeg's own -progress output
+    # (out_time_ms / voiceover duration — the audio is master).
+    on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict:
     """Render the final recap video. Returns a result dict.
 
@@ -962,7 +1037,12 @@ def render_recap_video(
             cmd += ["-map", "2:s", "-c:s", "mov_text"]
         cmd.append(output_path)
 
-        _run(cmd, "final render")
+        # Render progress comes from ffmpeg itself (out_time_ms /
+        # voiceover duration — the audio is master, -shortest cuts
+        # the output there).
+        _run_ffmpeg_progress(
+            cmd, "final render", _media_duration(voiceover_path),
+            on_progress)
         if soft_srt_out:
             shutil.copy2(srt_path, soft_srt_out)
 
@@ -1010,6 +1090,10 @@ def render_pro_recap_video(
     blur_boxes: Optional[List[Dict]] = None,
     subtitle_config: Optional[Dict] = None,
     srt_path: Optional[str] = None,
+    # Progress callback for the render phase (0..1): per-block sync
+    # fills 0–0.40 (equal share per block), the final visual chain
+    # fills 0.40–1.0 — both measured from ffmpeg's -progress output.
+    on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict:
     """Render a Pro AI Recap video (dialogue video, Step 15).
 
@@ -1136,7 +1220,13 @@ def render_pro_recap_video(
             else:
                 fc = (f"[0:v]setpts=PTS/{speed:.4f}[v];"
                       f"[1:a]{tts_fit},aresample=44100[a]")
-            _run(
+            _n_blocks = len(blocks)
+
+            def _block_cb(frac, _i=i, _n=_n_blocks):
+                if on_progress is not None:
+                    on_progress(0.40 * (_i + frac) / max(1, _n))
+
+            _run_ffmpeg_progress(
                 ["ffmpeg", "-y", "-v", "error",
                  "-i", seg, "-i", b["audio_path"],
                  "-filter_complex", fc,
@@ -1145,6 +1235,8 @@ def render_pro_recap_video(
                  "-pix_fmt", "yuv420p", "-r", "30",
                  "-c:a", "aac", "-b:a", "128k", out],
                 f"pro block {i} sync",
+                video_dur,
+                _block_cb if on_progress is not None else None,
             )
             block_outs.append(out)
             synced.append({
@@ -1205,7 +1297,10 @@ def render_pro_recap_video(
                 "-c:a", "copy",
                 "-movflags", "+faststart"]
         cmd.append(output_path)
-        _run(cmd, "pro final render")
+        _run_ffmpeg_progress(
+            cmd, "pro final render", cum,
+            (lambda f: on_progress(0.40 + 0.60 * f))
+            if on_progress is not None else None)
 
         meta = get_video_metadata(output_path)
         return {

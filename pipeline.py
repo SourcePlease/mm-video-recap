@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from video_processor import get_video_metadata, prepare_video_source
 from ai_analyzer import (
@@ -73,6 +73,14 @@ def run_full_recap_pipeline(
     mirror_horizontal: bool = False,
     copyright_zoom: float = 1.0,
     random_crop_offset: bool = False,
+    # Progress callback: on_progress(pct, phase, detail) with pct in
+    # [0, 100]. Phase weights — analyze 0–30, TTS 30–55, render
+    # 55–100. Analyze / single-voiceover TTS are single calls with no
+    # sub-progress, so they report phase start/end only (the bar
+    # holds at the phase start while they run — that is honest, not
+    # a faked creeping bar). Pro TTS and both renders report real
+    # measured sub-progress (per-block completion, ffmpeg -progress).
+    on_progress: Optional[Callable[[float, str, str], None]] = None,
 ) -> Dict:
     """Run the full recap pipeline end to end.
 
@@ -100,12 +108,27 @@ def run_full_recap_pipeline(
         output_dir = work_dir
     os.makedirs(output_dir, exist_ok=True)
 
+    # Progress reporting: phase weights as (base, span) — analyze
+    # 0–30, TTS 30–55, render 55–100. Single calls (Gemini analyze,
+    # one-shot TTS) report only phase start/end — no faked creep.
+    _PHASES = {"analyze": (0.0, 30.0), "tts": (30.0, 25.0),
+               "render": (55.0, 45.0)}
+
+    def _report(phase: str, frac: float, detail: str) -> None:
+        if on_progress is None:
+            return
+        base, span = _PHASES[phase]
+        pct = base + span * min(1.0, max(0.0, frac))
+        on_progress(round(pct, 1), phase, detail)
+
     # 1) ingest
+    _report("analyze", 0.0, "ဗီဒီယို ရယူနေသည်…")
     local_path, metadata = prepare_video_source(
         uploaded_file_path=video_path, video_url=video_url, work_dir=work_dir
     )
 
     # 2) recap plan (live AI or mock / prebuilt) — mode-aware
+    _report("analyze", 0.0, "AI က ဗီဒီယို စိစစ်နေသည်…")
     if plan is None:
         if processing_mode == "pro_ai_recap":
             if use_mock_plan:
@@ -122,6 +145,7 @@ def run_full_recap_pipeline(
                     target_duration=target_duration, style=style,
                     model=model,
                 )
+    _report("analyze", 1.0, "AI စိစစ်မှု ပြီးပါပြီ")
     title = plan.get("title", "")
 
     if processing_mode == "pro_ai_recap":
@@ -131,7 +155,9 @@ def run_full_recap_pipeline(
             raise PipelineError("Pro blocks သည် အလွတ်ဖြစ်နေပါသည်။")
         blocks = generate_block_voiceovers(
             blocks, os.path.join(work_dir, "block_audio"),
-            voice_name=voice_name, rate=rate, proxy=tts_proxy)
+            voice_name=voice_name, rate=rate, proxy=tts_proxy,
+            on_progress=lambda f: _report(
+                "tts", f, "မြန်မာအသံ ထုတ်နေသည်…"))
         script_text = plan.get("burmese_script", "") or " ".join(
             str(b.get("text", "")) for b in blocks).strip()
         sync = None
@@ -141,6 +167,7 @@ def run_full_recap_pipeline(
         final_path = os.path.join(output_dir, output_name)
         scfg = dict(subtitle_config or {})
         scfg["enabled"] = bool(burn_subtitles)
+        _report("render", 0.0, "ဗီဒီယို ပေါင်းနေသည်…")
         render = render_pro_recap_video(
             local_path, blocks,
             output_path=final_path,
@@ -158,7 +185,10 @@ def run_full_recap_pipeline(
             blur_boxes=blur_boxes,
             subtitle_config=scfg,
             srt_path=os.path.join(output_dir, "subtitles.srt"),
+            on_progress=lambda f: _report(
+                "render", f, "ဗီဒီယို ပေါင်းနေသည်…"),
         )
+        _report("render", 1.0, "ဗီဒီယို ပေါင်းတာ ပြီးပါပြီ")
         final_srt = render.get("srt_path")
         result = {
             "final_video_path": render["video_path"],
@@ -188,16 +218,19 @@ def run_full_recap_pipeline(
         if not script_text.strip():
             raise PipelineError("burmese_script သည် အလွတ်ဖြစ်နေပါသည်။")
 
-        # 3) voiceover + subtitles
+        # 3) voiceover + subtitles (single Edge-TTS call: no
+        # sub-progress — report phase start/end only).
         auto_assets = False
         if voiceover_path is None:
             auto_assets = True
             voiceover_path = os.path.join(output_dir, "voiceover.mp3")
             auto_srt = os.path.join(output_dir, "subtitles.srt")
+            _report("tts", 0.0, "မြန်မာအသံ ထုတ်နေသည်…")
             audio_duration = generate_burmese_voiceover(
                 script_text, voiceover_path, auto_srt,
                 voice_name=voice_name, rate=rate, proxy=tts_proxy,
             )
+            _report("tts", 1.0, "အသံ ထုတ်တာ ပြီးပါပြီ")
             srt_path = auto_srt
         else:
             if not os.path.isfile(voiceover_path):
@@ -215,6 +248,7 @@ def run_full_recap_pipeline(
 
         # 5) render
         final_path = os.path.join(output_dir, output_name)
+        _report("render", 0.0, "ဗီဒီယို ပေါင်းနေသည်…")
         render = render_recap_video(
             local_path,
             sync["highlights"],
@@ -235,7 +269,10 @@ def run_full_recap_pipeline(
             mirror_horizontal=mirror_horizontal,
             copyright_zoom=copyright_zoom,
             random_crop_offset=random_crop_offset,
+            on_progress=lambda f: _report(
+                "render", f, "ဗီဒီယို ပေါင်းနေသည်…"),
         )
+        _report("render", 1.0, "ဗီဒီယို ပေါင်းတာ ပြီးပါပြီ")
         final_srt = render.get("sidecar_srt") or srt_path
         result = {
             "final_video_path": render["video_path"],
