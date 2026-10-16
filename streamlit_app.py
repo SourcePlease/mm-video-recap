@@ -688,7 +688,12 @@ def _run_pipeline_job(job: Dict) -> None:
         })
 
 
-@st.fragment(run_every=1)
+# Phone-hang fix: poll every 3s, not every 1s. A 1s interval meant
+# ~360 fragment reruns over a 6-min Pro run — constant network +
+# CPU on the phone for a progress bar that only changes in bursts
+# anyway. 3s is still live (progress + elapsed tick every 3s) with
+# 3x less load.
+@st.fragment(run_every=3)
 def _render_run_progress() -> None:
     """Poll the async job and render live progress / finalize it.
 

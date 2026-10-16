@@ -588,6 +588,25 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   function previewArgs() {
     return (S.args && S.args.preview) || {};
   }
+  function syncBgVideo() {
+    /* Phone-hang fix: the bg video is only needed for Pad (blur bg).
+       In Crop mode (default) it is hidden, so keeping a second decoder
+       on the same ~40MB source doubles video memory / CPU on the
+       phone for nothing. Load it only in Pad mode, and free it
+       (remove src) when leaving Pad mode. Callers must call this
+       AFTER video.src is set (new video / pick / fit switch). */
+    var fit = (previewArgs().fit_mode || "crop");
+    if (fit === "pad") {
+      if (video.src && bgVideo.src !== video.src) {
+        bgVideo.src = video.src;
+        bgVideo.load();
+      }
+    } else if (bgVideo.src) {
+      bgVideo.pause();
+      bgVideo.removeAttribute("src");
+      bgVideo.load();
+    }
+  }
   function applyPreview() {
     var p = previewArgs();
     /* Phone shape: the OUTPUT aspect (Original = the source video's
@@ -621,6 +640,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       video.style.objectPosition = align === "top" ? "50% 0%"
         : align === "bottom" ? "50% 100%" : "50% 50%";
     }
+    /* Bg decoder only in Pad mode; freed in Crop mode (see syncBgVideo). */
+    syncBgVideo();
   }
   function layoutPad(p) {
     var r = phone.getBoundingClientRect();
@@ -650,9 +671,16 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   /* ---------------- player ---------------- */
   function wirePlayer() {
     btnPlay.addEventListener("click", function () {
-      /* Both videos follow the same play state (bg is muted). */
-      if (video.paused) { video.play(); bgVideo.play(); }
-      else { video.pause(); bgVideo.pause(); }
+      /* Both videos follow the same play state (bg is muted).
+         Bg has no src in Crop mode (phone-hang fix) — guard it so
+         play() on an empty video can't reject / error. */
+      if (video.paused) {
+        video.play();
+        if (bgVideo.src) bgVideo.play();
+      } else {
+        video.pause();
+        if (bgVideo.src) bgVideo.pause();
+      }
     });
     video.addEventListener("play", function () { btnPlay.textContent = "\u23F8"; });
     video.addEventListener("pause", function () { btnPlay.textContent = "\u25B6"; });
@@ -686,7 +714,9 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       var frac = clamp((clientX - r.left) / r.width, 0, 1);
       if (video.duration) {
         video.currentTime = frac * video.duration;
-        bgVideo.currentTime = frac * (bgVideo.duration || video.duration);
+        if (bgVideo.src) {
+          bgVideo.currentTime = frac * (bgVideo.duration || video.duration);
+        }
       }
     }
     prog.addEventListener("pointerdown", function (e) {
@@ -785,8 +815,10 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.hasVideo = true;
       video.src = dataUrl;
       video.load();
-      bgVideo.src = dataUrl;
-      bgVideo.load();
+      /* Phone-hang fix: do NOT load bgVideo here — syncBgVideo()
+         loads it only in Pad mode, and applyPreview() on the next
+         render keeps it in sync on fit switches. */
+      syncBgVideo();
       /* Deferred upload: the video stays LOCAL — no video_data is
          sent yet. Python learns about the pick from the lightweight
          video_picked action below, and requests the payload only
@@ -1197,8 +1229,10 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       if (S.args.video_data_url) {
         video.src = S.args.video_data_url;
         video.load();
-        bgVideo.src = S.args.video_data_url;
-        bgVideo.load();
+        /* Phone-hang fix: bgVideo only in Pad mode (see syncBgVideo).
+           applyPreview() at the top of this render ran before
+           video.src was set, so sync again now that it is set. */
+        syncBgVideo();
       } else {
         /* No data URL: the video is already loaded in this frame
            (picked locally), so keep it. */
