@@ -192,6 +192,13 @@ def _wait_for_active(client: genai.Client, file_name: str,
 
 
 def _build_prompt(target_duration: int, style: str) -> str:
+    # Narration word-count table matched to the target duration:
+    # Burmese TTS speaks ~2.2 words/sec, so the script must carry
+    # enough words to fill the full duration (the 17s-output bug was
+    # a too-short script cut to audio length).
+    _word_counts = {30: "60–75", 60: "130–160", 90: "200–240",
+                    180: "400–450"}
+    _word_count = _word_counts.get(target_duration, "130–160")
     return (
         "သင်သည် မြန်မာဗီဒီယို အကျဉ်းချုပ် (video recap) ကျွမ်းကျင်သူဖြစ်သည်။\n"
         "ပေးထားသော ဗီဒီယိုကို သေချာကြည့်ပြီး အောက်ပါအတိုင်း မြန်မာလို အကျဉ်းချုပ် "
@@ -200,6 +207,10 @@ def _build_prompt(target_duration: int, style: str) -> str:
         f"- ရွေးချယ်ရမည့် အဓိကအခန်းများ စုစုပေါင်း ကြာချိန်: ခန့်မှန်းခြေ {target_duration} စက္ကန့်\n"
         "- highlights တစ်ခုချင်းစီအတွက် start/end ကို စက္ကန့်ဖြင့် (ဒသမကိန်းရ) "
         "ပေးပါ။\n"
+        "- highlights များသည် ဗီဒီယို၏ အစ / အလယ် / အဆုံး သုံးပိုင်းလုံးကို "
+        "ဖုံးရမည်။ highlights အရေအတွက် ၆–၁၂ ခု ဖြစ်ရမည်။ highlights "
+        "တစ်ခုချင်းစီ၏ ကြာချိန်သည် စက္ကန့်အတိုင်း မှန်ရမည် (start နှင့် "
+        "end ကွာခြားချက်သည် ထိုအခန်း၏ တကယ့် ကြာချိန်နှင့် ကိုက်ရမည်)။\n"
         "- title သည် ဆွဲဆောင်မှုရှိသော မြန်မာ ခေါင်းစဉ်ဖြစ်ရမည်။\n"
         "- description များနှင့် burmese_script သည် သဘာဝကျပြီး နားထောင်ကောင်းသော "
         "မြန်မာစကားပြော ဖြစ်ရမည်။\n"
@@ -214,7 +225,9 @@ def _build_prompt(target_duration: int, style: str) -> str:
         "(Unicode Myanmar encoding) ဖြင့်သာ ရေးရမည်။ Zawgyi encoding လုံးဝ "
         "မသုံးပါနှင့်။\n"
         "- burmese_script သည် ရွေးထားသော highlights များကို ဆက်စပ်ပြီး ပြောပြသော "
-        f"ဇာတ်ကြောင်းပြော စာသား ဖြစ်ရမည် (ခန့်မှန်း {target_duration} စက္ကန့်စာ အသံထွက်)။\n\n"
+        f"ဇာတ်ကြောင်းပြော စာသား ဖြစ်ရမည် (ခန့်မှန်း {target_duration} စက္ကန့်စာ အသံထွက်)။\n"
+        f"burmese_script ၏ စကားလုံးအရေအတွက်သည် {_word_count} လုံး ဖြစ်ရမည် — "
+        "စာသား တိုလျှင် အသံက စောပြီး ပြီးသွားပြီး ဗီဒီယိုလည်း တိုသွားမည်။\n\n"
         "STRICT JSON ONLY ဖြင့် ပြန်ပေးပါ။ JSON မှလွဲ၍ အခြားစာသား မထည့်ပါနှင့်။\n"
         'ပုံစံ: {"title": "...", "highlights": '
         '[{"start": 0.0, "end": 5.0, "description": "..."}], '
