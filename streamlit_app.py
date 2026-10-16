@@ -28,6 +28,10 @@ from streamlit_js_eval import streamlit_js_eval
 
 from canvas_component import CANVAS_DEFAULT, interactive_canvas
 from pipeline import run_full_recap_pipeline
+
+# Build marker: bump on every push so a live page check can prove
+# which code the running app has.
+BUILD_VERSION = "2026-10-16 job-persist v2"
 from video_editor import (
     SUBTITLE_COLOR_RGB,
     SUBTITLE_FONTS,
@@ -768,6 +772,11 @@ def _render_run_progress() -> None:
                     if st.session_state.get("run_error") != _JOB_LOST_MSG:
                         st.session_state["run_error"] = _JOB_LOST_MSG
                         st.rerun(scope="app")
+                elif _fage <= _JOB_LOST_MIN_S:
+                    # The worker may not have written its status file
+                    # yet — say the job is remembered instead of
+                    # showing a silently idle page.
+                    st.caption("ထုတ်လုပ်မှု မှတ်ထားသည် — စတင်နေသည်…")
         return
     with job["lock"]:
         status = job["status"]
@@ -1609,3 +1618,8 @@ if st.session_state.pop("_canvas_rerun_needed", False) and not run_btn:
 # canvas call already ran with the old nonce this rerun).
 if st.session_state.pop("_rerun_needed", False):
     st.rerun()
+
+# Build marker: proves which code the running app has (a browser
+# check can read it; it also makes "is the fix live?" answerable
+# without guessing from the repo commit).
+st.caption(f"build {BUILD_VERSION}")
