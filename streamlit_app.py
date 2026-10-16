@@ -719,6 +719,9 @@ _val = interactive_canvas(
     # Deferred upload: a fresh nonce when a Run click needs the
     # picked video (None = no upload requested).
     upload_request=st.session_state.get("upload_nonce"),
+    # Pick re-announce: tell the canvas which pick Python knows, so
+    # it can re-announce a local pick lost to a session reset.
+    pending_ack=st.session_state.get("pending_video_id"),
     key="mmr_canvas",
 )
 if isinstance(_val, dict):

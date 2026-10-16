@@ -387,6 +387,12 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
        is not re-sent on every later rerun (phone-data burn). */
     videoDataPending: null,
     subsEnabled: true,
+    /* Pick re-announce: timestamp (ms) of the last video_picked
+       re-send. If Python lost the pick (session reset kept this
+       iframe but wiped Python state), onRender re-sends the
+       lightweight video_picked action — throttled, so a missed ack
+       can't spin reruns. */
+    lastPickAnnounce: 0,
   };
 
   function clamp(v, a, b) { return Math.min(b, Math.max(a, v)); }
@@ -1130,6 +1136,21 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
         video_name: S.localName || "video",
       });
     }
+    /* Pick re-announce: Python lost the pick (e.g. a session reset
+       kept this iframe but wiped Python state) — it no longer acks
+       our videoId, yet the video is still displayed. Re-send the
+       LIGHTWEIGHT video_picked action (no payload). Python's handler
+       no-ops when the id already matches, and the 2s throttle keeps
+       a missed ack from spinning reruns. Without this, Run errors
+       "select a video" while the video is still on screen. */
+    if (S.localPicked && S.videoId && !S.expectRemove
+        && S.args.pending_ack !== S.videoId
+        && Date.now() - S.lastPickAnnounce > 2000) {
+      S.lastPickAnnounce = Date.now();
+      sendValue("video_picked", {
+        video_id: S.videoId, video_name: S.localName || "video",
+      });
+    }
     if (!vid && S.localPicked && S.videoId && !S.expectRemove) {
       /* A locally-picked video is in flight (Python hasn't saved it
          yet): ignore this no-video render — don't wipe the video. */
@@ -1304,6 +1325,13 @@ def interactive_canvas(
     # the picked video. None = no upload requested; the frontend sends
     # the stored video_data exactly once per nonce.
     upload_request: Optional[int] = None,
+    # Pick re-announce: the pending_video_id Python currently knows
+    # (None = none). The frontend re-sends the lightweight
+    # video_picked action when it holds a local pick Python has lost
+    # (e.g. a session reset kept the iframe but wiped Python state) —
+    # without this, Run would error "select a video" while the video
+    # is still displayed in the canvas.
+    pending_ack: Optional[str] = None,
     key: Optional[str] = None,
 ) -> Dict:
     """Render the canvas and return the latest user-edited state.
@@ -1333,6 +1361,7 @@ def interactive_canvas(
         preview=preview or {},
         subtitle_style=subtitle_style or {},
         upload_request=upload_request,
+        pending_ack=pending_ack,
         default=CANVAS_DEFAULT,
         key=key,
     )
