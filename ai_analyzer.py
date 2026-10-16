@@ -108,6 +108,37 @@ PRO_BLOCKS_JSON_SCHEMA: Dict[str, Any] = {
     "required": ["title", "blocks"],
 }
 
+# Strict JSON schema for an AI narration CONTINUATION (Fix 1): only the
+# burmese_script for the uncovered tail [from_time, video_duration].
+CONTINUATION_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "burmese_script": {"type": "string"},
+    },
+    "required": ["burmese_script"],
+}
+
+# Strict JSON schema for the Pro FILL call (Fix 2): Myanmar narration
+# text for the specific windows whose blocks came back empty.
+PRO_FILL_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "blocks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "number"},
+                    "end": {"type": "number"},
+                    "text": {"type": "string"},
+                },
+                "required": ["start", "end", "text"],
+            },
+        },
+    },
+    "required": ["blocks"],
+}
+
 
 class AnalyzerError(Exception):
     """Analyzer failure carrying a user-facing Myanmar message."""
@@ -250,6 +281,65 @@ def _build_prompt(video_duration: float, style: str) -> str:
     )
 
 
+def _build_continuation_prompt(from_time: float, video_duration: float,
+                              style: str) -> str:
+    """Prompt for an AI narration CONTINUATION (Fix 1).
+
+    The first narration only covered up to ``from_time``; this asks
+    Gemini to narrate ONLY what happens in [from_time, video_duration]
+    — no repetition of the earlier part — so the pipeline can append
+    it and fill the video to the end. Word count scales with the tail
+    length at the same ~2.2 words/sec speaking rate.
+    """
+    tail = max(0.0, float(video_duration) - float(from_time))
+    _words = int(tail * 2.2)
+    _lo = int(_words * 0.9)
+    _hi = int(_words * 1.1)
+    return (
+        "သင်သည် မြန်မာဗီဒီယို ဇာတ်ကြောင်းပြော (narration) ကျွမ်းကျင်သူဖြစ်သည်။\n"
+        "ပေးထားသော ဗီဒီယို၏ အစောပိုင်းကို ဇာတ်ကြောင်းပြောပြီးပါပြီ။ "
+        f"အခု {from_time:.0f} စက္ကန့်မှ ဗီဒီယို၏ အဆုံး ({video_duration:.0f} စက္ကန့်) "
+        "အထိ ဖြစ်ပျက်သည်များကိုသာ ဆက်လက် ဇာတ်ကြောင်းပြောပေးပါ။\n\n"
+        f"- ဤအပိုင်း၏ ကြာချိန်သည် {tail:.0f} စက္ကန့် ဖြစ်သည်။ "
+        f"burmese_script ၏ စကားလုံးအရေအတွက်သည် {_lo}–{_hi} လုံး ဖြစ်ရမည် "
+        "(အစောပိုင်းကို ထပ်မပြောရ၊ အဆုံးထိ ရောက်အောင် ပြောရမည်)။\n"
+        "- ဇာတ်ကြောင်းပြောသည် သဘာဝကျပြီး နားထောင်ကောင်းသော မြန်မာစကားပြော "
+        "ဖြစ်ရမည်။ မြန်မာစာလုံးပေါင်း အတိအကျ မှန်ရမည်။\n"
+        "- burmese_script သည် Unicode မြန်မာစာဖြင့်သာ ရေးရမည်။ "
+        "Zawgyi encoding လုံးဝ မသုံးပါနှင့်။\n\n"
+        "STRICT JSON ONLY ဖြင့် ပြန်ပေးပါ။ JSON မှလွဲ၍ အခြားစာသား မထည့်ပါနှင့်။\n"
+        "'{\"burmese_script\": \"...\"}'"
+    )
+
+
+def _build_pro_fill_prompt(windows) -> str:
+    """Prompt for the Pro FILL call (Fix 2): narration for empty blocks.
+
+    ``windows`` is a list of (start, end) pairs whose blocks came back
+    with empty text. Gemini must return non-empty Myanmar narration
+    for EACH window — dubbing of what is said, or a brief narration of
+    the action when nobody speaks — so Myanmar speech never drops out.
+    """
+    _list = ", ".join(f"[{s:.1f}–{e:.1f}s]" for s, e in windows)
+    return (
+        "သင်သည် မြန်မာ Dialogue ဗီဒီယို ပြန်ဆိုသူ (dubbing) ကျွမ်းကျင်သူဖြစ်သည်။\n"
+        "ပေးထားသော ဗီဒီယိုတွင် အောက်ပါ အချိန်အပိုင်းများ၏ မြန်မာစာသား "
+        "လွတ်နေပါသည်။ အပိုင်းတစ်ခုချင်းစီအတွက် မြန်မာလို ပြန်ဆိုထားသော "
+        f"စာသားကို ပေးပါ: {_list}\n\n"
+        "- Block တစ်ခုချင်းစီအတွက် start/end ကို ပေးထားသည့်အတိုင်း အတိအကျ "
+        "ပြန်ပေးပါ။\n"
+        "- text သည် ထို Block ၏ စကားပြောကို မြန်မာလို ပြန်ဆိုထားသော "
+        "စာသား ဖြစ်ရမည်။ စကားပြော မရှိသော Block တွင်လည်း ထိုအခိုက်အတန့်တွင် "
+        "ဖြစ်ပျက်နေသည်ကို တိုတိုရှင်းရှင်း ဇာတ်ကြောင်းပြောအဖြစ် ရေးပေးပါ။\n"
+        "- text အလွတ် (empty) လုံးဝ မရှိစေရ။ Block တစ်ခုချင်းစီတွင် "
+        "text အနည်းဆုံး စကားလုံး ၃ လုံး ရှိရမည်။\n"
+        "- မြန်မာစာလုံးပေါင်း အတိအကျ မှန်ရမည်။ Unicode မြန်မာစာဖြင့်သာ "
+        "ရေးရမည်။ Zawgyi encoding လုံးဝ မသုံးပါနှင့်။\n\n"
+        "STRICT JSON ONLY ဖြင့် ပြန်ပေးပါ။ JSON မှလွဲ၍ အခြားစာသား မထည့်ပါနှင့်။\n"
+        "'{\"blocks\": [{\"start\": 0.0, \"end\": 5.0, \"text\": \"...\"}]}'"
+    )
+
+
 def _build_pro_prompt() -> str:
     """Prompt for Pro AI Recap (Step 15): sequential dialogue blocks."""
     return (
@@ -263,7 +353,10 @@ def _build_pro_prompt() -> str:
         "- Block တစ်ခုချင်းစီအတွက် start/end ကို စက္ကန့်ဖြင့် (ဒသမ) ပေးပါ။ "
         "Block တစ်ခု၏ ကြာချိန်သည် များသောအားဖြင့် ၃–၈ စက္ကန့် ဖြစ်သင့်သည်။\n"
         "- text သည် ထို Block ၏ စကားပြောကို မြန်မာလို ပြန်ဆိုထားသော "
-        "(သို့မဟုတ် ဇာတ်ကြောင်းပြော) စာသားဖြစ်ရမည်။\n"
+        "(သို့မဟုတ် ဇာတ်ကြောင်းပြော) စာသားဖြစ်ရမည်။ Block တိုင်းတွင် "
+        "text အလွတ် (empty) လုံးဝ မရှိစေရ — စကားပြော မရှိသော Block "
+        "တွင်လည်း ထိုအခိုက်အတန့်တွင် ဖြစ်ပျက်နေသည်ကို တိုတိုရှင်းရှင်း "
+        "ဇာတ်ကြောင်းပြောအဖြစ် ရေးပေးပါ (မြန်မာအသံ ဘယ်တော့မှ ပြတ်မသွားစေရန်)။\n"
         "- ဗီဒီယိုကို ဘာမှ မဖြတ်ပါ (No Cuts) — ဗီဒီယို အမြန်နှုန်းသည် "
         "အမြဲ 1.0 (ပုံမှန်) ဖြစ်ရမည်။ ဗီဒီယိုကို နှေးသွားအောင် (slow-motion) "
         "လုံးဝ မလုပ်ရပါ။ အသံက Block အတွင်း မဝင်လျှင် ဗီဒီယိုကို "
@@ -425,6 +518,97 @@ def analyze_video_pro_blocks(
             client, uploaded, prompt, PRO_BLOCKS_JSON_SCHEMA, model)
         metadata = get_video_metadata(path)
         return validate_pro_blocks(plan, metadata.get("duration") or 0)
+    finally:
+        try:
+            client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
+
+
+def analyze_video_continuation(
+    video_path,
+    user_api_key: str,
+    from_time: float,
+    video_duration: float,
+    style: str = DEFAULT_STYLE,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Ask Gemini for narration covering ONLY [from_time, video_duration].
+
+    Fix 1: the first AI narration sometimes ends far before the video
+    ends (measured: 8:04 video, narration ended at 1:43). The pipeline
+    appends this continuation's audio + subtitles so the narration
+    reaches the end. Returns {"burmese_script": ...} (non-empty, or
+    raises AnalyzerError). The uploaded remote file is always deleted.
+    """
+    api_key = _require_key(user_api_key)
+
+    path = str(video_path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Video file not found: {path}")
+    if float(video_duration) <= float(from_time):
+        raise AnalyzerError("ဆက်လက် ဇာတ်ကြောင်းပြောရန် အပိုင်း မကျန်ပါ။")
+
+    client = genai.Client(api_key=api_key)
+    uploaded = client.files.upload(file=path)
+    try:
+        _wait_for_active(client, uploaded.name)
+        prompt = _build_continuation_prompt(from_time, video_duration, style)
+        plan = _generate_with_fallback(
+            client, uploaded, prompt, CONTINUATION_JSON_SCHEMA, model)
+        script = str((plan or {}).get("burmese_script", "")).strip()
+        if not script:
+            raise AnalyzerError(
+                "AI က ဆက်လက် ဇာတ်ကြောင်းပြော ပြန်မပေးနိုင်ပါ။")
+        return {"burmese_script": script}
+    finally:
+        try:
+            client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
+
+
+def analyze_video_pro_fill(
+    video_path,
+    user_api_key: str,
+    windows,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Ask Gemini for Myanmar narration for the given empty windows.
+
+    Fix 2: Pro blocks whose text came back empty would render as
+    silence (Myanmar speech "comes and goes"). The pipeline fills
+    those blocks' text from this call, then re-synthesizes them.
+    ``windows`` is a list of (start, end) pairs. Returns
+    {"blocks": [{"start","end","text"}...]}. The uploaded remote file
+    is always deleted.
+    """
+    api_key = _require_key(user_api_key)
+
+    path = str(video_path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Video file not found: {path}")
+    windows = [(float(s), float(e)) for s, e in (windows or []) if e > s]
+    if not windows:
+        return {"blocks": []}
+
+    client = genai.Client(api_key=api_key)
+    uploaded = client.files.upload(file=path)
+    try:
+        _wait_for_active(client, uploaded.name)
+        prompt = _build_pro_fill_prompt(windows)
+        plan = _generate_with_fallback(
+            client, uploaded, prompt, PRO_FILL_JSON_SCHEMA, model)
+        blocks = []
+        for b in (plan or {}).get("blocks", []) or []:
+            try:
+                s, e = float(b.get("start", 0)), float(b.get("end", 0))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            text = str(b.get("text", "")).strip()
+            if e > s and text:
+                blocks.append({"start": s, "end": e, "text": text})
+        return {"blocks": blocks}
     finally:
         try:
             client.files.delete(name=uploaded.name)

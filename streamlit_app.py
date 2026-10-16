@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-16 render-fixes v1"
+BUILD_VERSION = "2026-10-17 narration-coverage v1"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -585,6 +585,7 @@ def _job_file_result(result) -> Dict:
         "srt_path": result.get("srt_path"),
         "title": result.get("title"),
         "script_text": result.get("script_text"),
+        "narration_coverage": result.get("narration_coverage"),
     }
 
 
@@ -598,11 +599,24 @@ def _apply_job_result(result, snap) -> Dict:
     _sync_note = str(result.get("sync_method"))
     if result.get("video_speed_factor") is not None:
         _sync_note += f" ({result['video_speed_factor']})"
+    # Narration coverage (Fix 3): "အသံ: 1:43/8:04" — how much of
+    # the video actually has Myanmar speech. A short script used to
+    # ship silently; now the coverage is visible in every success.
+    _cov_note = ""
+    _cov = result.get("narration_coverage") or {}
+    if _cov.get("total_s"):
+        def _mmss(_s):
+            _s = max(0, int(round(float(_s))))
+            return f"{_s // 60}:{_s % 60:02d}"
+        _cov_note = (
+            f" | အသံ: {_mmss(_cov.get('covered_s', 0))}"
+            f"/{_mmss(_cov.get('total_s', 0))}"
+        )
     _recap = {
         "status": (
             f"✓ ပြီးဆုံးပါပြီ! | {result.get('aspect_ratio')} | "
             f"စာတန်း: {result.get('subtitle_mode')} | "
-            f"sync: {_sync_note}"
+            f"sync: {_sync_note}{_cov_note}"
         ),
         "video_path": result.get("final_video_path"),
         "srt_path": result.get("srt_path"),
@@ -1278,7 +1292,7 @@ with tab_src:
 with tab_voice:
     voice_choice = st.radio(" မြန်မာ AI အသံ ရွေးပါ", VOICE_CHOICES, index=0)
     bg_volume = st.slider(
-        " မူရင်းနောက်ခံအသံ အတိုးအကျယ်", 0.0, 0.5, 0.15, 0.05
+        " မူရင်းနောက်ခံအသံ အတိုးအကျယ်", 0.0, 0.5, 0.0, 0.05
     )
 
 with tab_sub:

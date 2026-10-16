@@ -876,6 +876,30 @@ def _scale_srt_timestamps(srt_path: str, scale: float, max_dur: float,
     return out_path
 
 
+def _offset_srt_timestamps(srt_path: str, offset: float,
+                           out_path: str) -> str:
+    """Rewrite an SRT with all cue times shifted by ``offset`` seconds.
+
+    Used when a narration CONTINUATION's SRT is appended after the
+    first narration: the continuation's cues are in continuation-audio
+    time (starting at 0), so they must be shifted by the length of the
+    first narration. Cue numbers are re-sequenced from 1. Returns
+    out_path.
+    """
+    cues = _parse_srt_cues(srt_path)
+    with open(out_path, "w", encoding="utf-8") as f:
+        n = 0
+        for start, end, text in cues:
+            ns = start + offset
+            ne = end + offset
+            if ne <= ns:
+                continue
+            n += 1
+            f.write(f"{n}\n{_srt_timestamp(ns)} --> "
+                    f"{_srt_timestamp(ne)}\n{text}\n\n")
+    return out_path
+
+
 def fit_audio_to_duration(audio_path: str, srt_path: Optional[str],
                           target_dur: float,
                           work_dir: str) -> Tuple[str, Optional[str], Dict]:
@@ -1001,7 +1025,7 @@ def render_recap_video(
     output_path: Optional[str] = None,
     aspect_ratio: str = "16:9",
     video_speed_factor: float = 1.0,
-    bg_volume: float = 0.15,
+    bg_volume: float = 0.0,
     work_dir: Optional[str] = None,
     blur_boxes: Optional[List[Dict]] = None,
     subtitle_config: Optional[Dict] = None,
@@ -1219,7 +1243,7 @@ def render_pro_recap_video(
     mirror_horizontal: bool = False,
     copyright_zoom: float = 1.0,
     random_crop_offset: bool = False,
-    bg_volume: float = 0.15,
+    bg_volume: float = 0.0,
     work_dir: Optional[str] = None,
     blur_boxes: Optional[List[Dict]] = None,
     subtitle_config: Optional[Dict] = None,

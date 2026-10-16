@@ -23,8 +23,10 @@ from typing import Callable, Dict, List, Optional
 from video_processor import get_video_metadata, prepare_video_source
 from ai_analyzer import (
     DEFAULT_STYLE,
+    analyze_video_continuation,
     analyze_video_for_recap,
     analyze_video_pro_blocks,
+    analyze_video_pro_fill,
     generate_mock_pro_plan,
     generate_mock_recap_plan,
     validate_pro_blocks,
@@ -36,6 +38,7 @@ from tts_manager import (
     measure_audio_duration,
 )
 from video_editor import (
+    _offset_srt_timestamps,
     fit_audio_to_duration,
     render_pro_recap_video,
     render_recap_video,
@@ -44,6 +47,88 @@ from video_editor import (
 
 class PipelineError(Exception):
     """Raised for pipeline failures."""
+
+
+# Narration coverage: a plan is "full" when the Myanmar speech covers
+# at least 90% of the video. Below that, the pipeline retries Gemini
+# for the missing part (AI continuation / Pro fill).
+NARRATION_COVERAGE_TARGET = 0.90
+# Max extra Gemini narration rounds per Run (each costs one more
+# analyze call + one more TTS pass).
+NARRATION_RETRY_MAX = 2
+
+
+def _narration_coverage(covered_s: float, total_s: float) -> Dict[str, float]:
+    """Coverage report shown in the success line (Fix 3).
+
+    ``covered_s`` = seconds of real Myanmar speech (measured TTS
+    audio length for AI; sum of non-empty block audio for Pro).
+    """
+    total = max(0.0, float(total_s or 0))
+    covered = max(0.0, min(float(covered_s or 0), total)) if total else 0.0
+    pct = (covered / total * 100.0) if total else 0.0
+    return {"covered_s": round(covered, 1),
+            "total_s": round(total, 1),
+            "pct": round(pct, 1)}
+
+
+def _renumber_srt(srt_path: str) -> str:
+    """Re-sequence cue numbers 1..N in place.
+
+    Used after appending a continuation SRT (whose cues restart at
+    1) to the first SRT — duplicate numbers confuse some players.
+    """
+    import re
+
+    with open(srt_path, encoding="utf-8") as f:
+        text = f.read()
+    blocks = re.split(r"\n\s*\n", text.strip())
+    out = []
+    n = 0
+    for block in blocks:
+        lines = block.strip().split("\n")
+        if len(lines) >= 2 and lines[0].strip().isdigit() \
+                and "-->" in lines[1]:
+            n += 1
+            lines[0] = str(n)
+            out.append("\n".join(lines))
+        elif block.strip():
+            out.append(block.strip())
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write("\n\n".join(out) + ("\n" if out else ""))
+    return srt_path
+
+
+def _concat_audios(paths: List[str], out_path: str) -> str:
+    """Concatenate audio files end-to-end into one MP3 (ffmpeg concat).
+
+    Used to append a narration CONTINUATION to the first narration.
+    Re-encodes (MP3 concat with stream-copy can drift), so the result
+    is a clean single file.
+    """
+    import subprocess
+
+    if not paths:
+        raise PipelineError("အသံဖိုင် ပေါင်းရန် ဖိုင် မရှိပါ။")
+    if len(paths) == 1:
+        shutil.copyfile(paths[0], out_path)
+        return out_path
+    inputs: List[str] = []
+    for p in paths:
+        inputs += ["-i", str(p)]
+    n = len(paths)
+    filt = "".join(f"[{i}:a]" for i in range(n)) + \
+        f"concat=n={n}:v=0:a=1[a]"
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", *inputs,
+         "-filter_complex", filt, "-map", "[a]",
+         "-c:a", "libmp3lame", "-q:a", "4", out_path],
+        capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0:
+        raise PipelineError(
+            "အသံဖိုင် ပေါင်းစပ်မှု မအောင်မြင်ပါ: "
+            f"{proc.stderr.strip()[:200]}")
+    return out_path
 
 
 def run_full_recap_pipeline(
@@ -55,7 +140,7 @@ def run_full_recap_pipeline(
     voice_name: str = "my-MM-ThihaNeural",
     rate: str = "+0%",
     aspect_ratio: str = "16:9",
-    bg_volume: float = 0.15,
+    bg_volume: float = 0.0,
     work_dir: Optional[str] = None,
     output_dir: Optional[str] = None,
     output_name: str = "final_recap.mp4",
@@ -181,6 +266,10 @@ def run_full_recap_pipeline(
     # the tiling guarantee (highlights/blocks cover [0, duration]).
     _report("analyze", 0.0, "AI က ဗီဒီယို စိစစ်နေသည်…")
     _video_dur = metadata["duration"] or 0
+    # True only when the plan came from live Gemini (not mock, not a
+    # caller-passed prebuilt plan) — only then may the pipeline call
+    # Gemini again for the Pro fill.
+    _live_ai_plan = (plan is None and not use_mock_plan)
     if plan is None:
         if processing_mode == "pro_ai_recap":
             if use_mock_plan:
@@ -209,6 +298,34 @@ def run_full_recap_pipeline(
         blocks = plan.get("blocks") or []
         if not blocks:
             raise PipelineError("Pro blocks သည် အလွတ်ဖြစ်နေပါသည်။")
+        # 2b) Fill empty blocks (Fix 2): blocks whose text came back
+        # empty would render as silence — Myanmar speech "comes and
+        # goes". Ask Gemini once for narration for exactly those
+        # windows (dubbing, or a brief action narration when nobody
+        # speaks), then re-validate so the tiling holds.
+        if _live_ai_plan:
+            _empty = [(float(b.get("start", 0)), float(b.get("end", 0)))
+                      for b in blocks
+                      if not str(b.get("text", "")).strip()]
+            if _empty:
+                try:
+                    _filled = analyze_video_pro_fill(
+                        local_path, user_api_key, _empty, model=model)
+                    _by_window = {(round(float(b.get("start", 0)), 2),
+                                   round(float(b.get("end", 0)), 2)): b
+                                  for b in _filled.get("blocks", []) or []}
+                    for _b in blocks:
+                        _key = (round(float(_b.get("start", 0)), 2),
+                                round(float(_b.get("end", 0)), 2))
+                        if not str(_b.get("text", "")).strip() \
+                                and _key in _by_window:
+                            _b["text"] = str(
+                                _by_window[_key].get("text", "")).strip()
+                    plan = validate_pro_blocks(
+                        {"title": title, "blocks": blocks}, _video_dur)
+                    blocks = plan.get("blocks") or []
+                except Exception:
+                    pass
         blocks = generate_block_voiceovers(
             blocks, os.path.join(work_dir, "block_audio"),
             voice_name=voice_name, rate=rate, proxy=tts_proxy,
@@ -218,6 +335,11 @@ def run_full_recap_pipeline(
             str(b.get("text", "")) for b in blocks).strip()
         sync = None
         audio_duration = sum(b["audio_len"] for b in blocks)
+        # Coverage counts only blocks with real narration text — the
+        # 0.5s silence placeholders for empty blocks are not speech.
+        _pro_covered = sum(
+            b["audio_len"] for b in blocks
+            if str(b.get("text", "")).strip())
 
         # 5) Pro render (blocks define the timeline + synced subtitles)
         final_path = os.path.join(output_dir, output_name)
@@ -260,6 +382,8 @@ def run_full_recap_pipeline(
             },
             "subtitle_mode": render["subtitle_mode"],
             "sync_method": "pro_blocks",
+            "narration_coverage": _narration_coverage(
+                _pro_covered, _video_dur),
             "video_speed_factor": None,
             "aspect_ratio": aspect_ratio,
             "processing_mode": "pro_ai_recap",
@@ -323,6 +447,60 @@ def run_full_recap_pipeline(
         if _auto_assets:
             _report("tts", 1.0, "အသံ ထုတ်တာ ပြီးပါပြီ")
 
+        # 3b) Narration coverage (Fix 1): the first script sometimes
+        # ends far before the video ends (measured: 8:04 video,
+        # narration ended at 1:43) — the old code padded the rest with
+        # silence and built subtitles only for the short script, so
+        # speech + subtitles never reached the end. If the measured
+        # narration covers < 90% of the video, ask Gemini for a
+        # CONTINUATION covering the uncovered tail, synthesize it, and
+        # append its audio + subtitles (offset). Up to
+        # NARRATION_RETRY_MAX rounds. Skipped for mock plans (test
+        # fixtures) and for prebuilt voiceovers (the caller owns them).
+        if _auto_assets and not use_mock_plan:
+            for _cont in range(NARRATION_RETRY_MAX):
+                if _video_dur <= 0 or \
+                        audio_duration >= NARRATION_COVERAGE_TARGET * _video_dur:
+                    break
+                try:
+                    _tail = analyze_video_continuation(
+                        local_path, user_api_key,
+                        from_time=audio_duration,
+                        video_duration=_video_dur,
+                        style=style, model=model)
+                    _cont_text = str(
+                        _tail.get("burmese_script", "")).strip()
+                except Exception:
+                    break
+                if not _cont_text:
+                    break
+                _cont_audio = os.path.join(
+                    work_dir, f"voiceover_cont_{_cont}.mp3")
+                _cont_srt = os.path.join(
+                    work_dir, f"voiceover_cont_{_cont}.srt")
+                _cont_len = generate_burmese_voiceover(
+                    _cont_text, _cont_audio, _cont_srt,
+                    voice_name=voice_name, rate=_tts_rate_used,
+                    proxy=tts_proxy)
+                if _cont_len <= 0 or not os.path.isfile(_cont_audio):
+                    break
+                _merged_audio = os.path.join(
+                    work_dir, f"voiceover_merged_{_cont}.mp3")
+                _concat_audios([voiceover_path, _cont_audio], _merged_audio)
+                _merged_srt = os.path.join(
+                    work_dir, f"subtitles_merged_{_cont}.srt")
+                _offset_srt_timestamps(
+                    _cont_srt, audio_duration, _merged_srt)
+                # Append the continuation cues after the first SRT's.
+                with open(srt_path, "a", encoding="utf-8") as _f:
+                    _f.write(open(_merged_srt, encoding="utf-8").read())
+                # Renumber cue indices across the merged file (the
+                # appended block restarts at 1).
+                _renumber_srt(srt_path)
+                voiceover_path = _merged_audio
+                script_text = (script_text + " " + _cont_text).strip()
+                audio_duration = audio_duration + _cont_len
+
         # 4) fit the AUDIO to the full video duration (video stays 1.0x):
         # pad silence if shorter; atempo (+ scaled SRT) if longer.
         fitted_audio, fitted_srt, audio_fit = fit_audio_to_duration(
@@ -371,6 +549,8 @@ def run_full_recap_pipeline(
             },
             "subtitle_mode": render["subtitle_mode"],
             "sync_method": "full_narration",
+            "narration_coverage": _narration_coverage(
+                audio_duration, _video_dur),
             "video_speed_factor": 1.0,
             "aspect_ratio": aspect_ratio,
             "processing_mode": "ai_recap",
