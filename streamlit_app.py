@@ -295,6 +295,8 @@ def verify_gemini_api_key(user_api_key: str):
 
 # Browser-local key storage (per-user, never touches our server).
 LS_KEY = "mmr_gemini_api_key"
+# Browser-local remembered Run (job persistence; see helpers below).
+LS_JOB = "mmr_job_id"
 
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
@@ -306,6 +308,10 @@ if "forgotten_key" not in st.session_state:
     st.session_state["forgotten_key"] = ""
 if "key_load_nonce" not in st.session_state:
     st.session_state["key_load_nonce"] = 0
+if "job_load_nonce" not in st.session_state:
+    st.session_state["job_load_nonce"] = 0
+if "job_save_nonce" not in st.session_state:
+    st.session_state["job_save_nonce"] = 0
 if "forget_just_clicked" not in st.session_state:
     st.session_state["forget_just_clicked"] = False
 
@@ -381,6 +387,25 @@ if (
 ):
     st.session_state["api_key"] = browser_saved
     st.session_state["key_restored"] = True
+
+# Ask this browser for a remembered Run (job persistence): the
+# component key includes a nonce, bumped on every Run save, so the
+# read stays fresh (same staleness trap as the key load).
+_browser_job = streamlit_js_eval(
+    js_expressions=f"localStorage.getItem('{LS_JOB}')",
+    key=f"mmr_job_load_{st.session_state['job_load_nonce']}",
+)
+# Parsed stored job (if any): {"run_dir": ..., "saved_at": ...}.
+# Kept in session_state so the progress fragment (which re-runs
+# without the main script) can re-attach to a job from a dead session.
+try:
+    _parsed_job = json.loads(_browser_job) if _browser_job else None
+except ValueError:
+    _parsed_job = None
+if isinstance(_parsed_job, dict) and _parsed_job.get("run_dir"):
+    st.session_state["stored_job"] = _parsed_job
+elif _parsed_job is not None:
+    st.session_state["stored_job"] = None
 
 st.markdown(HEADER_TOP)
 
@@ -466,6 +491,103 @@ def _cleanup_run_workdir(run_dir, keep_paths) -> None:
         pass
 
 
+# ---- Job persistence: a Run's status lives in a file, not only in
+# session memory, so a session reset mid-run (Streamlit reconnect /
+# container hiccup under CPU throttle) no longer makes the job vanish
+# silently. The browser keeps the run_dir in localStorage (mmr_job_id);
+# a fresh session re-attaches to the file: running -> live progress
+# from the file, done -> result restored, error -> error restored,
+# file gone shortly after the Run -> a "lost" error instead of idle.
+_JOB_LOST_MSG = (
+    "ထုတ်လုပ်မှု အလယ်မှာ ပြတ်သွားပါပြီ — app က ပြန်စသွားလို့ "
+    "ဒီ Run ရဲ့ ရလဒ် ပျောက်သွားပါပြီ။ Run ကို ထပ်နှိပ်ပြီး ပြန်စပေးပါ။"
+)
+_JOB_STALE_RUNNING_S = 15 * 60  # file untouched this long -> worker dead
+_JOB_LOST_MIN_S = 60  # file missing sooner -> worker may not have started yet
+_JOB_LOST_MAX_S = 30 * 60  # file missing later -> stale entry, ignore
+
+
+def _job_status_path(run_dir) -> str:
+    return os.path.join(str(run_dir), "job_status.json")
+
+
+def _write_job_status(run_dir, payload) -> None:
+    """Atomic best-effort write; a failed write must never break the run."""
+    try:
+        _tmp = os.path.join(str(run_dir), ".job_status.tmp")
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            json.dump(payload, _f)
+        os.replace(_tmp, _job_status_path(run_dir))
+    except OSError:
+        pass
+
+
+def _read_job_status(run_dir):
+    try:
+        with open(_job_status_path(run_dir), encoding="utf-8") as _f:
+            _data = json.load(_f)
+        return _data if isinstance(_data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _job_file_snapshot(snap) -> Dict:
+    return {
+        "run_dir": snap.get("run_dir"),
+        "input_path": snap.get("input_path"),
+        "src_local_picked_at_start": bool(snap.get("src_local_picked_at_start")),
+    }
+
+
+def _job_file_result(result) -> Dict:
+    return {
+        "aspect_ratio": result.get("aspect_ratio"),
+        "subtitle_mode": result.get("subtitle_mode"),
+        "sync_method": result.get("sync_method"),
+        "video_speed_factor": result.get("video_speed_factor"),
+        "final_video_path": result.get("final_video_path"),
+        "srt_path": result.get("srt_path"),
+        "title": result.get("title"),
+        "script_text": result.get("script_text"),
+    }
+
+
+def _apply_job_result(result, snap) -> Dict:
+    """Build recap_result + cleanup + auto-delete input (idempotent).
+
+    Runs on the script thread only (never the worker): it touches
+    session_state and deletes files, so both the in-memory finalize
+    path and the file re-attach path share it.
+    """
+    _sync_note = str(result.get("sync_method"))
+    if result.get("video_speed_factor") is not None:
+        _sync_note += f" ({result['video_speed_factor']})"
+    _recap = {
+        "status": (
+            f"✓ ပြီးဆုံးပါပြီ! | {result.get('aspect_ratio')} | "
+            f"စာတန်း: {result.get('subtitle_mode')} | "
+            f"sync: {_sync_note}"
+        ),
+        "video_path": result.get("final_video_path"),
+        "srt_path": result.get("srt_path"),
+        "title": result.get("title"),
+        "script_text": result.get("script_text"),
+    }
+    _cleanup_run_workdir(
+        snap.get("run_dir"),
+        [result.get("final_video_path"), result.get("srt_path"),
+         _job_status_path(snap.get("run_dir"))])
+    # Auto-delete the uploaded input (the result no longer needs
+    # it; a re-Run re-uploads from the canvas if asked).
+    if snap.get("src_local_picked_at_start"):
+        _delete_quietly(snap.get("input_path"))
+        if st.session_state.get("src_path") == snap.get("input_path"):
+            st.session_state["src_path"] = None
+            st.session_state["src_local_picked"] = False
+            st.session_state["src_video_id"] = None
+    return _recap
+
+
 # ---- Async Run: the pipeline runs in a worker thread so the UI can
 # show live progress (percentage + elapsed + estimated remaining).
 # The worker NEVER touches st.session_state — it only mutates the
@@ -491,6 +613,16 @@ def _run_pipeline_job(job: Dict) -> None:
             job["pct"] = float(pct)
             job["phase"] = phase
             job["detail"] = detail
+        # Mirror progress to the status file so a fresh session can
+        # re-attach if this session dies mid-run.
+        _write_job_status(snap["run_dir"], {
+            "status": "running",
+            "pct": float(pct),
+            "phase": phase,
+            "detail": detail,
+            "started_at": job.get("started_at", time.time()),
+            "snapshot": _job_file_snapshot(snap),
+        })
 
     try:
         result = run_full_recap_pipeline(
@@ -527,11 +659,29 @@ def _run_pipeline_job(job: Dict) -> None:
             job["phase"] = "done"
             job["detail"] = "ပြီးဆုံးပါပြီ"
             job["result"] = result
+        _write_job_status(snap["run_dir"], {
+            "status": "done",
+            "pct": 100.0,
+            "phase": "done",
+            "detail": "ပြီးဆုံးပါပြီ",
+            "started_at": job.get("started_at", time.time()),
+            "snapshot": _job_file_snapshot(snap),
+            "result": _job_file_result(result),
+        })
     except Exception as exc:  # noqa: BLE001 - surfaced in the fragment
         traceback.print_exc()
         with lock:
             job["status"] = "error"
             job["error"] = str(exc)
+        _write_job_status(snap["run_dir"], {
+            "status": "error",
+            "pct": job.get("pct", 0.0),
+            "phase": job.get("phase", "analyze"),
+            "detail": str(exc),
+            "started_at": job.get("started_at", time.time()),
+            "snapshot": _job_file_snapshot(snap),
+            "error": str(exc),
+        })
 
 
 @st.fragment(run_every=1)
@@ -554,6 +704,70 @@ def _render_run_progress() -> None:
         st.caption("ဗီဒီယို server ကို တင်နေသည်… Run နှိပ်ပြီးမှ တင်တာပါ။")
         return
     if not job:
+        # No in-memory job: re-attach to a job from a dead session, if
+        # the browser remembers one (stored_job) and its status file
+        # exists. Without this, a session reset mid-run looks like the
+        # page silently going idle (the observed Pro failure).
+        _stored = st.session_state.get("stored_job") or {}
+        _fdir = _stored.get("run_dir")
+        if _fdir and st.session_state.get("restored_job_dir") != _fdir:
+            _fstatus = _read_job_status(_fdir)
+            if _fstatus is not None:
+                _fst = _fstatus.get("status")
+                _fsnap = _fstatus.get("snapshot") or {}
+                if _fst == "done" and _fstatus.get("result"):
+                    st.session_state["recap_result"] = _apply_job_result(
+                        _fstatus["result"], _fsnap)
+                    st.session_state["restored_job_dir"] = _fdir
+                    st.rerun(scope="app")
+                if _fst == "error":
+                    _ferr = _fstatus.get("error") or "အမည်မသိ အမှား"
+                    if st.session_state.get("run_error") != _ferr:
+                        st.session_state["run_error"] = _ferr
+                        st.rerun(scope="app")
+                if _fst == "running":
+                    # Worker dead but file survived? A stale file means
+                    # the worker is gone — report it instead of a
+                    # frozen bar. (A live worker updates the file on
+                    # every progress callback.)
+                    try:
+                        _fage = time.time() - os.path.getmtime(
+                            _job_status_path(_fdir))
+                    except OSError:
+                        _fage = 0.0
+                    if _fage > _JOB_STALE_RUNNING_S:
+                        if st.session_state.get("run_error") != _JOB_LOST_MSG:
+                            st.session_state["run_error"] = _JOB_LOST_MSG
+                            st.rerun(scope="app")
+                    else:
+                        _fpct = float(_fstatus.get("pct", 0.0))
+                        _fstarted = float(
+                            _fstatus.get("started_at", time.time()))
+                        _felapsed = max(0.0, time.time() - _fstarted)
+                        _feta = ""
+                        if _fpct >= 10.0:
+                            _fremain = _felapsed * (100.0 - _fpct) / _fpct
+                            _feta = f" | ခန့်မှန်း ကျန်ချိန် ~{_fremain:.0f}s"
+                        _flabel = _RUN_PHASE_LABELS.get(
+                            _fstatus.get("phase", "analyze"),
+                            _fstatus.get("detail") or "")
+                        st.progress(
+                            min(1.0, _fpct / 100.0),
+                            text=(f"{_flabel} — {_fpct:.0f}% | "
+                                  f"{_felapsed:.0f}s ကြာပြီး{_feta}"))
+                        st.caption(_fstatus.get("detail") or "")
+                        return
+            else:
+                # No status file: the Run was lost before it could write
+                # one (or the container wiped /tmp). Only call it lost
+                # inside a window — too soon and the worker may not
+                # have started yet; too late and it's a stale entry.
+                _saved_at = float(_stored.get("saved_at") or 0)
+                _fage = time.time() - _saved_at if _saved_at else 0.0
+                if _JOB_LOST_MIN_S < _fage < _JOB_LOST_MAX_S:
+                    if st.session_state.get("run_error") != _JOB_LOST_MSG:
+                        st.session_state["run_error"] = _JOB_LOST_MSG
+                        st.rerun(scope="app")
         return
     with job["lock"]:
         status = job["status"]
@@ -578,32 +792,9 @@ def _render_run_progress() -> None:
         st.caption(detail or "")
         return
     if status == "done" and result is not None:
-        _sync_note = str(result["sync_method"])
-        if result.get("video_speed_factor") is not None:
-            _sync_note += f" ({result['video_speed_factor']})"
-        st.session_state["recap_result"] = {
-            "status": (
-                f"✓ ပြီးဆုံးပါပြီ! | {result['aspect_ratio']} | "
-                f"စာတန်း: {result['subtitle_mode']} | "
-                f"sync: {_sync_note}"
-            ),
-            "video_path": result["final_video_path"],
-            "srt_path": result["srt_path"],
-            "title": result["title"],
-            "script_text": result["script_text"],
-        }
-        _cleanup_run_workdir(
-            job["snapshot"]["run_dir"],
-            [result["final_video_path"], result["srt_path"]])
-        # Auto-delete the uploaded input (the result no longer needs
-        # it; a re-Run re-uploads from the canvas if asked).
-        if job["snapshot"].get("src_local_picked_at_start"):
-            _delete_quietly(job["snapshot"].get("input_path"))
-            if st.session_state.get("src_path") == job["snapshot"].get(
-                    "input_path"):
-                st.session_state["src_path"] = None
-                st.session_state["src_local_picked"] = False
-                st.session_state["src_video_id"] = None
+        st.session_state["recap_result"] = _apply_job_result(
+            result, job["snapshot"])
+        st.session_state["restored_job_dir"] = job["snapshot"].get("run_dir")
         st.session_state["run_job"] = None
         # Full-app rerun: a fragment-scoped rerun would NOT re-execute
         # the main script, so the result below would never render.
@@ -1294,6 +1485,24 @@ if run_btn and not _run_blocked:
         "needs_upload": _needs_upload,
         "clicked_at": time.time(),
     }
+    # Remember this Run in the browser: if the session dies mid-run,
+    # a fresh session re-attaches to the job's status file instead of
+    # going silently idle. The load nonce bump forces a fresh read.
+    _job_saved_at = time.time()
+    st.session_state["stored_job"] = {
+        "run_dir": _run_dir, "saved_at": _job_saved_at}
+    st.session_state["restored_job_dir"] = None
+    st.session_state["job_save_nonce"] = (
+        int(st.session_state.get("job_save_nonce") or 0) + 1)
+    streamlit_js_eval(
+        js_expressions=(
+            f"localStorage.setItem('{LS_JOB}',"
+            f"{json.dumps(json.dumps({'run_dir': _run_dir, 'saved_at': _job_saved_at}))})"
+        ),
+        key=f"mmr_job_save_{st.session_state['job_save_nonce']}",
+    )
+    st.session_state["job_load_nonce"] = (
+        int(st.session_state.get("job_load_nonce") or 0) + 1)
     if _needs_upload:
         # Fresh nonce -> the canvas sends the stored video_data once.
         st.session_state["upload_nonce"] = (
