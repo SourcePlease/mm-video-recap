@@ -12,12 +12,14 @@ Public functions
 - analyze_video_for_recap(video_path, user_api_key, target_duration=30,
     style="စိတ်ဝင်စားဖွယ် ဇာတ်လမ်းအကျဉ်းချုပ်", model=None)
     Uploads the video to the user's own Gemini Files storage, waits until it
-    is ACTIVE, asks Gemini for a recap plan as strict JSON, validates the
-    timestamps against the real video duration, then ALWAYS deletes the
-    remote file in a ``finally:`` block so the user's free cloud storage
-    does not fill up. ``model`` optionally pins one model ID (tried first);
-    otherwise the free-tier MODEL_CANDIDATES are tried in order, then any
-    other flash model the key can access (live discovery).
+    is ACTIVE, asks Gemini for a FULL-DURATION narration plan as strict
+    JSON (highlights tile the whole video, burmese_script fills the full
+    duration — target_duration is IGNORED), validates the timestamps
+    against the real video duration, then ALWAYS deletes the remote file
+    in a ``finally:`` block so the user's free cloud storage does not fill
+    up. ``model`` optionally pins one model ID (tried first); otherwise
+    the free-tier MODEL_CANDIDATES are tried in order, then any other
+    flash model the key can access (live discovery).
 - validate_recap_plan(plan_dict, video_duration)
     Clamps every highlight's start/end into [0, video_duration], drops
     invalid segments, sorts by start time.
@@ -191,29 +193,40 @@ def _wait_for_active(client: genai.Client, file_name: str,
         time.sleep(interval_s)
 
 
-def _build_prompt(target_duration: int, style: str) -> str:
-    # Narration word-count table matched to the target duration:
-    # Burmese TTS speaks ~2.2 words/sec, so the script must carry
-    # enough words to fill the full duration (the 17s-output bug was
-    # a too-short script cut to audio length).
-    _word_counts = {30: "60–75", 60: "130–160", 90: "200–240",
-                    180: "400–450"}
-    _word_count = _word_counts.get(target_duration, "130–160")
+def _build_prompt(video_duration: float, style: str) -> str:
+    # AI Recap = Narration Master, FULL duration (never a short cut).
+    # The narration must fill the ENTIRE original video: Burmese TTS
+    # speaks ~2.2 words/sec, so the script needs ~2.2 words per second
+    # of video (e.g. an 8-min video needs ~1000 words). A too-short
+    # script was the old 17s-output bug — the output was cut to the
+    # audio length. Now the output is always the full video duration
+    # with the narration as master over the full footage.
+    _dur = max(0.0, float(video_duration or 0))
+    _lo, _hi = int(_dur * 2.0), int(_dur * 2.4)
+    _word_count = f"{_lo}–{_hi}" if _dur > 0 else "ဗီဒီယို ကြာချိန်နှင့် လိုက်ဖက်သော"
+    _dur_txt = f"{_dur:.0f} စက္ကန့်" if _dur > 0 else "ဗီဒီယို အပြည့်"
     return (
-        "သင်သည် မြန်မာဗီဒီယို အကျဉ်းချုပ် (video recap) ကျွမ်းကျင်သူဖြစ်သည်။\n"
-        "ပေးထားသော ဗီဒီယိုကို သေချာကြည့်ပြီး အောက်ပါအတိုင်း မြန်မာလို အကျဉ်းချုပ် "
-        "အစီအစဉ် ရေးပေးပါ။\n\n"
-        f"- အကျဉ်းချုပ် စတိုင်: {style}\n"
-        f"- ရွေးချယ်ရမည့် အဓိကအခန်းများ စုစုပေါင်း ကြာချိန်: ခန့်မှန်းခြေ {target_duration} စက္ကန့်\n"
+        "သင်သည် မြန်မာဗီဒီယို ဇာတ်ကြောင်းပြော (narration) ကျွမ်းကျင်သူဖြစ်သည်။\n"
+        "ပေးထားသော ဗီဒီယိုကို သေချာကြည့်ပြီး အောက်ပါအတိုင်း မြန်မာလို "
+        "ဇာတ်ကြောင်းပြော အစီအစဉ် အပြည့်အစုံ ရေးပေးပါ။\n\n"
+        f"- ဇာတ်ကြောင်းပြော စတိုင်: {style}\n"
+        f"- မူရင်းဗီဒီယို ကြာချိန်: {_dur_txt} — ဗီဒီယိုကို တိုတိုလေး "
+        "ဖြတ်မချရပါ။ မူရင်း footage အပြည့်အစုံကို အသုံးပြုရမည်။ "
+        "Output သည် မူရင်းဗီဒီယို ကြာချိန်အတိုင်း အပြည့်အဝ ဖြစ်ရမည်။\n"
         "- highlights တစ်ခုချင်းစီအတွက် start/end ကို စက္ကန့်ဖြင့် (ဒသမကိန်းရ) "
         "ပေးပါ။\n"
-        "- highlights များသည် ဗီဒီယို၏ အစ / အလယ် / အဆုံး သုံးပိုင်းလုံးကို "
-        "ဖုံးရမည်။ highlights အရေအတွက် ၆–၁၂ ခု ဖြစ်ရမည်။ highlights "
-        "တစ်ခုချင်းစီ၏ ကြာချိန်သည် စက္ကန့်အတိုင်း မှန်ရမည် (start နှင့် "
-        "end ကွာခြားချက်သည် ထိုအခန်း၏ တကယ့် ကြာချိန်နှင့် ကိုက်ရမည်)။\n"
+        "- highlights များသည် ဗီဒီယိုတစ်ခုလုံးကို အစမှအဆုံး ဆက်တိုက် "
+        "ဖုံးရမည်။ ပထမ highlight က 0.0 တွင် စရမည်၊ နောက်ဆုံး highlight က "
+        "ဗီဒီယို၏ အဆုံးတွင် ဆုံးရမည်။ highlights များအကြား လစ်ဟာမှု (gap) "
+        "သို့မဟုတ် ထပ်မှု (overlap) မရှိရပါ။ highlight တစ်ခုချင်းစီ၏ "
+        "ကြာချိန်သည် ၁၀–၃၀ စက္ကန့် ဖြစ်သင့်သည် (၁၅ မိနစ်ထက် ရှည်သော "
+        "ဗီဒီယိုများအတွက် ၆၀ စက္ကန့်အထိ ရသည်)။ highlights တစ်ခုချင်းစီ၏ "
+        "ကြာချိန်သည် စက္ကန့်အတိုင်း မှန်ရမည် (start နှင့် end ကွာခြားချက်သည် "
+        "ထိုအခန်း၏ တကယ့် ကြာချိန်နှင့် ကိုက်ရမည်)။\n"
         "- title သည် ဆွဲဆောင်မှုရှိသော မြန်မာ ခေါင်းစဉ်ဖြစ်ရမည်။\n"
         "- description များနှင့် burmese_script သည် သဘာဝကျပြီး နားထောင်ကောင်းသော "
-        "မြန်မာစကားပြော ဖြစ်ရမည်။\n"
+        "မြန်မာစကားပြော ဖြစ်ရမည်။ description တစ်ခုချင်းစီသည် ထို "
+        "highlight အပိုင်း၏ အကြောင်းအရာကို ဖော်ပြရမည်။\n"
         "- မြန်မာစာလုံးပေါင်း အတိအကျ မှန်ရမည်။ မြန်မာစာအဖွဲ့၏ စံစာလုံးပေါင်း "
         "(standard Myanmar orthography) ကိုသာ သုံးပါ။ စကားလုံးတစ်လုံးချင်းစီ၏ "
         "စာလုံးပေါင်းကို ထုတ်ပေးခြင်းမပြုမီ ပြန်စစ်ပါ။ အသတ် (်)၊ ဝိသဇ္ဇနာ (း)၊ "
@@ -224,13 +237,15 @@ def _build_prompt(target_duration: int, style: str) -> str:
         "- title, description နှင့် burmese_script အားလုံးသည် Unicode မြန်မာစာ "
         "(Unicode Myanmar encoding) ဖြင့်သာ ရေးရမည်။ Zawgyi encoding လုံးဝ "
         "မသုံးပါနှင့်။\n"
-        "- burmese_script သည် ရွေးထားသော highlights များကို ဆက်စပ်ပြီး ပြောပြသော "
-        f"ဇာတ်ကြောင်းပြော စာသား ဖြစ်ရမည် (ခန့်မှန်း {target_duration} စက္ကန့်စာ အသံထွက်)။\n"
-        f"burmese_script ၏ စကားလုံးအရေအတွက်သည် {_word_count} လုံး ဖြစ်ရမည် — "
-        "စာသား တိုလျှင် အသံက စောပြီး ပြီးသွားပြီး ဗီဒီယိုလည်း တိုသွားမည်။\n\n"
+        "- burmese_script သည် ဗီဒီယိုတစ်ခုလုံး၏ အစ / အလယ် / အဆုံး "
+        "အကြောင်းအရာ စုံလင်သော ဇာတ်ကြောင်းပြော အပြည့်အစုံ ဖြစ်ရမည်။\n"
+        f"burmese_script ၏ စကားလုံးအရေအတွက်သည် {_word_count} လုံး ဖြစ်ရမည် "
+        "(မြန်မာအသံ တစ်စက္ကန့်လျှင် ~၂.၂ လုံးနှုန်းဖြင့် ဗီဒီယို "
+        "ကြာချိန်အပြည့် ဖြည့်ရန်) — စာသား တိုလျှင် အသံက စောပြီး "
+        "ပြီးသွားမည်။\n\n"
         "STRICT JSON ONLY ဖြင့် ပြန်ပေးပါ။ JSON မှလွဲ၍ အခြားစာသား မထည့်ပါနှင့်။\n"
         'ပုံစံ: {"title": "...", "highlights": '
-        '[{"start": 0.0, "end": 5.0, "description": "..."}], '
+        '[{"start": 0.0, "end": 20.0, "description": "..."}], '
         '"burmese_script": "..."}'
     )
 
@@ -249,13 +264,18 @@ def _build_pro_prompt() -> str:
         "Block တစ်ခု၏ ကြာချိန်သည် များသောအားဖြင့် ၃–၈ စက္ကန့် ဖြစ်သင့်သည်။\n"
         "- text သည် ထို Block ၏ စကားပြောကို မြန်မာလို ပြန်ဆိုထားသော "
         "(သို့မဟုတ် ဇာတ်ကြောင်းပြော) စာသားဖြစ်ရမည်။\n"
+        "- ဗီဒီယိုကို ဘာမှ မဖြတ်ပါ (No Cuts) — ဗီဒီယို အမြန်နှုန်းသည် "
+        "အမြဲ 1.0 (ပုံမှန်) ဖြစ်ရမည်။ ဗီဒီယိုကို နှေးသွားအောင် (slow-motion) "
+        "လုံးဝ မလုပ်ရပါ။ အသံက Block အတွင်း မဝင်လျှင် ဗီဒီယိုကို "
+        "မနှေးစေဘဲ အသံကိုသာ မြန်အောင် ညှိမည် — ထို့ကြောင့် text သည် "
+        "Block အတွင်း ကွက်တိ ဝင်ဆံ့ရမည်။\n"
         "- text သည် အလွန်တိုတိုနှင့် အနှစ်ချုပ်သာ ဖြစ်ရမည်။ မြန်မာစကားပြော "
         "နှုန်း (တစ်စက္ကန့်လျှင် အများဆုံး ၃ စကားလုံးနှုန်း) အရ Block "
         "ကြာချိန်နှင့် လိုက်ဖက်သော စကားလုံးအရေအတွက်သာ ထည့်ပါ "
         "(ဥပမာ ၃ စက္ကန့် Block ဆိုလျှင် စာလုံးရေ ၁၀ လုံးထက် မကျော်စေရန်၊ "
         "၅ စက္ကန့် Block ဆိုလျှင် ၁၅ လုံးထက် မကျော်စေရန်)။ ရှည်လျားသော "
         "ဝါကျများ၊ အပိုစကားများ လုံးဝ မထည့်ပါနှင့်။ စာသားရှည်လျှင် "
-        "အသံက လေးလံပြီး ဗီဒီယိုက slow-motion ဖြစ်သွားမည်။\n"
+        "အသံက Block အတွင်း ဝင်မည်မဟုတ်ပါ။\n"
         "- မြန်မာစာလုံးပေါင်း အတိအကျ မှန်ရမည်။ မြန်မာစာအဖွဲ့၏ စံစာလုံးပေါင်း "
         "(standard Myanmar orthography) ကိုသာ သုံးပါ။ အသတ် (်)၊ ဝိသဇ္ဇနာ (း)၊ "
         "အက္ခရာတွဲများ (stacked consonants) ကို မှန်ကန်စွာ သုံးပါ။ "
@@ -339,9 +359,14 @@ def analyze_video_for_recap(
 ) -> Dict[str, Any]:
     """Analyze a video with the USER's own Gemini key; return a recap plan.
 
-    ``model`` optionally pins one model ID (tried first). Otherwise the
-    static MODEL_CANDIDATES are tried in order, then any other flash model
-    the key can access (discovered live via ``client.models.list()``).
+    AI Recap is ALWAYS full-duration (Narration Master): the prompt is
+    built from the REAL video duration, not ``target_duration``.
+    ``target_duration`` is kept only for backward compatibility and is
+    IGNORED — an 8-min video always gets a full ~8-min narration plan,
+    never a 30s cut. ``model`` optionally pins one model ID (tried
+    first). Otherwise the static MODEL_CANDIDATES are tried in order,
+    then any other flash model the key can access (discovered live via
+    ``client.models.list()``).
 
     The uploaded remote file is always deleted in a ``finally:`` block.
     """
@@ -351,15 +376,18 @@ def analyze_video_for_recap(
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Video file not found: {path}")
 
+    # Real duration FIRST — the full-duration prompt needs it.
+    metadata = get_video_metadata(path)
+    duration = metadata.get("duration") or 0
+
     client = genai.Client(api_key=api_key)
     uploaded = client.files.upload(file=path)
     try:
         _wait_for_active(client, uploaded.name)
-        prompt = _build_prompt(target_duration, style)
+        prompt = _build_prompt(duration, style)
         plan = _generate_with_fallback(
             client, uploaded, prompt, RECAP_JSON_SCHEMA, model)
-        metadata = get_video_metadata(path)
-        return validate_recap_plan(plan, metadata.get("duration") or 0)
+        return validate_recap_plan(plan, duration)
     finally:
         # Keep the user's free cloud storage clean, even on failure.
         try:
@@ -407,30 +435,57 @@ def analyze_video_pro_blocks(
 def validate_recap_plan(
     plan_dict: Dict[str, Any], video_duration: float
 ) -> Dict[str, Any]:
-    """Clamp highlight timestamps into [0, video_duration]; drop invalid ones."""
+    """Normalize highlights into a clean tiling of [0, video_duration].
+
+    AI Recap is full-duration: highlights must tile the whole video
+    (same tiling rule as validate_pro_blocks). Sorts by start, clamps
+    into range, drops empty segments, fills gaps by extending the
+    previous segment's end, cuts overlaps, forces the first segment to
+    start at 0.0 and extends the last segment to the full duration. If
+    no valid highlight survives, falls back to one [0, duration]
+    segment so the render still covers the full video.
+    """
     if not isinstance(plan_dict, dict):
         raise AnalyzerError("AI မှ ပြန်လာသော ရလဒ် ပုံစံမမှန်ပါ။")
     duration = max(0.0, float(video_duration or 0))
 
-    cleaned: List[Dict[str, Any]] = []
+    raw: List[Dict[str, Any]] = []
     for h in plan_dict.get("highlights", []) or []:
         try:
             start = float(h.get("start", 0))
             end = float(h.get("end", 0))
         except (TypeError, ValueError, AttributeError):
             continue
-        start = max(0.0, min(start, duration))
-        end = max(0.0, min(end, duration))
-        if end <= start:
+        # Preserve extra keys — only start/end/description normalize.
+        _copy = dict(h) if isinstance(h, dict) else {}
+        _copy["start"] = start
+        _copy["end"] = end
+        _copy["description"] = str(h.get("description", "")).strip()
+        raw.append(_copy)
+    raw.sort(key=lambda h: h["start"])
+
+    cleaned: List[Dict[str, Any]] = []
+    for h in raw:
+        s = max(0.0, min(h["start"], duration))
+        e = max(0.0, min(h["end"], duration))
+        if not cleaned:
+            s = 0.0  # the first segment always starts at 0
+        else:
+            prev = cleaned[-1]
+            if s > prev["end"]:
+                prev["end"] = round(s, 2)  # fill the gap: extend previous
+            s = prev["end"]  # cut any overlap
+        if e <= s:
             continue
-        cleaned.append(
-            {
-                "start": round(start, 2),
-                "end": round(end, 2),
-                "description": str(h.get("description", "")).strip(),
-            }
-        )
-    cleaned.sort(key=lambda h: h["start"])
+        _out = dict(h)
+        _out["start"] = round(s, 2)
+        _out["end"] = round(e, 2)
+        cleaned.append(_out)
+    if cleaned and cleaned[-1]["end"] < duration:
+        cleaned[-1]["end"] = round(duration, 2)
+    if not cleaned and duration > 0:
+        cleaned = [{"start": 0.0, "end": round(duration, 2),
+                    "description": ""}]
     return {
         "title": str(plan_dict.get("title", "")).strip(),
         "highlights": cleaned,
@@ -460,8 +515,13 @@ def validate_pro_blocks(
             end = float(b.get("end", 0))
         except (TypeError, ValueError, AttributeError):
             continue
-        raw.append({"start": start, "end": end,
-                    "text": str(b.get("text", "")).strip()})
+        # Preserve every extra key (audio_path / audio_len / tts_rate
+        # from prebuilt block audio) — only start/end/text normalize.
+        _copy = dict(b) if isinstance(b, dict) else {}
+        _copy["start"] = start
+        _copy["end"] = end
+        _copy["text"] = str(b.get("text", "")).strip()
+        raw.append(_copy)
     raw.sort(key=lambda b: b["start"])
 
     blocks: List[Dict[str, Any]] = []
@@ -477,8 +537,10 @@ def validate_pro_blocks(
             s = prev["end"]  # cut any overlap
         if e <= s:
             continue
-        blocks.append({"start": round(s, 2), "end": round(e, 2),
-                       "text": b["text"]})
+        _out = dict(b)
+        _out["start"] = round(s, 2)
+        _out["end"] = round(e, 2)
+        blocks.append(_out)
     if blocks and blocks[-1]["end"] < duration:
         blocks[-1]["end"] = round(duration, 2)
     return {

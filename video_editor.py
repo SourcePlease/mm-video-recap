@@ -2,12 +2,14 @@
 video_editor.py — Step 5: Video Editing, Audio Ducking & Render Module.
 
 render_recap_video(...) trims highlight clips from the source video,
-concatenates them, optionally re-times the video with setpts so it matches
-the Myanmar voiceover length, converts to 16:9 or 9:16, applies multiple
+concatenates them, converts to 16:9 or 9:16, applies multiple
 user-positioned blur boxes, ducks the original audio under the voiceover,
 and burns in Myanmar subtitles with exact (x_pct, y_pct) position + font
 size via Pillow RAQM PNG overlays (pixel-faithful Canvas WYSIWYG, correct
-Myanmar shaping) — or soft-muxes the SRT when burn-in is off.
+Myanmar shaping) — or soft-muxes the SRT when burn-in is off. The video
+speed is ALWAYS 1.0 (no setpts): AI Recap (full narration) and Pro
+(dialogue dubbing) both keep the original video timing untouched and
+fit the AUDIO to the video, never the video to the audio.
 
 No API keys are used or stored anywhere in this module.
 """
@@ -28,16 +30,11 @@ class VideoEditorError(Exception):
     """Raised for video editing / rendering failures."""
 
 
-# Pro AI Recap speed clamp (Fix 1): a block's video speed is the ratio
-# segment_duration / narration_length. Without a clamp, a long narration
-# over a short segment collapses the speed (e.g. 0.5x) into extreme
-# slow-motion and stretches the video far past the original length.
-# The clamp keeps every block's video between 0.85x and 1.25x, so the
-# whole output stays within [0.8x, 1.18x] of the original duration.
-# When the clamp binds, the narration is fitted to the clamped video
-# duration instead (atempo up to PRO_TTS_FIT_MAX, then trim).
-PRO_SPEED_MIN = 0.85
-PRO_SPEED_MAX = 1.25
+# Pro/AI audio fit: when narration is longer than its video window even
+# after the TTS rate ladder (+0% -> +10% -> +20%), the narration audio
+# is fitted to the window with atempo up to PRO_TTS_FIT_MAX, then the
+# tail is trimmed (last resort — the prompt word-cap should prevent
+# this). The VIDEO is never slowed: speed is always 1.0.
 PRO_TTS_FIT_MAX = 1.25
 
 
@@ -795,11 +792,13 @@ def _srt_timestamp(sec: float) -> str:
 
 
 def build_pro_srt(blocks: List[Dict], srt_path: str) -> Tuple[str, int]:
-    """Write synced subtitles for Pro blocks (one cue per block).
+    """Write subtitles for Pro blocks (one cue per block).
 
-    Each block carries "synced_start"/"synced_end" (cumulative block
-    VIDEO durations — the synced timeline follows the clamped video,
-    not the raw narration lengths). Returns (path, cue count).
+    Each cue uses the block's ORIGINAL dialogue window ("start"/"end"
+    — the exact time the person speaks in the source video), because
+    video speed is always 1.0 and the synced timeline IS the original
+    timeline. Falls back to "synced_start"/"synced_end" for blocks
+    that carry them instead. Returns (path, cue count).
     """
     with open(srt_path, "w", encoding="utf-8") as f:
         n = 0
@@ -807,14 +806,112 @@ def build_pro_srt(blocks: List[Dict], srt_path: str) -> Tuple[str, int]:
             text = str(b.get("text", "")).strip()
             if not text:
                 continue
+            start = b.get("start", b.get("synced_start"))
+            end = b.get("end", b.get("synced_end"))
+            if start is None or end is None:
+                continue
             n += 1
             f.write(
                 f"{n}\n"
-                f"{_srt_timestamp(b['synced_start'])} --> "
-                f"{_srt_timestamp(b['synced_end'])}\n"
+                f"{_srt_timestamp(start)} --> "
+                f"{_srt_timestamp(end)}\n"
                 f"{text}\n\n"
             )
     return srt_path, n
+
+
+def _scale_srt_timestamps(srt_path: str, scale: float, max_dur: float,
+                           out_path: str) -> str:
+    """Rewrite an SRT with all cue times multiplied by ``scale``.
+
+    Used when narration audio is atempo-fitted to the video duration:
+    the word-boundary SRT from TTS is in original-audio time, so it must
+    be scaled into video time. Cues starting at/after ``max_dur`` are
+    dropped; ends are clamped to ``max_dur``. Returns out_path.
+    """
+    cues = _parse_srt_cues(srt_path)
+    with open(out_path, "w", encoding="utf-8") as f:
+        n = 0
+        for start, end, text in cues:
+            ns = start * scale
+            ne = end * scale
+            if ns >= max_dur - 1e-6:
+                continue
+            ne = min(ne, max_dur)
+            if ne <= ns:
+                continue
+            n += 1
+            f.write(f"{n}\n{_srt_timestamp(ns)} --> "
+                    f"{_srt_timestamp(ne)}\n{text}\n\n")
+    return out_path
+
+
+def fit_audio_to_duration(audio_path: str, srt_path: Optional[str],
+                          target_dur: float,
+                          work_dir: str) -> Tuple[str, Optional[str], Dict]:
+    """Fit a voiceover to exactly ``target_dur`` seconds (video stays 1.0x).
+
+    - Audio shorter than target: pad with silence (apad) to target.
+      SRT is unchanged (cues stay in their original positions).
+    - Audio longer than target: atempo to fit (factor up to
+      PRO_TTS_FIT_MAX), SRT timestamps scaled by 1/factor. If the
+      factor would exceed PRO_TTS_FIT_MAX, atempo at the max and trim
+      the tail to target (last resort), SRT scaled by 1/max then cut.
+    - Within 0.1s: return the originals untouched.
+
+    Returns (fitted_audio_path, fitted_srt_path_or_None, fit_info).
+    The fitted files live in ``work_dir``; the caller keeps the final
+    video + SRT, so these intermediates are cleaned up with the run.
+    """
+    target = max(0.0, float(target_dur))
+    if target <= 0:
+        raise VideoEditorError("fit target duration must be > 0.")
+    audio_len = _media_duration(audio_path)
+    if abs(audio_len - target) < 0.1:
+        return audio_path, srt_path, {"method": "none",
+                                       "audio_len": round(audio_len, 3),
+                                       "target": round(target, 3)}
+    os.makedirs(work_dir, exist_ok=True)
+    if audio_len < target:
+        fitted = os.path.join(work_dir, "voiceover_fitted.mp3")
+        _run(["ffmpeg", "-y", "-v", "error", "-i", audio_path,
+              "-af", f"apad,atrim=0:{target:.3f}",
+              "-c:a", "libmp3lame", "-q:a", "4", fitted],
+             "pad voiceover to video duration")
+        return fitted, srt_path, {"method": "pad",
+                                   "audio_len": round(audio_len, 3),
+                                   "target": round(target, 3)}
+    # Longer: atempo (then trim if the factor would exceed the max).
+    factor = audio_len / target
+    if factor <= PRO_TTS_FIT_MAX:
+        fitted = os.path.join(work_dir, "voiceover_fitted.mp3")
+        _run(["ffmpeg", "-y", "-v", "error", "-i", audio_path,
+              "-af", f"atempo={factor:.4f}",
+              "-c:a", "libmp3lame", "-q:a", "4", fitted],
+             "atempo voiceover to video duration")
+        fitted_srt = srt_path
+        if srt_path and os.path.isfile(srt_path):
+            scaled = os.path.join(work_dir, "subtitles_fitted.srt")
+            fitted_srt = _scale_srt_timestamps(srt_path, 1.0 / factor,
+                                               target, scaled)
+        return fitted, fitted_srt, {"method": "atempo",
+                                     "factor": round(factor, 4),
+                                     "audio_len": round(audio_len, 3),
+                                     "target": round(target, 3)}
+    fitted = os.path.join(work_dir, "voiceover_fitted.mp3")
+    _run(["ffmpeg", "-y", "-v", "error", "-i", audio_path,
+          "-af", f"atempo={PRO_TTS_FIT_MAX:.4f},atrim=0:{target:.3f}",
+          "-c:a", "libmp3lame", "-q:a", "4", fitted],
+         "atempo+trim voiceover to video duration")
+    fitted_srt = srt_path
+    if srt_path and os.path.isfile(srt_path):
+        scaled = os.path.join(work_dir, "subtitles_fitted.srt")
+        fitted_srt = _scale_srt_timestamps(srt_path, 1.0 / PRO_TTS_FIT_MAX,
+                                           target, scaled)
+    return fitted, fitted_srt, {"method": "atempo_trim",
+                                 "factor": round(factor, 4),
+                                 "audio_len": round(audio_len, 3),
+                                 "target": round(target, 3)}
 
 
 def _media_duration(path: str) -> float:
@@ -1095,28 +1192,25 @@ def render_pro_recap_video(
     # fills 0.40–1.0 — both measured from ffmpeg's -progress output.
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict:
-    """Render a Pro AI Recap video (dialogue video, Step 15).
+    """Render a Pro AI Recap video (dialogue dubbing, Step 15).
 
     pro_blocks: [{"start","end","text","audio_path"}, ...] — sequential
-    blocks tiling the source. Each block's own video segment is
-    re-timed with its OWN setpts so its duration matches its block TTS
-    audio length — with the speed CLAMPED to [0.85, 1.25] (Fix 1), so a
-    long narration can never drag a block into extreme slow-motion or
-    stretch the output far past the original length. When the clamp
-    binds, the narration is fitted to the clamped video duration
-    (atempo, then trim) and the synced timeline follows the video
-    durations. Then the blocks are concatenated. Subtitles are rebuilt
-    from the blocks on the SYNCED timeline (cumulative video
-    durations), not the source timeline.
-
-    The same visual chain as the recap render applies to the concatenated
-    result: copyright filters FIRST (source-frame stage), then aspect/fit,
-    then blur boxes, then subtitles. srt_path is the path the rebuilt
-    synced SRT is written to (default: work_dir/pro_subtitles.srt).
+    blocks tiling the source. Video speed is ALWAYS 1.0 (No Cuts, no
+    setpts, no slow-motion): each block's video segment keeps its
+    ORIGINAL duration, and the block narration is fitted to that
+    dialogue window (TTS rate ladder in tts_manager, then atempo up to
+    PRO_TTS_FIT_MAX, then trim as a last resort; shorter narration is
+    silence-padded). The synced timeline IS the original block timeline
+    (synced_start = start, synced_end = end), so subtitles appear
+    exactly when the person speaks. Blocks are concatenated, then the
+    same visual chain as the recap render applies: copyright filters
+    FIRST (source-frame stage), then aspect/fit, then blur boxes, then
+    subtitles. srt_path is the path the rebuilt SRT is written to
+    (default: work_dir/pro_subtitles.srt).
 
     Result keys: video_path, subtitle_mode, aspect_ratio,
     processing_mode ("pro_ai_recap"), blocks (with synced_start/end +
-    speed), duration, width, height, has_audio, blur_boxes_applied,
+    speed 1.0), duration, width, height, has_audio, blur_boxes_applied,
     subtitle_position, copyright_applied, fit_mode, srt_path.
     """
     if aspect_ratio not in ("original", "16:9", "9:16", "1:1", "4:5"):
@@ -1170,15 +1264,14 @@ def render_pro_recap_video(
         # 1) trim the block segments (re-encoded, like the recap path)
         seg_paths = _trim_segments(source_video_path, blocks, seg_dir)
 
-        # 2) per-block independent speed sync + audio mix.
-        # Speed is CLAMPED to [PRO_SPEED_MIN, PRO_SPEED_MAX]: without
-        # the clamp a long narration over a short segment would drag
-        # the video into extreme slow-motion (e.g. 0.5x) and stretch
-        # the output far past the original length. When the clamp
-        # binds, the narration is fitted to the clamped video duration
-        # (atempo up to PRO_TTS_FIT_MAX, then trim the tail) and the
-        # synced timeline follows the VIDEO durations, not the raw
-        # narration lengths — so concat never drifts.
+        # 2) per-block audio mix — video speed is ALWAYS 1.0 (no
+        # setpts, no slow-motion). Each block's video keeps its
+        # ORIGINAL duration; the narration is fitted to that dialogue
+        # window (TTS rate ladder already tried in tts_manager; here
+        # atempo up to PRO_TTS_FIT_MAX, then trim, is the last resort;
+        # shorter narration is silence-padded). The synced timeline
+        # IS the original block timeline, so concat never drifts and
+        # subtitles land exactly on the dialogue.
         synced: List[Dict] = []
         block_outs: List[str] = []
         cum = 0.0
@@ -1191,10 +1284,9 @@ def render_pro_recap_video(
                 raise VideoEditorError(
                     f"Pro block {i} audio duration is 0.")
             out = os.path.join(block_dir, f"block_{i:03d}.mp4")
-            raw_speed = seg_dur / audio_len
-            speed = min(PRO_SPEED_MAX, max(PRO_SPEED_MIN, raw_speed))
-            video_dur = seg_dur / speed
-            # Fit the block narration to the clamped video duration.
+            speed = 1.0
+            video_dur = seg_dur
+            # Fit the block narration to the ORIGINAL dialogue window.
             if audio_len > video_dur + 1e-3:
                 fit_factor = audio_len / video_dur
                 if fit_factor <= PRO_TTS_FIT_MAX:
@@ -1210,15 +1302,15 @@ def render_pro_recap_video(
                 tts_fit = "anull"
             if seg_meta["has_audio"]:
                 fc = (
-                    f"[0:v]setpts=PTS/{speed:.4f}[v];"
-                    f"[0:a]{_atempo_chain(speed)},volume={bg_volume}[bg];"
+                    f"[0:v]null[v];"
+                    f"[0:a]anull,volume={bg_volume}[bg];"
                     f"[1:a]{tts_fit},aresample=44100[tts];"
                     f"[bg][tts]amix=inputs=2:duration=shortest:"
                     f"dropout_transition=0:normalize=0,"
                     f"alimiter=limit=0.95,aresample=44100[a]"
                 )
             else:
-                fc = (f"[0:v]setpts=PTS/{speed:.4f}[v];"
+                fc = (f"[0:v]null[v];"
                       f"[1:a]{tts_fit},aresample=44100[a]")
             _n_blocks = len(blocks)
 
@@ -1239,20 +1331,24 @@ def render_pro_recap_video(
                 _block_cb if on_progress is not None else None,
             )
             block_outs.append(out)
+            # Synced timeline = ORIGINAL dialogue window (speed is 1.0,
+            # so cumulative video durations equal the original starts
+            # up to trim rounding — but subtitles must land EXACTLY on
+            # the dialogue, so record the original start/end).
             synced.append({
                 **b,
                 "speed": round(speed, 4),
                 "audio_len": round(audio_len, 3),
                 "video_dur": round(video_dur, 3),
-                "synced_start": round(cum, 3),
-                "synced_end": round(cum + video_dur, 3),
+                "synced_start": round(b["start"], 3),
+                "synced_end": round(b["end"], 3),
             })
             cum += video_dur
 
-        # 3) concatenate the synced blocks (video + audio)
+        # 3) concatenate the blocks (video + audio)
         concat_path = _concat_segments(block_outs, block_dir)
 
-        # 4) rebuilt subtitles on the SYNCED timeline
+        # 4) rebuilt subtitles on the ORIGINAL dialogue timeline
         build_pro_srt(synced, srt_path)
 
         # 5) visual chain on the concatenated result

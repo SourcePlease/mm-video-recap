@@ -348,7 +348,6 @@ if "demo_suppressed" not in st.session_state:
 # so the canvas preview sees them on the very first run too).
 _STEP16_DEFAULTS = {
     "processing_mode": "ai_recap",
-    "recap_duration": 60,
     "aspect_ratio": "9:16",
     "fit_mode": "crop",
     "crop_align": "center",
@@ -634,7 +633,8 @@ def _run_pipeline_job(job: Dict) -> None:
             video_path=snap["src_path"],
             video_url=snap["src_url"],
             user_api_key=snap["key"] or None,
-            target_duration=snap["recap_duration"],
+            # No target_duration: AI Recap is always full-duration
+            # (pipeline ignores target_duration; see pipeline.py).
             voice_name=snap["voice_name"],
             processing_mode=snap["processing_mode"],
             aspect_ratio=snap["aspect_ratio"],
@@ -1155,23 +1155,10 @@ with tab_src:
         label_visibility="collapsed",
     )
 
-    # ---- Duration Pills (AI Recap only; Pro ignores it — full video) ----
-    st.markdown("### Duration (AI Recap)")
-    st.pills(
-        "Duration",
-        options=[30, 60, 90, 180],
-        format_func=lambda d: {
-            30: "30s (Shorts)",
-            60: "60s (1 min)",
-            90: "90s (1.5 min)",
-            180: "180s (3 min)",
-        }[d],
-        key="recap_duration",
-        label_visibility="collapsed",
-    )
-    st.caption(
-        "AI Recap အတွက်သာ — Pro AI Recap က ဗီဒီယိုအပြည့်ကို ပြန်ဆိုတယ်။"
-    )
+    # NOTE: No duration selector — AI Recap is ALWAYS the full original
+    # duration (Narration Master concept: never cut an 8-min video to
+    # 30s). The old 30/60/90/180 pills were removed because they
+    # contradicted the full-duration spec. Pro is full-duration too.
 
     # ---- Step 16: Aspect Ratio (5 pills) + Fit Mode (2 pills) ----
     st.markdown("### Aspect Ratio")
@@ -1484,8 +1471,6 @@ if run_btn and not _run_blocked:
         # tab's 5-way pill selector, not the old Advanced radio).
         "processing_mode": str(
             st.session_state.get("processing_mode", "ai_recap")),
-        "recap_duration": int(
-            st.session_state.get("recap_duration", 60)),
         "aspect_ratio": str(
             st.session_state.get("aspect_ratio", "9:16")),
         "fit_mode": str(st.session_state.get("fit_mode", "crop")),

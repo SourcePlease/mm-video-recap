@@ -149,14 +149,28 @@ def generate_block_voiceovers(
     audio. A block with empty text gets 0.5s of silence so it still has
     an audio length for the sync math.
 
-    Dynamic rate (Fix 1): a block's narration must fit its own video
-    segment, or the Pro render has to slow the video down (slow-motion).
-    If the first synthesis at the base ``rate`` runs longer than the
-    block, the block is re-synthesized once at "+20%" and the shorter
-    audio is kept. Returns the blocks with "audio_path" + "audio_len"
-    (seconds) + "tts_rate" (the rate actually used) added.
+    Rate ladder (Pro dubbing concept): the VIDEO is never slowed —
+    speed is always 1.0 — so the narration must fit its own dialogue
+    window. If synthesis at the base ``rate`` runs longer than the
+    block, retry faster in steps (+10%, then +20%) and keep the first
+    audio that fits the window. Only rates faster than (or equal to)
+    the base rate are tried. Returns the blocks with "audio_path" +
+    "audio_len" (seconds) + "tts_rate" (the rate actually used) added.
     """
     os.makedirs(out_dir, exist_ok=True)
+
+    def _rate_value(r: str) -> int:
+        try:
+            return int(str(r).strip().rstrip("%"))
+        except ValueError:
+            return 0
+
+    _base_val = _rate_value(rate)
+    _ladder: List[str] = []
+    for _r in (rate, "+10%", "+20%"):
+        if _rate_value(_r) >= _base_val and _r not in _ladder:
+            _ladder.append(_r)
+
     out: List[Dict] = []
     for i, b in enumerate(blocks):
         ap = b.get("audio_path")
@@ -167,23 +181,24 @@ def generate_block_voiceovers(
             ap = os.path.join(out_dir, f"block_{i:03d}.mp3")
             text = str(b.get("text", "")).strip()
             if text:
-                audio_len = generate_burmese_voiceover(
-                    text, ap, None,
-                    voice_name=voice_name, rate=rate, proxy=proxy,
-                )
-                # Too long for its own segment -> retry faster once.
                 try:
                     block_dur = float(b.get("end", 0)) - float(b.get("start", 0))
                 except (TypeError, ValueError):
                     block_dur = 0.0
-                if block_dur > 0 and audio_len > block_dur and rate != "+20%":
-                    retry_len = generate_burmese_voiceover(
+                audio_len = 0.0
+                for _try_rate in _ladder:
+                    audio_len = generate_burmese_voiceover(
                         text, ap, None,
-                        voice_name=voice_name, rate="+20%", proxy=proxy,
+                        voice_name=voice_name, rate=_try_rate, proxy=proxy,
                     )
-                    if retry_len < audio_len:
-                        audio_len = retry_len
-                        used_rate = "+20%"
+                    used_rate = _try_rate
+                    # Fits the dialogue window — stop, keep this audio.
+                    if block_dur <= 0 or audio_len <= block_dur:
+                        break
+                    # Too long: loop tries the next faster rate. The
+                    # render's atempo fit is the last resort if even
+                    # +20% does not fit (prompt word-cap should prevent
+                    # this for well-formed blocks).
             else:
                 proc = subprocess.run(
                     ["ffmpeg", "-y", "-v", "error",
@@ -209,6 +224,12 @@ def sync_highlights_with_audio(
     source_video_duration: float,
 ) -> Dict:
     """Align highlight clips with the voiceover duration.
+
+    LEGACY — the pipeline no longer calls this: AI Recap (full narration)
+    and Pro (dialogue dubbing) both keep video speed at exactly 1.0 and
+    fit the AUDIO to the video (TTS rate ladder + atempo/pad), never the
+    video to the audio. Kept as a public utility for callers that still
+    need clip/audio alignment.
 
     Strategy (က): proportionally stretch/shrink each clip's ``end`` (keeping
     ``start`` fixed) so the clips' total duration matches ``audio_duration`` —

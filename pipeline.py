@@ -27,14 +27,19 @@ from ai_analyzer import (
     analyze_video_pro_blocks,
     generate_mock_pro_plan,
     generate_mock_recap_plan,
+    validate_pro_blocks,
+    validate_recap_plan,
 )
 from tts_manager import (
     generate_block_voiceovers,
     generate_burmese_voiceover,
     measure_audio_duration,
-    sync_highlights_with_audio,
 )
-from video_editor import render_pro_recap_video, render_recap_video
+from video_editor import (
+    fit_audio_to_duration,
+    render_pro_recap_video,
+    render_recap_video,
+)
 
 
 class PipelineError(Exception):
@@ -89,11 +94,16 @@ def run_full_recap_pipeline(
     prebuilt voiceover assets instead of re-running TTS.
     tts_proxy is dev-VM only; production leaves it as None.
 
-    processing_mode: "ai_recap" (default, narration recap — audio is
-    master) or "pro_ai_recap" (dialogue video — sequential blocks, each
-    block speed-synced independently; voiceover_path/srt_path are ignored
-    for Pro because every block carries its own audio; pass a plan whose
-    blocks already have "audio_path" to reuse prebuilt block audio).
+    processing_mode: "ai_recap" (default, Narration Master — FULL
+    original duration, narration over the full footage, video speed
+    always 1.0, audio fitted to the video) or "pro_ai_recap" (dialogue
+    dubbing — sequential blocks, video speed always 1.0, each block's
+    narration fitted to its own dialogue window; voiceover_path/srt_path
+    are ignored for Pro because every block carries its own audio; pass
+    a plan whose blocks already have "audio_path" to reuse prebuilt
+    block audio).
+    ``target_duration`` is DEPRECATED and IGNORED — AI Recap is always
+    the full video duration, never a short cut.
     fit_mode / crop_align / inner_scale / vertical_pos / horizontal_pos /
     mirror_horizontal / copyright_zoom / random_crop_offset are the
     Source-tab engine options (Step 15); defaults preserve the old output.
@@ -127,24 +137,31 @@ def run_full_recap_pipeline(
         uploaded_file_path=video_path, video_url=video_url, work_dir=work_dir
     )
 
-    # 2) recap plan (live AI or mock / prebuilt) — mode-aware
+    # 2) recap plan (live AI or mock / prebuilt) — mode-aware.
+    # Plans are re-validated here so even a directly-passed plan gets
+    # the tiling guarantee (highlights/blocks cover [0, duration]).
     _report("analyze", 0.0, "AI က ဗီဒီယို စိစစ်နေသည်…")
+    _video_dur = metadata["duration"] or 0
     if plan is None:
         if processing_mode == "pro_ai_recap":
             if use_mock_plan:
-                plan = generate_mock_pro_plan(metadata["duration"] or 0)
+                plan = generate_mock_pro_plan(_video_dur)
             else:
                 plan = analyze_video_pro_blocks(
                     local_path, user_api_key, model=model)
         else:
             if use_mock_plan:
-                plan = generate_mock_recap_plan(metadata["duration"] or 0)
+                plan = generate_mock_recap_plan(_video_dur)
             else:
                 plan = analyze_video_for_recap(
                     local_path, user_api_key,
                     target_duration=target_duration, style=style,
                     model=model,
                 )
+    if processing_mode == "pro_ai_recap":
+        plan = validate_pro_blocks(plan, _video_dur)
+    else:
+        plan = validate_recap_plan(plan, _video_dur)
     _report("analyze", 1.0, "AI စိစစ်မှု ပြီးပါပြီ")
     title = plan.get("title", "")
 
@@ -214,23 +231,47 @@ def run_full_recap_pipeline(
             "fit_mode": render.get("fit_mode"),
         }
     else:
+        # AI Recap = Narration Master, FULL duration. The narration
+        # covers the whole video; the video keeps its ORIGINAL timing
+        # (speed 1.0, no cuts); the AUDIO is fitted to the video.
         script_text = plan.get("burmese_script", "")
         if not script_text.strip():
             raise PipelineError("burmese_script သည် အလွတ်ဖြစ်နေပါသည်။")
+        highlights = plan.get("highlights", []) or []
+        if not highlights:
+            highlights = [{"start": 0.0, "end": float(_video_dur),
+                           "description": ""}]
 
-        # 3) voiceover + subtitles (single Edge-TTS call: no
-        # sub-progress — report phase start/end only).
-        auto_assets = False
-        if voiceover_path is None:
-            auto_assets = True
+        # 3) voiceover + subtitles. TTS rate ladder (same idea as Pro):
+        # if the narration is longer than the video, retry faster
+        # (+10%, then +20%) so the video never has to wait/slow.
+        # Single-voiceover TTS reports phase start/end only, and only
+        # when it actually synthesizes (prebuilt voiceover skips TTS,
+        # preserving the ["analyze", "render"] phase contract).
+        _tts_rate_used = rate
+        _auto_assets = voiceover_path is None
+        if _auto_assets:
+            _report("tts", 0.0, "မြန်မာအသံ ထုတ်နေသည်…")
             voiceover_path = os.path.join(output_dir, "voiceover.mp3")
             auto_srt = os.path.join(output_dir, "subtitles.srt")
-            _report("tts", 0.0, "မြန်မာအသံ ထုတ်နေသည်…")
-            audio_duration = generate_burmese_voiceover(
-                script_text, voiceover_path, auto_srt,
-                voice_name=voice_name, rate=rate, proxy=tts_proxy,
-            )
-            _report("tts", 1.0, "အသံ ထုတ်တာ ပြီးပါပြီ")
+            _ladder = []
+            for _r in (rate, "+10%", "+20%"):
+                try:
+                    _v = int(str(_r).strip().rstrip("%"))
+                    _base = int(str(rate).strip().rstrip("%"))
+                except ValueError:
+                    _v, _base = 0, 0
+                if _v >= _base and _r not in _ladder:
+                    _ladder.append(_r)
+            audio_duration = 0.0
+            for _try_rate in _ladder:
+                audio_duration = generate_burmese_voiceover(
+                    script_text, voiceover_path, auto_srt,
+                    voice_name=voice_name, rate=_try_rate, proxy=tts_proxy,
+                )
+                _tts_rate_used = _try_rate
+                if _video_dur <= 0 or audio_duration <= _video_dur:
+                    break
             srt_path = auto_srt
         else:
             if not os.path.isfile(voiceover_path):
@@ -240,23 +281,26 @@ def run_full_recap_pipeline(
             if audio_duration <= 0:
                 raise PipelineError(
                     "voiceover အသံဖိုင် ကြာချိန် တိုင်းတာ၍ မရပါ။")
+        if _auto_assets:
+            _report("tts", 1.0, "အသံ ထုတ်တာ ပြီးပါပြီ")
 
-        # 4) timing sync
-        sync = sync_highlights_with_audio(
-            plan.get("highlights", []), audio_duration,
-            metadata["duration"] or 0)
+        # 4) fit the AUDIO to the full video duration (video stays 1.0x):
+        # pad silence if shorter; atempo (+ scaled SRT) if longer.
+        fitted_audio, fitted_srt, audio_fit = fit_audio_to_duration(
+            voiceover_path, srt_path, _video_dur, work_dir)
 
-        # 5) render
+        # 5) render — full footage (highlights tile the whole video),
+        # video speed exactly 1.0, narration as master.
         final_path = os.path.join(output_dir, output_name)
         _report("render", 0.0, "ဗီဒီယို ပေါင်းနေသည်…")
         render = render_recap_video(
             local_path,
-            sync["highlights"],
-            voiceover_path,
-            srt_path=srt_path if burn_subtitles else None,
+            highlights,
+            fitted_audio,
+            srt_path=fitted_srt if burn_subtitles else None,
             output_path=final_path,
             aspect_ratio=aspect_ratio,
-            video_speed_factor=sync["video_speed_factor"],
+            video_speed_factor=1.0,
             bg_volume=bg_volume,
             work_dir=work_dir,
             blur_boxes=blur_boxes,
@@ -273,7 +317,7 @@ def run_full_recap_pipeline(
                 "render", f, "ဗီဒီယို ပေါင်းနေသည်…"),
         )
         _report("render", 1.0, "ဗီဒီယို ပေါင်းတာ ပြီးပါပြီ")
-        final_srt = render.get("sidecar_srt") or srt_path
+        final_srt = render.get("sidecar_srt") or fitted_srt
         result = {
             "final_video_path": render["video_path"],
             "srt_path": final_srt,
@@ -287,14 +331,16 @@ def run_full_recap_pipeline(
                 "file_size_mb": render["file_size_mb"],
             },
             "subtitle_mode": render["subtitle_mode"],
-            "sync_method": sync["method"],
-            "video_speed_factor": sync["video_speed_factor"],
+            "sync_method": "full_narration",
+            "video_speed_factor": 1.0,
             "aspect_ratio": aspect_ratio,
             "processing_mode": "ai_recap",
             "blur_boxes_applied": render.get("blur_boxes_applied", 0),
             "subtitle_position": render.get("subtitle_position"),
             "copyright_applied": render.get("copyright_applied"),
             "fit_mode": render.get("fit_mode"),
+            "tts_rate": _tts_rate_used,
+            "audio_fit": audio_fit,
         }
 
     # 6) cleanup temp fragments (keep final video + srt + voiceover)
