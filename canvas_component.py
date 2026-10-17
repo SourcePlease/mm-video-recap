@@ -453,6 +453,13 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     cachedMetaFor: null,
     metaProbePromise: null,
     metaFailedFor: null,
+    /* v1.5: WHY the pick-time probe failed (null on success) — the
+       probe used to swallow its FFmpeg exception, so a Run that
+       found an empty cache could only show the generic metadata
+       error while the canvas still displayed 8:04 from the
+       element's own duration. The Run-time gate now surfaces this
+       reason instead. */
+    metaProbeError: null,
     /* Gemini upload result awaiting Python's ack (args.gemini_ack).
        The component value can be overwritten by a later sendValue
        (e.g. a font ack) before Python's rerun reads it — the result
@@ -563,6 +570,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     S.cachedMetaFor = null;
     S.metaProbePromise = null;
     S.metaFailedFor = null;
+    S.metaProbeError = null;
     S.geminiResultPending = null;
     hideResultBar();
     if (S.resultBlobUrl) {
@@ -1318,6 +1326,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     S.cachedMeta = null;
     S.cachedMetaFor = null;
     S.metaFailedFor = null;
+    S.metaProbeError = null;
     S.metaProbePromise = (async function () {
       /* 1) Duration from the <video> element. NEVER attach a
          loadedmetadata listener without checking the element's
@@ -1404,9 +1413,20 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
               width: fm.width, height: fm.height,
             };
           }
-        } catch (e) { /* FFmpeg unavailable — fail fast below */ }
+        } catch (e) {
+          /* v1.5: record WHY (was swallowed) — the Run-time gate
+             surfaces this reason instead of the generic message. */
+          S.metaProbeError = "FFmpeg header probe: "
+            + String((e && e.message) || e);
+        }
       }
       if (!meta) {
+        if (!S.metaProbeError) {
+          S.metaProbeError = "element gave no metadata"
+            + (_hybridProbe
+               ? " and FFmpeg header probe gave none either"
+               : " (FFmpeg fallback is Hybrid-only)");
+        }
         S.metaFailedFor = vid;
         S.metaProbePromise = null;
         return null;
@@ -1423,7 +1443,11 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
             meta.width = dims.width;
             meta.height = dims.height;
           }
-        } catch (e) { /* FFmpeg unavailable — fall through */ }
+        } catch (e) {
+          /* v1.5: record WHY (was swallowed). */
+          S.metaProbeError = "FFmpeg header probe: "
+            + String((e && e.message) || e);
+        }
       }
       var _dimsOk = _hybridProbe
         ? (meta.width > 0 && meta.height > 0)
@@ -1432,14 +1456,50 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
           && isFinite(meta.duration) && meta.duration > 0) {
         S.cachedMeta = meta;
         S.cachedMetaFor = vid;
+        S.metaProbeError = null;
         S.metaProbePromise = null;
         return meta;
+      }
+      if (!S.metaProbeError) {
+        S.metaProbeError =
+          "dims missing after element + FFmpeg probe";
       }
       S.metaFailedFor = vid;
       S.metaProbePromise = null;
       return null;
     })();
     return S.metaProbePromise;
+  }
+
+  /* Run-time metadata gate (v1.5): the Run uses the SAME cached
+     pick-time probe result — never re-probes with an element-only
+     path, never requires element dims. If the pick-time probe
+     failed (cache empty — its FFmpeg fallback may have hit a
+     transient CDN blip), retry the FULL probe once before failing:
+     the retry re-runs element fast path + FFmpeg header fallback.
+     On final failure the error carries the recorded probe reason
+     (S.metaProbeError), so the user sees WHY instead of the generic
+     metadata message. Fails fast BEFORE the Gemini upload. */
+  async function getRunMeta() {
+    if (S.metaProbePromise) {
+      try { await S.metaProbePromise; } catch (e) { /* use cache */ }
+    }
+    var meta = (S.cachedMetaFor === S.videoId) ? S.cachedMeta : null;
+    if (!meta) {
+      /* Pick-time probe failed — retry the FULL probe once. */
+      try { await probeMetaAtPick(S.videoId); }
+      catch (e) { /* use cache */ }
+      meta = (S.cachedMetaFor === S.videoId) ? S.cachedMeta : null;
+    }
+    if (!meta) {
+      var _reason = S.metaProbeError
+        ? " (" + S.metaProbeError + ")" : "";
+      throw new Error(
+        "ဒီ video ရဲ့ metadata ကို browser က ဖတ်မရပါ" + _reason
+        + " — Server ပုံစံနဲ့ စမ်းကြည့်ပေးပါ "
+        + "(ဒါမှမဟုတ် တခြား video ရွေးပေးပါ)။");
+    }
+    return meta;
   }
 
   /* Resumable upload of the picked file DIRECTLY to the Gemini Files
@@ -1985,12 +2045,14 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
        args.gemini_upload_request (fresh nonce per Run). The video
        goes DIRECTLY to Gemini — never to Streamlit.
        Metadata comes ONLY from the pick-time cache (probeMetaAtPick)
-       — never re-probed after the upload: the old post-upload probe
-       timed out on HEVC / re-picked videos and killed the Run AFTER
-       a successful upload. If the cache is empty, fail fast BEFORE
-       the upload. The result is sticky (geminiResultPending) until
-       Python acks it via args.gemini_ack — a later sendValue must
-       never silently lose it. */
+       via getRunMeta — never re-probed after the upload: the old
+       post-upload probe timed out on HEVC / re-picked videos and
+       killed the Run AFTER a successful upload. If the cache is
+       empty, getRunMeta retries the FULL probe once, then fails
+       fast BEFORE the upload (with the recorded probe reason).
+       The result is sticky (geminiResultPending) until Python acks
+       it via args.gemini_ack — a later sendValue must never
+       silently lose it. */
     if (S.args.gemini_upload_request != null
         && S.args.gemini_upload_request !== S.geminiUploadServedNonce
         && S.localPicked && S.videoId && !S.expectRemove
@@ -2005,18 +2067,11 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
             throw new Error(
               "ဗီဒီယို file ကို browser ထဲမှာ မတွေ့ပါ — ဗီဒီယို ပြန်ရွေးပေးပါ။");
           }
-          /* Wait out a still-running pick-time probe, then use ONLY
-             the cache. */
-          if (S.metaProbePromise) {
-            try { await S.metaProbePromise; } catch (e) { /* use cache */ }
-          }
-          var meta = (S.cachedMetaFor === S.videoId) ? S.cachedMeta : null;
-          if (!meta) {
-            throw new Error(
-              "ဒီ video ရဲ့ metadata ကို browser က ဖတ်မရပါ — "
-              + "Server ပုံစံနဲ့ စမ်းကြည့်ပေးပါ "
-              + "(ဒါမှမဟုတ် တခြား video ရွေးပေးပါ)။");
-          }
+          /* v1.5: Run-time metadata gate (getRunMeta) — use the
+             SAME cached pick-time probe result; if the pick-time
+             probe failed, retry the FULL probe once, and surface
+             the recorded probe reason on final failure. */
+          var meta = await getRunMeta();
           /* Fail fast BEFORE the Gemini upload if browser-side
              FFmpeg cannot load (CDN / Worker): the device encode
              would fail after the upload anyway. loadFFmpeg() is
@@ -2128,6 +2183,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.cachedMetaFor = null;
       S.metaProbePromise = null;
       S.metaFailedFor = null;
+      S.metaProbeError = null;
       S.geminiResultPending = null;
       hideResultBar();
       S.boxes = [];
