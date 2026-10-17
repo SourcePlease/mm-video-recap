@@ -122,6 +122,32 @@ def _fill_blocks_by_overlap(blocks, filled_blocks) -> int:
     return _filled
 
 
+def _find_underfilled_blocks(blocks, threshold: float = 0.60) -> List[tuple]:
+    """Find Pro blocks whose audio is too short for their window.
+
+    Coverage fix v3: a block with non-empty text can still render
+    mostly silence if its text is too brief for its window (the old
+    Pro prompt pushed Gemini toward very brief text). A block is
+    under-filled when its measured audio is < ``threshold`` of its
+    window duration. Empty-text blocks are NOT under-filled here —
+    the empty-block fill handles them separately. Returns a list of
+    (start, end) window tuples.
+    """
+    _under = []
+    for _b in blocks:
+        if not str(_b.get("text", "")).strip():
+            continue
+        try:
+            _ws = float(_b.get("start", 0))
+            _we = float(_b.get("end", 0))
+            _al = float(_b.get("audio_len", 0))
+        except (TypeError, ValueError):
+            continue
+        if (_we - _ws) > 0 and _al < threshold * (_we - _ws):
+            _under.append((_ws, _we))
+    return _under
+
+
 def _renumber_srt(srt_path: str) -> str:
     """Re-sequence cue numbers 1..N in place.
 
@@ -384,6 +410,60 @@ def run_full_recap_pipeline(
             voice_name=voice_name, rate=rate, proxy=tts_proxy,
             on_progress=lambda f: _report(
                 "tts", f, "မြန်မာအသံ ထုတ်နေသည်…"))
+        # Coverage fix v3 — Pro under-filled detection: a block can
+        # have non-empty text yet still render mostly silence, because
+        # the Pro prompt used to push Gemini toward very brief text
+        # ("အလွန်တိုတို"). After the first TTS pass, flag blocks
+        # whose measured audio is <60% of their window as
+        # under-filled, ask Gemini once for expanded narration for
+        # exactly those windows, and re-synthesize only the updated
+        # blocks. The empty-block fill above handles blocks with NO
+        # text; this handles blocks with TOO-SHORT text.
+        _pro_fill_status = {"underfilled_found": 0, "filled": 0,
+                            "unmatched": 0, "error": None}
+        if _live_ai_plan:
+            _under = _find_underfilled_blocks(blocks, 0.60)
+            _pro_fill_status["underfilled_found"] = len(_under)
+            if _under:
+                try:
+                    _exp_blocks = []
+                    for _i in range(0, len(_under), PRO_FILL_BATCH):
+                        try:
+                            _exp = analyze_video_pro_fill(
+                                local_path, user_api_key,
+                                _under[_i:_i + PRO_FILL_BATCH],
+                                model=model)
+                            _exp_blocks.extend(
+                                _exp.get("blocks", []) or [])
+                        except Exception:
+                            continue
+                    # Snapshot text before overlap fill, so we know
+                    # which blocks actually got expanded text.
+                    _before = [str(_b.get("text", "")) for _b in blocks]
+                    _n_filled = _fill_blocks_by_overlap(
+                        blocks, _exp_blocks)
+                    _pro_fill_status["filled"] = _n_filled
+                    _pro_fill_status["unmatched"] = max(
+                        0, len(_under) - _n_filled)
+                    if _n_filled > 0:
+                        # Clear audio_path for blocks whose text
+                        # changed, so the second TTS pass re-synthesizes
+                        # only those (blocks with an existing audio_path
+                        # are measured, not re-synthesized).
+                        for _j, _b in enumerate(blocks):
+                            if str(_b.get("text", "")) != _before[_j]:
+                                _b.pop("audio_path", None)
+                                _b.pop("audio_len", None)
+                        blocks = generate_block_voiceovers(
+                            blocks,
+                            os.path.join(work_dir, "block_audio"),
+                            voice_name=voice_name, rate=rate,
+                            proxy=tts_proxy,
+                            on_progress=lambda f: _report(
+                                "tts", f,
+                                "မြန်မာအသံ ထပ်ထုတ်နေသည်…"))
+                except Exception as _e:
+                    _pro_fill_status["error"] = str(_e)[:200]
         script_text = plan.get("burmese_script", "") or " ".join(
             str(b.get("text", "")) for b in blocks).strip()
         sync = None
@@ -440,6 +520,7 @@ def run_full_recap_pipeline(
             "video_speed_factor": None,
             "aspect_ratio": aspect_ratio,
             "processing_mode": "pro_ai_recap",
+            "pro_fill_status": _pro_fill_status,
             "blocks": render.get("blocks"),
             "blur_boxes_applied": render.get("blur_boxes_applied", 0),
             "subtitle_position": render.get("subtitle_position"),
@@ -510,6 +591,17 @@ def run_full_recap_pipeline(
         # append its audio + subtitles (offset). Up to
         # NARRATION_RETRY_MAX rounds. Skipped for mock plans (test
         # fixtures) and for prebuilt voiceovers (the caller owns them).
+        #
+        # Coverage fix v3: after each continuation, count words — if
+        # Gemini delivered <50% of the requested words, re-ask once
+        # with an explicit "too short, expand" prompt. Record
+        # rounds_used + cap_hit + a per-round log (words, added
+        # seconds, coverage after) so a run that ends below 90% shows
+        # WHY (cap hit vs stall vs call failure) instead of silently
+        # passing as a normal success.
+        _cont_log = []
+        _cont_cap_hit = False
+        _cont_error = None
         if _auto_assets and not use_mock_plan:
             for _cont in range(NARRATION_RETRY_MAX):
                 if _video_dur <= 0 or \
@@ -523,10 +615,38 @@ def run_full_recap_pipeline(
                         style=style, model=model)
                     _cont_text = str(
                         _tail.get("burmese_script", "")).strip()
-                except Exception:
+                except Exception as _e:
+                    _cont_error = str(_e)[:200]
                     break
                 if not _cont_text:
+                    _cont_error = "empty continuation text"
                     break
+                # Word-count check: if Gemini delivered <50% of the
+                # requested words for this tail, re-ask once with the
+                # expand prompt. Use the longer of the two texts.
+                _tail_dur = max(0.0, _video_dur - audio_duration)
+                _expected_words = int(_tail_dur * 2.2)
+                _delivered_words = len(_cont_text.split())
+                _reasked = False
+                if _expected_words > 0 and \
+                        _delivered_words < 0.5 * _expected_words:
+                    try:
+                        _tail2 = analyze_video_continuation(
+                            local_path, user_api_key,
+                            from_time=audio_duration,
+                            video_duration=_video_dur,
+                            style=style, model=model,
+                            delivered_words=_delivered_words)
+                        _cont_text2 = str(
+                            _tail2.get("burmese_script", "")).strip()
+                        _reasked = True
+                        if len(_cont_text2.split()) > _delivered_words:
+                            _cont_text = _cont_text2
+                            _delivered_words = len(
+                                _cont_text.split())
+                    except Exception:
+                        # Re-ask failed — keep the first text.
+                        pass
                 _cont_audio = os.path.join(
                     work_dir, f"voiceover_cont_{_cont}.mp3")
                 _cont_srt = os.path.join(
@@ -536,6 +656,7 @@ def run_full_recap_pipeline(
                     voice_name=voice_name, rate=_tts_rate_used,
                     proxy=tts_proxy)
                 if _cont_len <= 0 or not os.path.isfile(_cont_audio):
+                    _cont_error = "continuation TTS produced no audio"
                     break
                 _merged_audio = os.path.join(
                     work_dir, f"voiceover_merged_{_cont}.mp3")
@@ -553,10 +674,26 @@ def run_full_recap_pipeline(
                 voiceover_path = _merged_audio
                 script_text = (script_text + " " + _cont_text).strip()
                 audio_duration = audio_duration + _cont_len
+                _cont_log.append({
+                    "round": _cont,
+                    "words": _delivered_words,
+                    "expected_words": _expected_words,
+                    "reasked": _reasked,
+                    "added_s": round(_cont_len, 1),
+                    "coverage_after_s": round(audio_duration, 1),
+                })
                 # A round that adds almost nothing means Gemini has
                 # stalled on the tail — stop instead of burning calls.
                 if _cont_len < NARRATION_MIN_ROUND_S:
                     break
+            # Cap hit: the loop ran all NARRATION_RETRY_MAX rounds
+            # without reaching the 90% target — the run ends below
+            # target because the round budget ran out, not because
+            # Gemini stalled or a call failed.
+            if len(_cont_log) >= NARRATION_RETRY_MAX and _video_dur > 0 \
+                    and audio_duration < \
+                    NARRATION_COVERAGE_TARGET * _video_dur:
+                _cont_cap_hit = True
 
         # 4) fit the AUDIO to the full video duration (video stays 1.0x):
         # pad silence if shorter; atempo (+ scaled SRT) if longer.
@@ -617,6 +754,14 @@ def run_full_recap_pipeline(
             "fit_mode": render.get("fit_mode"),
             "tts_rate": _tts_rate_used,
             "audio_fit": audio_fit,
+            # Coverage fix v3 diagnostics: how many continuation
+            # rounds ran, whether the round budget ran out below
+            # target, per-round words/coverage, and any error that
+            # ended the loop early.
+            "continuation_rounds": len(_cont_log),
+            "continuation_cap_hit": _cont_cap_hit,
+            "continuation_log": _cont_log,
+            "continuation_error": _cont_error,
         }
 
     # 6) cleanup temp fragments (keep final video + srt + voiceover)

@@ -312,6 +312,39 @@ def _build_continuation_prompt(from_time: float, video_duration: float,
     )
 
 
+def _build_continuation_expand_prompt(from_time: float, video_duration: float,
+                                     style: str, delivered_words: int) -> str:
+    """Prompt for a continuation RE-ASK (coverage fix v3).
+
+    The first continuation for [from_time, video_duration] came back
+    too short (``delivered_words`` vs the expected tail × 2.2). This
+    asks Gemini explicitly to EXPAND — more detail, more sentences —
+    so the narration actually fills the tail instead of leaving
+    silence. Same word-count target as the normal continuation.
+    """
+    tail = max(0.0, float(video_duration) - float(from_time))
+    _words = int(tail * 2.2)
+    _lo = int(_words * 0.9)
+    _hi = int(_words * 1.1)
+    return (
+        "သင်သည် မြန်မာဗီဒီယို ဇာတ်ကြောင်းပြော (narration) ကျွမ်းကျင်သူဖြစ်သည်။\n"
+        f"အခု {from_time:.0f} စက္ကန့်မှ ဗီဒီယို၏ အဆုံး ({video_duration:.0f} စက္ကန့်) "
+        "အထိ ဇာတ်ကြောင်းပြောရန် အရင်အဖြေက တိုလွန်းပါသည် "
+        f"(စကားလုံး {delivered_words} လုံးသာ ပါခဲ့သည်)။\n\n"
+        f"ဤအပိုင်းကို ပို၍ အသေးစိတ် ချဲ့ပြီး ထပ်ပြောပေးပါ။ "
+        f"burmese_script ၏ စကားလုံးအရေအတွက်သည် {_lo}–{_hi} လုံး ဖြစ်ရမည် "
+        "(အစောပိုင်းကို ထပ်မပြောရ၊ အဆုံးထိ ရောက်အောင် ပြောရမည်)။\n"
+        "- ဖြစ်ပျက်သည်များကို အသေးစိတ် ဖော်ပြပါ — လူများ ဘာပြောသည်၊ "
+        "ဘာလုပ်သည်၊ ဘယ်လို တုံ့ပြန်သည်ကို ပိုထည့်ပါ။\n"
+        "- ဇာတ်ကြောင်းပြောသည် သဘာဝကျပြီး နားထောင်ကောင်းသော မြန်မာစကားပြော "
+        "ဖြစ်ရမည်။ မြန်မာစာလုံးပေါင်း အတိအကျ မှန်ရမည်။\n"
+        "- burmese_script သည် Unicode မြန်မာစာဖြင့်သာ ရေးရမည်။ "
+        "Zawgyi encoding လုံးဝ မသုံးပါနှင့်။\n\n"
+        "STRICT JSON ONLY ဖြင့် ပြန်ပေးပါ။ JSON မှလွဲ၍ အခြားစာသား မထည့်ပါနှင့်။\n"
+        "'{\"burmese_script\": \"...\"}'"
+    )
+
+
 def _build_pro_fill_prompt(windows) -> str:
     """Prompt for the Pro FILL call (Fix 2): narration for empty blocks.
 
@@ -362,13 +395,14 @@ def _build_pro_prompt() -> str:
         "လုံးဝ မလုပ်ရပါ။ အသံက Block အတွင်း မဝင်လျှင် ဗီဒီယိုကို "
         "မနှေးစေဘဲ အသံကိုသာ မြန်အောင် ညှိမည် — ထို့ကြောင့် text သည် "
         "Block အတွင်း ကွက်တိ ဝင်ဆံ့ရမည်။\n"
-        "- text သည် အလွန်တိုတိုနှင့် အနှစ်ချုပ်သာ ဖြစ်ရမည်။ မြန်မာစကားပြော "
-        "နှုန်း (တစ်စက္ကန့်လျှင် အများဆုံး ၃ စကားလုံးနှုန်း) အရ Block "
-        "ကြာချိန်နှင့် လိုက်ဖက်သော စကားလုံးအရေအတွက်သာ ထည့်ပါ "
-        "(ဥပမာ ၃ စက္ကန့် Block ဆိုလျှင် စာလုံးရေ ၁၀ လုံးထက် မကျော်စေရန်၊ "
-        "၅ စက္ကန့် Block ဆိုလျှင် ၁၅ လုံးထက် မကျော်စေရန်)။ ရှည်လျားသော "
-        "ဝါကျများ၊ အပိုစကားများ လုံးဝ မထည့်ပါနှင့်။ စာသားရှည်လျှင် "
-        "အသံက Block အတွင်း ဝင်မည်မဟုတ်ပါ။\n"
+        "- text သည် Block ၏ ကြာချိန်၏ ၇၀–၉၀% လောက် ပြောလောက်အောင် "
+        "ရှည်ရမည် (ခန့်မှန်း စကားလုံးအရေအတွက် ≈ Block ကြာချိန် "
+        "(စက္ကန့်) × ၂.၀)။ တစ်စက္ကန့်လျှင် အများဆုံး ၃ စကားလုံး နှုန်းကို "
+        "အထက်ကန့်သတ် (upper bound) အဖြစ်သာ သုံးပါ — ပစ်မှတ် (target) "
+        "အဖြစ် မသုံးပါနှင့်။ (ဥပမာ ၅ စက္ကန့် Block ဆိုလျှင် စာလုံးရေ "
+        "၇–၁၀ လုံးခန့် ထည့်ပါ)။ တိုလွန်းသော စာသားသည် Block အတွင်း "
+        "တိတ်ဆိတ်ဖြစ်စေသည်။ ရှည်လျားသော ဝါကျများ၊ အပိုစကားများ "
+        "လုံးဝ မထည့်ပါနှင့်။\n"
         "- မြန်မာစာလုံးပေါင်း အတိအကျ မှန်ရမည်။ မြန်မာစာအဖွဲ့၏ စံစာလုံးပေါင်း "
         "(standard Myanmar orthography) ကိုသာ သုံးပါ။ အသတ် (်)၊ ဝိသဇ္ဇနာ (း)၊ "
         "အက္ခရာတွဲများ (stacked consonants) ကို မှန်ကန်စွာ သုံးပါ။ "
@@ -532,6 +566,7 @@ def analyze_video_continuation(
     video_duration: float,
     style: str = DEFAULT_STYLE,
     model: Optional[str] = None,
+    delivered_words: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Ask Gemini for narration covering ONLY [from_time, video_duration].
 
@@ -540,6 +575,11 @@ def analyze_video_continuation(
     appends this continuation's audio + subtitles so the narration
     reaches the end. Returns {"burmese_script": ...} (non-empty, or
     raises AnalyzerError). The uploaded remote file is always deleted.
+
+    Coverage fix v3: when ``delivered_words`` is given, the previous
+    continuation for this tail came back too short — use the expand
+    prompt, which explicitly asks Gemini to add detail and reach the
+    full word-count target.
     """
     api_key = _require_key(user_api_key)
 
@@ -553,7 +593,12 @@ def analyze_video_continuation(
     uploaded = client.files.upload(file=path)
     try:
         _wait_for_active(client, uploaded.name)
-        prompt = _build_continuation_prompt(from_time, video_duration, style)
+        if delivered_words is not None:
+            prompt = _build_continuation_expand_prompt(
+                from_time, video_duration, style, delivered_words)
+        else:
+            prompt = _build_continuation_prompt(
+                from_time, video_duration, style)
         plan = _generate_with_fallback(
             client, uploaded, prompt, CONTINUATION_JSON_SCHEMA, model)
         script = str((plan or {}).get("burmese_script", "")).strip()

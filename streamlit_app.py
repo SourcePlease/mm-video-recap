@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-17 coverage-fix v2"
+BUILD_VERSION = "2026-10-17 coverage-fix v3"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -586,6 +586,12 @@ def _job_file_result(result) -> Dict:
         "title": result.get("title"),
         "script_text": result.get("script_text"),
         "narration_coverage": result.get("narration_coverage"),
+        # Coverage fix v3 diagnostics (AI continuation + Pro fill).
+        "continuation_rounds": result.get("continuation_rounds"),
+        "continuation_cap_hit": result.get("continuation_cap_hit"),
+        "continuation_log": result.get("continuation_log"),
+        "continuation_error": result.get("continuation_error"),
+        "pro_fill_status": result.get("pro_fill_status"),
     }
 
 
@@ -612,6 +618,11 @@ def _apply_job_result(result, snap) -> Dict:
             f" | အသံ: {_mmss(_cov.get('covered_s', 0))}"
             f"/{_mmss(_cov.get('total_s', 0))}"
         )
+        # Coverage fix v3: if the continuation loop hit its round
+        # budget below the 90% target, say so — a run that ends at
+        # 82% must not look like a normal success.
+        if result.get("continuation_cap_hit"):
+            _cov_note += " — continuation cap reached"
     _recap = {
         "status": (
             f"✓ ပြီးဆုံးပါပြီ! | {result.get('aspect_ratio')} | "
