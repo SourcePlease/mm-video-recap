@@ -1026,6 +1026,167 @@ def _parse_srt_cues(srt_path: str) -> List[Tuple[float, float, str]]:
 
 
 # --------------------------------------------------------------------------- #
+# Hybrid mode (device-side encode): shared filter-graph builder
+# --------------------------------------------------------------------------- #
+def build_hybrid_filter_graph(
+    *,
+    src_w: int,
+    src_h: int,
+    aspect_ratio: str = "9:16",
+    fit_mode: Optional[str] = "crop",
+    crop_align: str = "center",
+    inner_scale: float = 1.0,
+    vertical_pos: float = 0.0,
+    horizontal_pos: float = 0.0,
+    mirror_horizontal: bool = False,
+    copyright_zoom: float = 1.0,
+    random_crop_offset: bool = False,
+    blur_boxes: Optional[List[Dict]] = None,
+    subtitle_enabled: bool = True,
+    bg_volume: float = 0.0,
+) -> Dict:
+    """Build the FFmpeg filter graph for a Hybrid (device) encode.
+
+    Pure function — the SAME graph the server render would build for
+    these settings, minus the parts the device does not need:
+    no trim/concat (the source plays full-duration at 1.0x), no
+    setpts (video speed is always 1.0), no subtitle PNG generation
+    (the browser renders the cue PNGs and feeds them as input 2).
+
+    Inputs the browser must provide: 0 = source video, 1 = voiceover
+    audio, 2 = subtitle concat video (only when subtitle_enabled).
+    Returns {"with_audio", "no_audio", "copyright_applied", "out_w",
+    "out_h", "blur_boxes" (pixel rects), "subtitle_input"}.
+    The no_audio variant is used when the source has no audio stream
+    (a filter graph referencing [0:a] would fail on such a file).
+    """
+    aspect_ratio = _normalize_aspect(aspect_ratio)
+    if aspect_ratio not in ("original", "16:9", "9:16", "1:1", "4:5"):
+        raise ValueError(
+            "aspect_ratio must be 'original', '16:9', '9:16', '1:1' or '4:5'.")
+    if fit_mode is not None and fit_mode not in ("crop", "pad"):
+        raise ValueError("fit_mode must be 'crop', 'pad', or None (legacy).")
+    out_w, out_h = _resolve_aspect_target(
+        aspect_ratio, {"width": src_w, "height": src_h})
+    base_w = int(src_w) - (int(src_w) % 2)
+    base_h = int(src_h) - (int(src_h) % 2)
+    copyright_str, copyright_applied = _copyright_filter_chain(
+        base_w, base_h, mirror_horizontal, copyright_zoom,
+        random_crop_offset)
+    pre: List[str] = []
+    if (base_w, base_h) != (int(src_w), int(src_h)):
+        pre.append(f"scale={base_w}:{base_h}")
+    if copyright_str:
+        pre.append(copyright_str)
+    vchain: List[str] = []
+    fit_in = "0:v"
+    if pre:
+        vchain.append(f"[0:v]{','.join(pre)}[vpre]")
+        fit_in = "vpre"
+    fit_steps, cur_label = _fit_filter_steps(
+        fit_in, base_w, base_h, out_w, out_h, fit_mode, crop_align,
+        inner_scale, vertical_pos, horizontal_pos, aspect_ratio)
+    vchain.extend(fit_steps)
+    boxes = _normalize_blur_boxes(blur_boxes, out_w, out_h)
+    if boxes:
+        steps, cur_label = _blur_filter_steps(cur_label, boxes)
+        vchain.extend(steps)
+    if subtitle_enabled:
+        vchain.append(f"[{cur_label}][2:v]overlay=0:0:format=auto[vout]")
+    else:
+        vchain.append(f"[{cur_label}]null[vout]")
+    video_part = ";".join(vchain)
+    # Audio: source at bg_volume mixed with the voiceover (server
+    # render uses anull for factor 1.0 — same here, speed is 1.0).
+    audio_with = (
+        f"[0:a]anull,volume={bg_volume}[bg];"
+        "[bg][1:a]amix=inputs=2:duration=longest:"
+        "dropout_transition=0:normalize=0,"
+        "alimiter=limit=0.95,aresample=44100[aout]"
+    )
+    audio_without = "[1:a]aresample=44100[aout]"
+    return {
+        "with_audio": video_part + ";" + audio_with,
+        "no_audio": video_part + ";" + audio_without,
+        "copyright_applied": copyright_applied,
+        "out_w": out_w,
+        "out_h": out_h,
+        "blur_boxes": boxes,
+        "subtitle_input": bool(subtitle_enabled),
+    }
+
+
+def mix_pro_block_audio(blocks: List[Dict], work_dir: str,
+                        out_path: str) -> str:
+    """Mix fitted per-block audios into ONE track of the video duration.
+
+    blocks: [{"start","end","audio_path","audio_len"}...] tiling [0, dur].
+    Each block's audio is fitted to its window exactly like the
+    server Pro render fits it (atempo up to PRO_TTS_FIT_MAX + trim when
+    longer; apad + trim when shorter), then all are concatenated in
+    order — so the single track has silence exactly where the blocks
+    have silence, and speech exactly on the dialogue windows. The
+    browser then just mixes [source audio at bg_volume] + [this track],
+    instead of placing ~100 separate audios. Returns out_path.
+    """
+    import subprocess
+
+    if not blocks:
+        raise VideoEditorError("No Pro blocks to mix.")
+    os.makedirs(work_dir, exist_ok=True)
+    inputs: List[str] = []
+    filters: List[str] = []
+    n = 0
+    for b in blocks:
+        ap = b.get("audio_path")
+        if not ap or not os.path.isfile(str(ap)):
+            continue
+        try:
+            s = float(b.get("start", 0))
+            e = float(b.get("end", 0))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        win = e - s
+        if win <= 0:
+            continue
+        try:
+            alen = float(b.get("audio_len") or 0) or _media_duration(str(ap))
+        except (TypeError, ValueError):
+            continue
+        if alen <= 0:
+            continue
+        if alen > win + 1e-3:
+            factor = alen / win
+            if factor <= PRO_TTS_FIT_MAX:
+                fit = f"atempo={factor:.4f}"
+            else:
+                fit = (f"atempo={PRO_TTS_FIT_MAX:.4f},"
+                       f"atrim=0:{win:.3f}")
+        elif alen < win - 1e-3:
+            fit = f"apad,atrim=0:{win:.3f}"
+        else:
+            fit = "anull"
+        inputs += ["-i", str(ap)]
+        filters.append(
+            f"[{n}:a]aresample=44100,{fit},atrim=0:{win:.3f}[a{n}]")
+        n += 1
+    if n == 0:
+        raise VideoEditorError("No valid Pro block audio to mix.")
+    concat = "".join(f"[a{i}]" for i in range(n)) + \
+        f"concat=n={n}:v=0:a=1[aout]"
+    cmd = ["ffmpeg", "-y", "-v", "error", *inputs,
+           "-filter_complex", ";".join(filters + [concat]),
+           "-map", "[aout]", "-c:a", "libmp3lame", "-q:a", "4",
+           out_path]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if proc.returncode != 0:
+        raise VideoEditorError(
+            "Pro block audio mix failed: "
+            f"{proc.stderr.strip()[-500:]}")
+    return out_path
+
+
+# --------------------------------------------------------------------------- #
 # public API
 # --------------------------------------------------------------------------- #
 def render_recap_video(

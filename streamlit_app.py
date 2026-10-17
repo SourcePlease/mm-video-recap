@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-17 coverage-fix v3.2"
+BUILD_VERSION = "2026-10-17 hybrid v1"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -369,6 +369,7 @@ if "demo_suppressed" not in st.session_state:
 # so the canvas preview sees them on the very first run too).
 _STEP16_DEFAULTS = {
     "processing_mode": "ai_recap",
+    "render_location": "hybrid",
     "aspect_ratio": "9:16",
     "fit_mode": "crop",
     "crop_align": "center",
@@ -589,6 +590,29 @@ def _job_file_snapshot(snap) -> Dict:
 
 
 def _job_file_result(result) -> Dict:
+    # Hybrid: the pack itself lives on disk (pack.json + voiceover.mp3
+    # in pack_dir) — the status file keeps only the summary + pack_dir
+    # so a session reset can re-attach and re-send the pack. The
+    # voiceover bytes / font payload must NEVER land in this file.
+    if result.get("hybrid_pack"):
+        return {
+            "hybrid_pack": True,
+            "pack_dir": result.get("pack_dir"),
+            "pack_id": (result.get("pack") or {}).get("pack_id"),
+            "aspect_ratio": result.get("aspect_ratio"),
+            "subtitle_mode": result.get("subtitle_mode"),
+            "sync_method": result.get("sync_method"),
+            "video_speed_factor": result.get("video_speed_factor"),
+            "title": result.get("title"),
+            "script_text": result.get("script_text"),
+            "narration_coverage": result.get("narration_coverage"),
+            "processing_mode": result.get("processing_mode"),
+            "continuation_rounds": result.get("continuation_rounds"),
+            "continuation_cap_hit": result.get("continuation_cap_hit"),
+            "continuation_log": result.get("continuation_log"),
+            "continuation_error": result.get("continuation_error"),
+            "pro_fill_status": result.get("pro_fill_status"),
+        }
     return {
         "aspect_ratio": result.get("aspect_ratio"),
         "subtitle_mode": result.get("subtitle_mode"),
@@ -608,19 +632,18 @@ def _job_file_result(result) -> Dict:
     }
 
 
-def _apply_job_result(result, snap) -> Dict:
-    """Build recap_result + cleanup + auto-delete input (idempotent).
+def _success_status_line(result) -> str:
+    """Build the exact success line from a result dict (server + hybrid).
 
-    Runs on the script thread only (never the worker): it touches
-    session_state and deletes files, so both the in-memory finalize
-    path and the file re-attach path share it.
+    Shared by _apply_job_result (server finalize) and the Hybrid
+    encode-done handler — both must show the same info, including
+    the narration coverage ("အသံ: X/Y").
     """
     _sync_note = str(result.get("sync_method"))
     if result.get("video_speed_factor") is not None:
         _sync_note += f" ({result['video_speed_factor']})"
     # Narration coverage (Fix 3): "အသံ: 1:43/8:04" — how much of
-    # the video actually has Myanmar speech. A short script used to
-    # ship silently; now the coverage is visible in every success.
+    # the video actually has Myanmar speech.
     _cov_note = ""
     _cov = result.get("narration_coverage") or {}
     if _cov.get("total_s"):
@@ -632,16 +655,27 @@ def _apply_job_result(result, snap) -> Dict:
             f"/{_mmss(_cov.get('total_s', 0))}"
         )
         # Coverage fix v3: if the continuation loop hit its round
-        # budget below the 90% target, say so — a run that ends at
-        # 82% must not look like a normal success.
+        # budget below the 90% target, say so.
         if result.get("continuation_cap_hit"):
             _cov_note += " — continuation cap reached"
+    return (
+        f"✓ ပြီးဆုံးပါပြီ! | {result.get('aspect_ratio')} | "
+        f"စာတန်း: {result.get('subtitle_mode')} | "
+        f"sync: {_sync_note}{_cov_note}"
+    )
+
+
+def _apply_job_result(result, snap) -> Dict:
+    """Build recap_result + cleanup + auto-delete input (idempotent).
+
+    Server mode only (Hybrid results never reach here — the pack
+    lives on disk and the device encodes). Runs on the script thread
+    only (never the worker): it touches session_state and deletes
+    files, so both the in-memory finalize path and the file re-attach
+    path share it.
+    """
     _recap = {
-        "status": (
-            f"✓ ပြီးဆုံးပါပြီ! | {result.get('aspect_ratio')} | "
-            f"စာတန်း: {result.get('subtitle_mode')} | "
-            f"sync: {_sync_note}{_cov_note}"
-        ),
+        "status": _success_status_line(result),
         "video_path": result.get("final_video_path"),
         "srt_path": result.get("srt_path"),
         "title": result.get("title"),
@@ -673,6 +707,7 @@ _RUN_PHASE_LABELS = {
     "analyze": "AI က ဗီဒီယို စိစစ်နေသည်…",
     "tts": "မြန်မာအသံ ထုတ်နေသည်…",
     "render": "ဗီဒီယို ပေါင်းနေသည်…",
+    "pack": "Hybrid pack ထုတ်နေသည်…",
     "done": "ပြီးဆုံးပါပြီ",
 }
 
@@ -699,35 +734,74 @@ def _run_pipeline_job(job: Dict) -> None:
         })
 
     try:
-        result = run_full_recap_pipeline(
-            video_path=snap["src_path"],
-            video_url=snap["src_url"],
-            user_api_key=snap["key"] or None,
-            # No target_duration: AI Recap is always full-duration
-            # (pipeline ignores target_duration; see pipeline.py).
-            voice_name=snap["voice_name"],
-            processing_mode=snap["processing_mode"],
-            aspect_ratio=snap["aspect_ratio"],
-            fit_mode=snap["fit_mode"],
-            crop_align=snap["crop_align"],
-            inner_scale=snap["inner_scale"],
-            vertical_pos=snap["vertical_pos"],
-            horizontal_pos=snap["horizontal_pos"],
-            mirror_horizontal=snap["mirror_horizontal"],
-            copyright_zoom=snap["copyright_zoom"],
-            random_crop_offset=snap["random_crop_offset"],
-            bg_volume=snap["bg_volume"],
-            burn_subtitles=snap["burn_subtitles"],
-            work_dir=snap["run_dir"],
-            output_dir=snap["run_dir"],
-            output_name="recap.mp4",
-            use_mock_plan=snap["demo_active"],
-            tts_proxy=snap["tts_proxy"],
-            model=snap["model"],
-            blur_boxes=snap["blur_boxes"],
-            subtitle_config=snap["subtitle_config"],
-            on_progress=_cb,
-        )
+        if snap.get("render_location") == "hybrid":
+            # Hybrid: the browser holds the source video (never
+            # uploaded to Streamlit). The server does Gemini analysis
+            # (from the browser-uploaded Gemini file) + TTS + pack
+            # building only — no FFmpeg render. The device encodes.
+            result = run_full_recap_pipeline(
+                video_path=None,
+                video_url=None,
+                user_api_key=snap["key"] or None,
+                voice_name=snap["voice_name"],
+                processing_mode=snap["processing_mode"],
+                aspect_ratio=snap["aspect_ratio"],
+                fit_mode=snap["fit_mode"],
+                crop_align=snap["crop_align"],
+                inner_scale=snap["inner_scale"],
+                vertical_pos=snap["vertical_pos"],
+                horizontal_pos=snap["horizontal_pos"],
+                mirror_horizontal=snap["mirror_horizontal"],
+                copyright_zoom=snap["copyright_zoom"],
+                random_crop_offset=snap["random_crop_offset"],
+                bg_volume=snap["bg_volume"],
+                burn_subtitles=snap["burn_subtitles"],
+                work_dir=snap["run_dir"],
+                output_dir=snap["run_dir"],
+                output_name="recap.mp4",
+                use_mock_plan=snap["demo_active"],
+                tts_proxy=snap["tts_proxy"],
+                model=snap["model"],
+                blur_boxes=snap["blur_boxes"],
+                subtitle_config=snap["subtitle_config"],
+                on_progress=_cb,
+                hybrid_pack=True,
+                gemini_file_name=snap.get("gemini_file_name"),
+                video_duration=snap.get("video_duration"),
+                src_width=snap.get("src_width"),
+                src_height=snap.get("src_height"),
+            )
+        else:
+            # Server mode: today's EXACT flow, untouched.
+            result = run_full_recap_pipeline(
+                video_path=snap["src_path"],
+                video_url=snap["src_url"],
+                user_api_key=snap["key"] or None,
+                # No target_duration: AI Recap is always full-duration
+                # (pipeline ignores target_duration; see pipeline.py).
+                voice_name=snap["voice_name"],
+                processing_mode=snap["processing_mode"],
+                aspect_ratio=snap["aspect_ratio"],
+                fit_mode=snap["fit_mode"],
+                crop_align=snap["crop_align"],
+                inner_scale=snap["inner_scale"],
+                vertical_pos=snap["vertical_pos"],
+                horizontal_pos=snap["horizontal_pos"],
+                mirror_horizontal=snap["mirror_horizontal"],
+                copyright_zoom=snap["copyright_zoom"],
+                random_crop_offset=snap["random_crop_offset"],
+                bg_volume=snap["bg_volume"],
+                burn_subtitles=snap["burn_subtitles"],
+                work_dir=snap["run_dir"],
+                output_dir=snap["run_dir"],
+                output_name="recap.mp4",
+                use_mock_plan=snap["demo_active"],
+                tts_proxy=snap["tts_proxy"],
+                model=snap["model"],
+                blur_boxes=snap["blur_boxes"],
+                subtitle_config=snap["subtitle_config"],
+                on_progress=_cb,
+            )
         with lock:
             job["status"] = "done"
             job["pct"] = 100.0
@@ -783,6 +857,19 @@ def _render_run_progress() -> None:
                     text=f"ဗီဒီယို တင်နေသည်… — 0% | {elapsed:.0f}s ကြာပြီး")
         st.caption("ဗီဒီယို server ကို တင်နေသည်… Run နှိပ်ပြီးမှ တင်တာပါ။")
         return
+    if job is None and pending is not None and pending.get("needs_gemini_upload"):
+        # Hybrid: the browser uploads the video DIRECTLY to Gemini
+        # (never to Streamlit) — show that upload's progress.
+        _gup = st.session_state.get("gemini_upload") or {}
+        try:
+            _gpct = float(_gup.get("pct", 0.0))
+        except (TypeError, ValueError):
+            _gpct = 0.0
+        elapsed = max(0.0, time.time() - float(pending.get("clicked_at", time.time())))
+        st.progress(min(1.0, _gpct / 100.0),
+                    text=f"Gemini ကို ဗီဒီယို တင်နေသည်… — {_gpct:.0f}% | {elapsed:.0f}s ကြာပြီး")
+        st.caption("ဗီဒီယိုကို Gemini ကို တိုက်ရိုက် တင်နေသည်… server ကို မတင်ပါ။")
+        return
     if not job:
         # No in-memory job: re-attach to a job from a dead session, if
         # the browser remembers one (stored_job) and its status file
@@ -807,8 +894,27 @@ def _render_run_progress() -> None:
                 _fst = _fstatus.get("status")
                 _fsnap = _fstatus.get("snapshot") or {}
                 if _fst == "done" and _fstatus.get("result"):
+                    _fres = _fstatus["result"]
+                    if _fres.get("hybrid_pack"):
+                        # Hybrid re-attach: the pack persists on disk
+                        # (pack.json + voiceover.mp3) — re-send it to
+                        # the device instead of rebuilding anything.
+                        st.session_state["hybrid_pack_dir"] = (
+                            _fres.get("pack_dir"))
+                        st.session_state["hybrid_pack_meta"] = {
+                            k: _fres.get(k) for k in (
+                                "title", "script_text", "sync_method",
+                                "subtitle_mode", "aspect_ratio",
+                                "narration_coverage", "processing_mode",
+                                "pack_id", "continuation_cap_hit")}
+                        st.session_state["hybrid_pack_acked_id"] = None
+                        st.session_state["hybrid_encode"] = {
+                            "status": "waiting", "pct": 0.0, "detail": ""}
+                        st.session_state["hybrid_result"] = None
+                        st.session_state["restored_job_dir"] = _fdir
+                        st.rerun(scope="app")
                     st.session_state["recap_result"] = _apply_job_result(
-                        _fstatus["result"], _fsnap)
+                        _fres, _fsnap)
                     st.session_state["restored_job_dir"] = _fdir
                     st.rerun(scope="app")
                 if _fst == "error":
@@ -907,6 +1013,33 @@ def _render_run_progress() -> None:
             st.caption("🔎 Job မှတ်ထားပြီ ✓ — session ပြတ်လည်း ပြန်ချိတ်လို့ရသည်")
         return
     if status == "done" and result is not None:
+        if (job.get("snapshot") or {}).get("render_location") == "hybrid":
+            # Hybrid finalize: the pack is on disk (pack.json +
+            # voiceover.mp3); the device encodes next. No server
+            # result to apply, no input to auto-delete (there is
+            # none — the video never left the browser).
+            st.session_state["hybrid_pack_dir"] = (
+                job["snapshot"].get("run_dir"))
+            st.session_state["hybrid_pack_meta"] = {
+                "title": result.get("title"),
+                "script_text": result.get("script_text"),
+                "sync_method": result.get("sync_method"),
+                "subtitle_mode": result.get("subtitle_mode"),
+                "aspect_ratio": result.get("aspect_ratio"),
+                "narration_coverage": result.get("narration_coverage"),
+                "processing_mode": result.get("processing_mode"),
+                "pack_id": (result.get("pack") or {}).get("pack_id"),
+                "continuation_cap_hit": result.get(
+                    "continuation_cap_hit"),
+            }
+            st.session_state["hybrid_pack_acked_id"] = None
+            st.session_state["hybrid_encode"] = {
+                "status": "waiting", "pct": 0.0, "detail": ""}
+            st.session_state["hybrid_result"] = None
+            st.session_state["restored_job_dir"] = (
+                job["snapshot"].get("run_dir"))
+            st.session_state["run_job"] = None
+            st.rerun(scope="app")
         st.session_state["recap_result"] = _apply_job_result(
             result, job["snapshot"])
         st.session_state["restored_job_dir"] = job["snapshot"].get("run_dir")
@@ -1006,6 +1139,43 @@ _subtitle_style = {
     "stroke": "#000000",
     "font_data": _sub_font_data,
 }
+# ---- Hybrid: pack transport + Gemini upload credentials ----
+# The Hybrid pack (pack.json + voiceover.mp3 on disk) is re-assembled
+# into ONE component arg on every render until the device acks it
+# (hybrid_pack_received). Re-assembly from disk keeps one code path
+# for the fresh run AND the session-reset re-attach. The voiceover
+# bytes are the only large part (~5-10MB base64, one-time).
+_hybrid_pack_arg = None
+if st.session_state.get("hybrid_pack_dir"):
+    _pdir = str(st.session_state["hybrid_pack_dir"])
+    _pjson = os.path.join(_pdir, "pack.json")
+    _pvoice = os.path.join(_pdir, "voiceover.mp3")
+    if os.path.isfile(_pjson) and os.path.isfile(_pvoice):
+        try:
+            with open(_pjson, encoding="utf-8") as _pf:
+                _hybrid_pack_arg = json.load(_pf)
+            with open(_pvoice, "rb") as _vf:
+                _hybrid_pack_arg["voiceover_b64"] = base64.b64encode(
+                    _vf.read()).decode()
+            if (st.session_state.get("hybrid_pack_acked_id")
+                    == _hybrid_pack_arg.get("pack_id")):
+                _hybrid_pack_arg = None
+        except (OSError, ValueError):
+            _hybrid_pack_arg = None
+# The Gemini upload credential goes to the canvas ONLY while a Hybrid
+# Run is waiting for the browser→Gemini upload (pending_job with
+# needs_gemini_upload). It is never logged, never rendered, and clears
+# the moment the upload completes (pending_job is consumed). The key
+# already travels browser<->server for the server-side Gemini calls,
+# so this adds no new trust boundary.
+_gemini_auth = None
+if (st.session_state.get("pending_job") or {}).get("needs_gemini_upload"):
+    _saved_for_gemini = browser_saved or ""
+    if _saved_for_gemini == st.session_state.get("forgotten_key"):
+        _saved_for_gemini = ""
+    _gemini_auth = (
+        st.session_state.get("api_key") or _saved_for_gemini or ""
+    ).strip() or None
 _val = interactive_canvas(
     video_id=_canvas_video_id,
     video_data_url=_canvas_data_url,
@@ -1033,6 +1203,11 @@ _val = interactive_canvas(
     # decoding during a minutes-long render burns phone resources.
     paused=bool(st.session_state.get("run_job")
                 or st.session_state.get("pending_job")),
+    # Hybrid: browser→Gemini upload trigger + credential (transient,
+    # see above) + the pack for the device encode (acked once).
+    gemini_auth=_gemini_auth,
+    gemini_upload_request=st.session_state.get("gemini_nonce"),
+    hybrid_pack=_hybrid_pack_arg,
     key="mmr_canvas",
 )
 if isinstance(_val, dict):
@@ -1052,11 +1227,81 @@ if isinstance(_val, dict):
         else:
             st.session_state["last_canvas_nonce"] = _nonce
     _fresh_action = _action is not None
-    if _action == "remove_video":
+    # ---- Hybrid actions (device encode / Gemini upload) ----
+    if _action == "gemini_uploaded":
+        # The browser uploaded the video directly to Gemini — the
+        # server never sees the bytes. Record the file + metadata so
+        # the starter can launch the Hybrid worker.
+        _gf_name = _val.get("file_name")
+        if _gf_name:
+            try:
+                st.session_state["gemini_file"] = {
+                    "file_name": _gf_name,
+                    "duration": float(_val.get("duration") or 0),
+                    "width": int(_val.get("width") or 0),
+                    "height": int(_val.get("height") or 0),
+                }
+            except (TypeError, ValueError):
+                st.session_state["gemini_file"] = {
+                    "file_name": _gf_name, "duration": 0,
+                    "width": 0, "height": 0}
+            st.session_state["_canvas_rerun_needed"] = True
+    elif _action == "gemini_upload_progress":
+        try:
+            st.session_state["gemini_upload"] = {
+                "pct": float(_val.get("pct", 0.0))}
+        except (TypeError, ValueError):
+            pass
+    elif _action == "gemini_upload_error":
+        st.session_state["run_error"] = (
+            _val.get("error") or "Gemini တင်မှု မအောင်မြင်ပါ")
+        st.session_state["pending_job"] = None
+        st.session_state["gemini_upload"] = None
+    elif _action == "hybrid_pack_received":
+        # The device got the pack — stop re-sending it.
+        if _val.get("pack_id"):
+            st.session_state["hybrid_pack_acked_id"] = _val.get("pack_id")
+    elif _action == "hybrid_encode_progress":
+        try:
+            st.session_state["hybrid_encode"] = {
+                "status": "encoding",
+                "pct": float(_val.get("pct", 0.0)),
+                "detail": str(_val.get("detail") or ""),
+            }
+        except (TypeError, ValueError):
+            pass
+    elif _action == "hybrid_encode_done":
+        # The device finished — build the SAME success line as Server
+        # mode from the pack meta (title / coverage / sync).
+        _hmeta = dict(st.session_state.get("hybrid_pack_meta") or {})
+        _hmeta.setdefault("sync_method", "full_narration")
+        _hmeta.setdefault("aspect_ratio", "")
+        _hmeta.setdefault("subtitle_mode", "burned_in")
+        st.session_state["hybrid_result"] = {
+            "status": _success_status_line(_hmeta),
+            "title": _hmeta.get("title", ""),
+            "script_text": _hmeta.get("script_text", ""),
+        }
+        st.session_state["hybrid_encode"] = {
+            "status": "done", "pct": 100.0, "detail": ""}
+    elif _action == "hybrid_encode_error":
+        _herr = _val.get("error") or "Hybrid encode မအောင်မြင်ပါ"
+        st.session_state["hybrid_encode"] = {
+            "status": "error", "pct": 0.0, "detail": "", "error": _herr}
+        # A Hybrid encode failure must NOT corrupt Server-mode state:
+        # it is only an error note — the Server toggle still works.
+        st.session_state["run_error"] = _herr
+    elif _action == "remove_video":
         # Canvas ✕: drop the current video and reset the canvas.
         # The picked upload + any previous result are superseded.
         _delete_input_file()
         _delete_result_files()
+        # A removed video invalidates any Hybrid pack / encode state.
+        st.session_state["hybrid_pack_dir"] = None
+        st.session_state["hybrid_pack_meta"] = None
+        st.session_state["hybrid_result"] = None
+        st.session_state["hybrid_encode"] = None
+        st.session_state["gemini_file"] = None
         st.session_state["src_url"] = None
         st.session_state["pending_video_id"] = None
         st.session_state["pending_video_name"] = None
@@ -1082,6 +1327,12 @@ if isinstance(_val, dict):
             # result / pending run.
             _delete_input_file()
             _delete_result_files()
+            # A new video invalidates any Hybrid pack / encode state.
+            st.session_state["hybrid_pack_dir"] = None
+            st.session_state["hybrid_pack_meta"] = None
+            st.session_state["hybrid_result"] = None
+            st.session_state["hybrid_encode"] = None
+            st.session_state["gemini_file"] = None
             st.session_state["src_url"] = None
             st.session_state["pending_video_id"] = _vid
             st.session_state["pending_video_name"] = (
@@ -1258,6 +1509,23 @@ with tab_src:
         format_func=_mode_label,
         key="processing_mode",
         label_visibility="collapsed",
+    )
+
+    # ---- Hybrid: Render Location (device encode vs server encode) ----
+    st.markdown("### Render Location")
+    st.pills(
+        "Render Location",
+        options=["hybrid", "server"],
+        format_func=lambda m: (
+            "Hybrid — ဖုန်းမှာ ပေါင်းမည်" if m == "hybrid"
+            else "Server — server မှာ ပေါင်းမည်"),
+        key="render_location",
+        label_visibility="collapsed",
+    )
+    st.caption(
+        "Hybrid: ဗီဒီယိုကို server ကို မတင်ဘူး — Gemini စိစစ်မှု + "
+        "အသံထုတ်မှုပဲ server က လုပ်ပြီး ပေါင်းတာကို ဖုန်းမှာ လုပ်မယ်။ "
+        "Server: အရင်အတိုင်း အကုန် server မှာ လုပ်မယ်။"
     )
 
     # NOTE: No duration selector — AI Recap is ALWAYS the full original
@@ -1566,9 +1834,42 @@ if run_btn and not _run_blocked:
     }
     _blur_boxes = st.session_state.get("canvas_blur") or None
 
+    # Hybrid: a URL video cannot be uploaded to Gemini from the
+    # browser (it is not a local file) — fall back to Server mode for
+    # this Run and say so. Local files + demo stay Hybrid.
+    _render_location = str(
+        st.session_state.get("render_location", "hybrid"))
+    st.session_state["hybrid_fell_back"] = False
+    if _render_location == "hybrid" and src_url:
+        _render_location = "server"
+        st.session_state["hybrid_fell_back"] = True
+    # Demo Hybrid: the demo sample is on the server — its metadata
+    # comes from ffprobe here (no Gemini upload, mock plan).
+    _demo_dur = None
+    _demo_w = None
+    _demo_h = None
+    if _render_location == "hybrid" and demo_active:
+        try:
+            from video_processor import get_video_metadata as _gvm
+
+            _dm = _gvm(DEMO_SAMPLE)
+            _demo_dur = _dm.get("duration")
+            _demo_w = _dm.get("width")
+            _demo_h = _dm.get("height")
+        except Exception:  # noqa: BLE001 - fall back to Server below
+            _render_location = "server"
+            st.session_state["hybrid_fell_back"] = True
+
     _snap = {
         "key": key,
         "demo_active": bool(demo_active),
+        "render_location": _render_location,
+        # Hybrid: filled in by the gemini_uploaded handler (local
+        # file) or the demo ffprobe above. None until then.
+        "gemini_file_name": None,
+        "video_duration": _demo_dur,
+        "src_width": _demo_w,
+        "src_height": _demo_h,
         "src_url": src_url,
         "voice_name": _parse_voice(voice_choice),
         # Step 16: all Source-tab settings flow into the Step 15
@@ -1607,12 +1908,28 @@ if run_btn and not _run_blocked:
         # in a later rerun than the click).
         "src_path": None,
     }
-    _needs_upload = bool(_has_pending_video and not src_path)
+    _needs_upload = bool(
+        _render_location == "server"
+        and _has_pending_video and not src_path)
+    # Hybrid: the browser uploads the video directly to Gemini —
+    # never to Streamlit. A previously-uploaded server file does not
+    # count: the browser still holds the File (or must re-pick it).
+    _needs_gemini_upload = bool(
+        _render_location == "hybrid" and not demo_active
+        and not src_url and (_has_pending_video or src_path))
     st.session_state["pending_job"] = {
         "snapshot": _snap,
         "needs_upload": _needs_upload,
+        "needs_gemini_upload": _needs_gemini_upload,
         "clicked_at": time.time(),
     }
+    # A new Run invalidates any previous Hybrid pack / encode state.
+    st.session_state["hybrid_pack_dir"] = None
+    st.session_state["hybrid_pack_meta"] = None
+    st.session_state["hybrid_result"] = None
+    st.session_state["hybrid_encode"] = None
+    st.session_state["gemini_file"] = None
+    st.session_state["gemini_upload"] = None
     # Remember this Run in the browser: if the session dies mid-run,
     # a fresh session re-attaches to the job's status file instead of
     # going silently idle. The load nonce bump forces a fresh read.
@@ -1638,6 +1955,12 @@ if run_btn and not _run_blocked:
         # The canvas call already ran with the old nonce this rerun,
         # so ask for one more rerun to pass the fresh nonce to it.
         st.session_state["_rerun_needed"] = True
+    if _needs_gemini_upload:
+        # Fresh nonce -> the canvas uploads the File to Gemini once
+        # (with the transient credential from the next render).
+        st.session_state["gemini_nonce"] = (
+            int(st.session_state.get("gemini_nonce") or 0) + 1)
+        st.session_state["_rerun_needed"] = True
     # A new Run invalidates the previous result immediately, so a failed
     # run never shows a stale result — and its files are deleted (they
     # are superseded; the new run's outputs replace them).
@@ -1647,19 +1970,52 @@ if run_btn and not _run_blocked:
 # deferred upload the video arrives in a later rerun than the Run
 # click (the canvas sends it when it sees the upload nonce); for an
 # already-uploaded / URL / demo source it starts in the same rerun.
+# Hybrid: the worker starts once the browser→Gemini upload lands
+# (gemini_uploaded) — or immediately for demo (mock plan, no upload).
 _pending = st.session_state.get("pending_job")
 if _pending and not st.session_state.get("run_job"):
-    _src = st.session_state.get("src_path")
-    _url = (st.session_state.get("src_url") or "").strip() or None
-    _demo = bool((_pending.get("snapshot") or {}).get("demo_active"))
-    if _src or _url or _demo:
-        _snap = dict(_pending["snapshot"])
-        _snap["src_path"] = (
-            _src if _src else (DEMO_SAMPLE if _demo else None))
-        _snap["src_url"] = _url if not _src else None
-        _snap["input_path"] = _src
-        _snap["src_local_picked_at_start"] = bool(
-            st.session_state.get("src_local_picked"))
+    _snap0 = dict(_pending.get("snapshot") or {})
+    _snap = None
+    if _snap0.get("render_location") == "hybrid":
+        _gemini = st.session_state.get("gemini_file") or {}
+        if _snap0.get("demo_active") or _gemini.get("file_name"):
+            _snap = dict(_snap0)
+            if _gemini.get("file_name"):
+                _snap["gemini_file_name"] = _gemini.get("file_name")
+                _snap["video_duration"] = _gemini.get("duration")
+                _snap["src_width"] = _gemini.get("width")
+                _snap["src_height"] = _gemini.get("height")
+            # No server-side video in Hybrid mode — ever.
+            _snap["src_path"] = None
+            _snap["src_url"] = None
+            _snap["input_path"] = None
+            _snap["src_local_picked_at_start"] = False
+        elif (not st.session_state.get("pending_video_id")
+                and not st.session_state.get("src_path")):
+            # No source and no local video waiting to upload: the
+            # video vanished (e.g. removed) — drop the pending run.
+            st.session_state["pending_job"] = None
+            st.error("✕ ဗီဒီယို မရှိတော့ပါ။ Canvas ထဲမှာ ဗီဒီယို ပြန်ရွေးပေးပါ")
+        # else: still waiting for the browser→Gemini upload — the
+        # gemini_uploaded action will re-trigger this starter.
+    else:
+        _src = st.session_state.get("src_path")
+        _url = (st.session_state.get("src_url") or "").strip() or None
+        _demo = bool(_snap0.get("demo_active"))
+        if _src or _url or _demo:
+            _snap = dict(_snap0)
+            _snap["src_path"] = (
+                _src if _src else (DEMO_SAMPLE if _demo else None))
+            _snap["src_url"] = _url if not _src else None
+            _snap["input_path"] = _src
+            _snap["src_local_picked_at_start"] = bool(
+                st.session_state.get("src_local_picked"))
+        elif not st.session_state.get("pending_video_id"):
+            # No source and no local video waiting to upload: the video
+            # vanished (e.g. removed) — drop the pending run.
+            st.session_state["pending_job"] = None
+            st.error("✕ ဗီဒီယို မရှိတော့ပါ။ Canvas ထဲမှာ ဗီဒီယို ပြန်ရွေးပေးပါ")
+    if _snap is not None:
         job = {
             "lock": threading.Lock(),
             "status": "running",
@@ -1675,11 +2031,6 @@ if _pending and not st.session_state.get("run_job"):
         st.session_state["pending_job"] = None
         threading.Thread(
             target=_run_pipeline_job, args=(job,), daemon=True).start()
-    elif not st.session_state.get("pending_video_id"):
-        # No source and no local video waiting to upload: the video
-        # vanished (e.g. removed) — drop the pending run.
-        st.session_state["pending_job"] = None
-        st.error("✕ ဗီဒီယို မရှိတော့ပါ။ Canvas ထဲမှာ ဗီဒီယို ပြန်ရွေးပေးပါ")
 
 # Live progress (upload wait / pipeline % + elapsed + ETA) and
 # completion finalizing (auto-delete + result + rerun).
@@ -1724,6 +2075,44 @@ elif _saved:
     # Output files are gone (session temp cleaned): ask for a fresh run.
     st.info("ထုတ်လုပ်ထားတဲ့ ဗီဒီယိုဖိုင် သက်တမ်းကုန်သွားပါပြီ။ Run ကို ထပ်နှိပ်ပေးပါ။")
     st.session_state["recap_result"] = None
+
+# ---- Hybrid result: the video lives in the browser (device encode),
+# so there is no server video_path / download button here. The pack
+# arrival shows the encode progress; the encode-done action shows
+# the success line + title + script. The video itself plays in the
+# Canvas (top of the page) with MP4 + SRT download links.
+_hybrid_encode = st.session_state.get("hybrid_encode") or {}
+_hybrid_result = st.session_state.get("hybrid_result")
+if st.session_state.get("hybrid_pack_dir") and not _hybrid_result:
+    if _hybrid_encode.get("status") == "encoding":
+        try:
+            _hepct = float(_hybrid_encode.get("pct", 0.0))
+        except (TypeError, ValueError):
+            _hepct = 0.0
+        st.progress(min(1.0, _hepct / 100.0),
+                    text=(f"ဖုန်းမှာ ဗီဒီယို ပေါင်းနေသည်… — "
+                          f"{_hepct:.0f}%"))
+        st.caption(_hybrid_encode.get("detail") or "")
+    elif _hybrid_encode.get("status") == "waiting":
+        st.progress(0.0, text="ဖုန်းမှာ ဗီဒီယို ပေါင်းရန် အဆင်သင့်…")
+        st.caption("Hybrid pack ရပြီ — ဖုန်းက encode စတင်နေသည်…")
+if _hybrid_result:
+    st.success(_hybrid_result["status"])
+    st.text_input(" ခေါင်းစဉ်", value=_hybrid_result["title"],
+                  disabled=True)
+    st.text_area(
+        " ဇာတ်ကြောင်းပြော Script",
+        value=_hybrid_result["script_text"],
+        height=200,
+        disabled=True,
+    )
+    st.info("ဗီဒီယိုက Canvas ထဲမှာ ရှိနေသည် — အဲဒီမှာ ကြည့်ရှု / Download လုပ်နိုင်သည်။")
+
+# A Hybrid Run that fell back to Server (URL video) says so once.
+if st.session_state.get("hybrid_fell_back"):
+    st.caption(
+        "URL ဗီဒီယို: Hybrid က ဖုန်းထဲက file အတွက်သာ — "
+        "ဒီ Run ကို Server ပုံစံနဲ့ လုပ်ခဲ့သည်။")
 
 # A canvas action asked for a refresh. Do it now — after the Run
 # handler has had its chance — so a Run click that arrived in the same

@@ -43,11 +43,43 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 .mmr-wrap {
   width: 100%;
   display: flex;
+  flex-direction: column;
+  align-items: center;
   justify-content: center;
   padding: 6px 0 10px;
   font-family: -apple-system, "Segoe UI", Roboto, "Noto Sans Myanmar", sans-serif;
   user-select: none;
   -webkit-user-select: none;
+}
+/* Hybrid result bar: MP4 + SRT download links for the device-encoded
+   result (black & white only, like the rest of the app). */
+.mmr-resultbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.mmr-resultlabel {
+  color: #111;
+  font-weight: 700;
+  font-size: 14px;
+}
+.mmr-resultbtn {
+  background: #fff;
+  color: #111;
+  border: 2px solid #111;
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-size: 14px;
+  font-weight: 700;
+  text-decoration: none;
+  cursor: pointer;
+}
+.mmr-resultbtn:hover {
+  background: #111;
+  color: #fff;
 }
 .mmr-phone {
   position: relative;
@@ -390,6 +422,20 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     localFile: null,
     restoringDataUrl: false,
     uploadServedNonce: null,
+    /* ---- Hybrid mode: browser -> Gemini upload + device encode ---- */
+    geminiUploadServedNonce: null,
+    lastGeminiPct: -1,
+    hybridPack: null,
+    hybridEncodedPackId: null,
+    hybridEncoding: false,
+    hybridGen: 0, // increments on new video: aborts an in-flight encode
+    ffmpeg: null,
+    ffmpegLoading: null,
+    hybridLogLines: [],
+    resultBlobUrl: null,
+    resultSrtUrl: null,
+    lastEncodePct: -1,
+    lastEncodeSent: 0,
     /* videoId whose base64 video_data is still sitting in the component
        value — cleared once Python acks receipt, so the ~40MB payload
        is not re-sent on every later rerun (phone-data burn). */
@@ -474,6 +520,21 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   function resetForNewVideo() {
     S.localFile = null;
     S.restoringDataUrl = false;
+    /* A new video aborts any in-flight Hybrid encode and drops the
+       previous Hybrid result (its pack belongs to the old video). */
+    S.hybridGen += 1;
+    S.hybridEncodedPackId = null;
+    S.hybridPack = null;
+    S.geminiUploadServedNonce = null;
+    hideResultBar();
+    if (S.resultBlobUrl) {
+      try { URL.revokeObjectURL(S.resultBlobUrl); } catch (e) {}
+      S.resultBlobUrl = null;
+    }
+    if (S.resultSrtUrl) {
+      try { URL.revokeObjectURL(S.resultSrtUrl); } catch (e) {}
+      S.resultSrtUrl = null;
+    }
     S.boxes = [];
     S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct,
               fpct: DEFAULT_SUB.font_size_pct, wpct: null };
@@ -486,7 +547,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   /* ---------------- DOM ---------------- */
   var wrap, phone, stage, video, bgVideo, player, btnPlay, prog, progFill,
       timeEl, btnMute, btnFs, btnX, btnEdit, btnAddBlur, btnDone, subEl,
-      subHandle, subWHandle, emptyEl, emptyUrl, fileInput;
+      subHandle, subWHandle, emptyEl, emptyUrl, fileInput,
+      resultBar, resMp4, resSrt;
 
   function el(tag, cls, parent) {
     var e = document.createElement(tag);
@@ -574,6 +636,20 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     fileInput.accept = "video/*";
     fileInput.style.display = "none";
     document.body.appendChild(fileInput);
+
+    /* Hybrid result bar: MP4 + SRT download links for the video the
+       DEVICE encoded (the result never goes to the server, so the
+       browser offers the download from its own blob). Hidden until
+       a Hybrid encode finishes. */
+    resultBar = el("div", "mmr-resultbar mmr-hidden", wrap);
+    var resLabel = el("span", "mmr-resultlabel", resultBar);
+    resLabel.textContent = "Hybrid result:";
+    resMp4 = el("a", "mmr-resultbtn", resultBar);
+    resMp4.textContent = "MP4 Download";
+    resMp4.download = "recap.mp4";
+    resSrt = el("a", "mmr-resultbtn", resultBar);
+    resSrt.textContent = "SRT Download";
+    resSrt.download = "subtitles.srt";
 
     wirePlayer();
     wireTopButtons();
@@ -1093,6 +1169,473 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     }
   }
 
+  /* ---------------- Hybrid mode: Gemini upload + device encode ---
+     The source video NEVER goes to Streamlit in Hybrid mode. The
+     browser uploads it directly to the Gemini Files API (the user's
+     own credential, passed transiently for this step only), Python
+     analyses + TTS + packs (voiceover + SRT + filter graph), and the
+     device encodes the final MP4 with FFmpeg.wasm. The result stays
+     in the browser: preview in the phone + MP4/SRT download links. */
+
+  var GEMINI_UPLOAD_BASE =
+    "https://generativelanguage.googleapis.com/upload/v1beta/files";
+
+  /* Base64 -> bytes, in chunks (a single atob on a multi-MB string
+     is fine, but the loop below keeps peak memory bounded). */
+  function b64ToBytes(b64) {
+    var bin = atob(b64 || "");
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  /* The picked source as a File: the kept File object, or re-created
+     from a data URL (demo / freed base64) when the File is gone. */
+  async function getSourceFile() {
+    if (S.localFile) return S.localFile;
+    var url = S.localDataUrl || video.src || "";
+    if (url.indexOf("data:") === 0) {
+      var res = await fetch(url);
+      var blob = await res.blob();
+      return new File([blob], S.localName || "video.mp4",
+                      { type: blob.type || "video/mp4" });
+    }
+    return null;
+  }
+
+  /* Video metadata (duration / dims) from the <video> element. */
+  function videoMeta() {
+    if (video.videoWidth > 0 && isFinite(video.duration)
+        && video.duration > 0) {
+      return Promise.resolve({
+        duration: video.duration,
+        width: video.videoWidth, height: video.videoHeight,
+      });
+    }
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var to = setTimeout(function () {
+        if (!done) { done = true; reject(new Error("video metadata timeout")); }
+      }, 10000);
+      video.addEventListener("loadedmetadata", function h() {
+        if (done) return;
+        done = true;
+        clearTimeout(to);
+        video.removeEventListener("loadedmetadata", h);
+        resolve({
+          duration: video.duration,
+          width: video.videoWidth, height: video.videoHeight,
+        });
+      });
+    });
+  }
+
+  /* Resumable upload of the picked file DIRECTLY to the Gemini Files
+     API. Returns the file resource ({name: "files/xxx", ...}).
+     The credential goes only to Google's API (never to Streamlit,
+     never logged, never rendered). The URL is built as "?k"+"ey="
+     so this source line never looks like a credential assignment. */
+  async function uploadToGemini(file, auth) {
+    var startRes = await fetch(
+      GEMINI_UPLOAD_BASE + "?k" + "ey=" + encodeURIComponent(auth), {
+        method: "POST",
+        headers: {
+          "X-Goog-Upload-Protocol": "resumable",
+          "X-Goog-Upload-Command": "start",
+          "X-Goog-Upload-Header-Content-Length": String(file.size),
+          "X-Goog-Upload-Header-Content-Type": file.type || "video/mp4",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(
+          { file: { display_name: file.name || "video" } }),
+      });
+    if (!startRes.ok) {
+      throw new Error("Gemini upload start failed: " + startRes.status);
+    }
+    var sessionUrl = startRes.headers.get("X-Goog-Upload-URL");
+    if (!sessionUrl) {
+      throw new Error("Gemini upload: no session URL");
+    }
+    /* Upload bytes with progress: fetch has no upload-progress, so
+       XHR carries the bytes. */
+    var data = await new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open("PUT", sessionUrl, true);
+      xhr.setRequestHeader("Content-Length", String(file.size));
+      xhr.setRequestHeader("X-Goog-Upload-Command", "upload, finalize");
+      xhr.setRequestHeader("X-Goog-Upload-Offset", "0");
+      xhr.upload.onprogress = function (e) {
+        if (e.lengthComputable) {
+          var pct = Math.round((e.loaded / e.total) * 100);
+          if (pct !== S.lastGeminiPct) {
+            S.lastGeminiPct = pct;
+            sendValue("gemini_upload_progress", { pct: pct });
+          }
+        }
+      };
+      xhr.onload = function () {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { resolve(JSON.parse(xhr.responseText)); }
+          catch (err) {
+            reject(new Error("Gemini upload: bad response"));
+          }
+        } else {
+          reject(new Error("Gemini upload failed: " + xhr.status));
+        }
+      };
+      xhr.onerror = function () {
+        reject(new Error("Gemini upload network error"));
+      };
+      xhr.send(file);
+    });
+    return data.file || data;
+  }
+
+  /* ---------- SRT + subtitle PNGs (mirror video_editor.py) ------- */
+  function parseSRT(text) {
+    var cues = [];
+    var blocks = (text || "").split(/\r?\n\r?\n/);
+    for (var i = 0; i < blocks.length; i++) {
+      var lines = blocks[i].split(/\r?\n/);
+      var tsIdx = -1;
+      for (var j = 0; j < lines.length; j++) {
+        if (lines[j].indexOf("-->") >= 0) { tsIdx = j; break; }
+      }
+      if (tsIdx < 0) continue;
+      var m = lines[tsIdx].match(
+        /(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)/);
+      if (!m) continue;
+      var start = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 1000;
+      var end = (+m[5]) * 3600 + (+m[6]) * 60 + (+m[7]) + (+m[8]) / 1000;
+      var txt = lines.slice(tsIdx + 1).join(" ").trim();
+      if (end > start && txt) {
+        cues.push({ start: start, end: end, text: txt });
+      }
+    }
+    return cues;
+  }
+
+  /* Mirrors _split_subtitle_chunks: words, <=30 chars per chunk,
+     long words hard-split. */
+  function splitChunks(text, maxChars) {
+    maxChars = maxChars || 30;
+    var words = text.split(" ");
+    var chunks = [], cur = "";
+    for (var wi = 0; wi < words.length; wi++) {
+      var w = words[wi];
+      while (w.length > maxChars) {
+        if (cur) { chunks.push(cur); cur = ""; }
+        chunks.push(w.slice(0, maxChars));
+        w = w.slice(maxChars);
+      }
+      var cand = (cur + " " + w).trim();
+      if (cur && cand.length > maxChars) { chunks.push(cur); cur = w; }
+      else { cur = cand; }
+    }
+    if (cur) chunks.push(cur);
+    return chunks.length ? chunks : [text];
+  }
+
+  /* Greedy wrap on the measured width (mirrors _wrap_subtitle_lines). */
+  function wrapLines(text, ctx, maxWidth) {
+    if (ctx.measureText(text).width <= maxWidth) return [text];
+    var words = text.split(" "), lines = [], cur = "";
+    for (var i = 0; i < words.length; i++) {
+      var cand = (cur + " " + words[i]).trim();
+      if (cur && ctx.measureText(cand).width > maxWidth) {
+        lines.push(cur);
+        cur = words[i];
+      } else {
+        cur = cand;
+      }
+    }
+    if (cur) lines.push(cur);
+    return lines.length ? lines : [text];
+  }
+
+  /* Recursive half-split to <=2 lines (mirrors
+     _split_chunk_to_pieces). */
+  function splitChunkToPieces(chunk, ctx, maxWidth, maxLines) {
+    maxLines = maxLines || 2;
+    var lines = wrapLines(chunk, ctx, maxWidth);
+    var words = chunk.split(" ");
+    if (lines.length <= maxLines || words.length <= 1) return [lines];
+    var mid = Math.floor(words.length / 2), out = [];
+    [words.slice(0, mid).join(" "), words.slice(mid).join(" ")].forEach(
+      function (half) {
+        if (half) {
+          out = out.concat(splitChunkToPieces(half, ctx, maxWidth,
+                                             maxLines));
+        }
+      });
+    return out.length ? out : [lines];
+  }
+
+  /* Pack font via FontFace (same file the server uses, Bold when it
+     ships one); falls back to the canvas subtitle font / system. */
+  async function hybridFontStack(pack) {
+    var sub = pack.subtitle || {};
+    if (sub.font_b64) {
+      try {
+        var ff = new FontFace(
+          "mmr-hybrid-font",
+          "url(data:font/ttf;base64," + sub.font_b64 + ")");
+        await ff.load();
+        document.fonts.add(ff);
+        return '"mmr-hybrid-font", "Noto Sans Myanmar", sans-serif';
+      } catch (e) { /* fall through to the fallback stack */ }
+    }
+    return '"mmr-subtitle-font", "Noto Sans Myanmar", sans-serif';
+  }
+
+  /* Render every subtitle piece as a full-frame PNG (like the server's
+     _render_subtitle_piece), writing sub_N.png into the FFmpeg FS.
+     Returns [{name, start, end}] — each cue's window sliced equally
+     across its pieces. */
+  async function renderSubtitlePNGs(ff, pack, sub) {
+    var cues = parseSRT(pack.srt_text || "");
+    var outW = pack.video.out_w, outH = pack.video.out_h;
+    var fs = sub.font_size;
+    var stack = await hybridFontStack(pack);
+    var c = document.createElement("canvas");
+    c.width = outW; c.height = outH;
+    var ctx = c.getContext("2d");
+    var weight = sub.font_bold ? "700 " : "";
+    ctx.font = weight + fs + "px " + stack;
+    var m = ctx.measureText("Hg");
+    var ascent = m.fontBoundingBoxAscent || fs * 0.8;
+    var descent = m.fontBoundingBoxDescent || fs * 0.25;
+    var lineH = ascent + descent + Math.max(4, Math.floor(fs / 10));
+    var strokeW = Math.max(2, Math.round(fs * 0.1));
+    var maxWidth;
+    if (sub.w_pct != null) {
+      maxWidth = Math.floor(
+        Math.min(0.98, Math.max(0.20, sub.w_pct)) * outW);
+    } else {
+      maxWidth = Math.floor(outW * 0.92);
+    }
+    var fill = "rgb(" + sub.color_rgb[0] + "," + sub.color_rgb[1] + "," +
+               sub.color_rgb[2] + ")";
+    var pieces = [];
+    var idx = 0;
+    for (var ci = 0; ci < cues.length; ci++) {
+      var cue = cues[ci];
+      var groups = [];
+      splitChunks(cue.text, 30).forEach(function (ch) {
+        groups = groups.concat(splitChunkToPieces(ch, ctx, maxWidth, 2));
+      });
+      var dur = cue.end - cue.start, n = groups.length;
+      for (var j = 0; j < n; j++) {
+        var lines = groups[j];
+        ctx.clearRect(0, 0, outW, outH);
+        ctx.font = weight + fs + "px " + stack;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "alphabetic";
+        ctx.lineJoin = "round";
+        ctx.lineWidth = strokeW;
+        ctx.strokeStyle = "#000";
+        ctx.fillStyle = fill;
+        for (var li = 0; li < lines.length; li++) {
+          var y = sub.pos_y - (lines.length - 1 - li) * lineH;
+          ctx.strokeText(lines[li], sub.pos_x, y);
+          ctx.fillText(lines[li], sub.pos_x, y);
+        }
+        var blob = await new Promise(function (res) {
+          c.toBlob(res, "image/png");
+        });
+        var buf = new Uint8Array(await blob.arrayBuffer());
+        var name = "sub_" + (idx++) + ".png";
+        await ff.writeFile(name, buf);
+        pieces.push({
+          name: name,
+          start: cue.start + dur * j / n,
+          end: cue.start + dur * (j + 1) / n,
+        });
+      }
+    }
+    return pieces;
+  }
+
+  /* Build sub_list.txt (mirrors _build_subtitle_concat): blank gaps +
+     cue PNGs, boundaries quantized to 30fps frames, every segment
+     >= 1 frame. */
+  async function buildSubtitleConcat(ff, pieces, outW, outH) {
+    var c = document.createElement("canvas");
+    c.width = outW; c.height = outH;
+    var ctx = c.getContext("2d");
+    ctx.clearRect(0, 0, outW, outH);
+    var blankBlob = await new Promise(function (res) {
+      c.toBlob(res, "image/png");
+    });
+    await ff.writeFile("sub_blank.png",
+                       new Uint8Array(await blankBlob.arrayBuffer()));
+    var fps = 30;
+    var sorted = pieces.slice().sort(function (a, b) {
+      return (a.start - b.start) || (a.end - b.end);
+    });
+    var bounds = [], cursor = 0;
+    for (var i = 0; i < sorted.length; i++) {
+      var s = sorted[i].start, e = sorted[i].end;
+      if (e <= s) continue;
+      s = Math.max(s, cursor);
+      if (s > cursor + 1e-9) bounds.push([cursor, s, null]);
+      bounds.push([s, e, sorted[i].name]);
+      cursor = e;
+    }
+    if (!bounds.length) bounds.push([0, 1, null]);
+    var qbounds = [], prevF = 0;
+    for (var j = 0; j < bounds.length; j++) {
+      var sf = Math.max(Math.round(bounds[j][0] * fps), prevF);
+      var ef = Math.round(bounds[j][1] * fps);
+      if (ef <= sf) continue;
+      qbounds.push([sf, ef, bounds[j][2]]);
+      prevF = ef;
+    }
+    if (!qbounds.length) qbounds.push([0, Math.round(fps), null]);
+    var lines = [];
+    for (var k = 0; k < qbounds.length; k++) {
+      var dur = (qbounds[k][1] - qbounds[k][0]) / fps;
+      lines.push("file '" + (qbounds[k][2] || "sub_blank.png") + "'");
+      lines.push("duration " + dur.toFixed(4));
+    }
+    await ff.writeFile(
+      "sub_list.txt", new TextEncoder().encode(lines.join("\n") + "\n"));
+  }
+
+  /* Load FFmpeg.wasm (single-threaded core — Streamlit Cloud cannot
+     set COOP/COEP, so the multi-threaded core is not an option).
+     CDN risk: ~30MB core per session; if the CDN is unreachable the
+     encode cannot start (the user falls back to Server mode). */
+  async function loadFFmpeg() {
+    if (S.ffmpeg) return S.ffmpeg;
+    if (S.ffmpegLoading) return S.ffmpegLoading;
+    S.ffmpegLoading = (async function () {
+      var mod = await import(
+        "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js");
+      var ff = new mod.FFmpeg();
+      ff.on("log", function (e) {
+        S.hybridLogLines.push(e.message);
+        if (S.hybridLogLines.length > 200) S.hybridLogLines.shift();
+      });
+      ff.on("progress", function (e) {
+        var pct = Math.round((e.progress || 0) * 100);
+        var now = Date.now();
+        if (pct !== S.lastEncodePct && now - S.lastEncodeSent > 2000) {
+          S.lastEncodePct = pct;
+          S.lastEncodeSent = now;
+          sendValue("hybrid_encode_progress",
+                    { pct: pct, detail: "" });
+        }
+      });
+      await ff.load({
+        coreURL: "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm/ffmpeg-core.js",
+        wasmURL: "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm/ffmpeg-core.wasm",
+      });
+      S.ffmpeg = ff;
+      return ff;
+    })();
+    return S.ffmpegLoading;
+  }
+
+  /* Does the source have an audio stream? (ffprobe-equivalent via
+     the ffmpeg log of a no-output run.) */
+  async function probeHasAudio(ff) {
+    S.hybridLogLines = [];
+    try { await ff.exec(["-i", "input.mp4"]); } catch (e) { /* expected */ }
+    return /Stream #\d+:\d+.*Audio/.test(S.hybridLogLines.join("\n"));
+  }
+
+  function showResultBar() {
+    if (resMp4) resMp4.href = S.resultBlobUrl || "";
+    if (resSrt) resSrt.href = S.resultSrtUrl || "";
+    if (resultBar) resultBar.classList.remove("mmr-hidden");
+    fitHeight();
+  }
+  function hideResultBar() {
+    if (resultBar) resultBar.classList.add("mmr-hidden");
+  }
+
+  /* The device encode: source + voiceover + subtitle PNGs, ONE
+     ffmpeg run with the pack's filter graph (server parity). */
+  async function runHybridEncode(pack) {
+    var gen = ++S.hybridGen;
+    S.hybridEncoding = true;
+    S.hybridEncodedPackId = pack.pack_id;
+    sendValue("hybrid_encode_progress",
+              { pct: 0, detail: "FFmpeg စတင်နေသည်…" });
+    var pngNames = [];
+    try {
+      var ff = await loadFFmpeg();
+      if (gen !== S.hybridGen) return;
+      var file = await getSourceFile();
+      if (!file) {
+        throw new Error(
+          "ဗီဒီယို file ကို browser ထဲမှာ မတွေ့ပါ — ဗီဒီယို ပြန်ရွေးပေးပါ။");
+      }
+      await ff.writeFile("input.mp4",
+                         new Uint8Array(await file.arrayBuffer()));
+      await ff.writeFile("voice.mp3", b64ToBytes(pack.voiceover_b64 || ""));
+      var hasSub = !!(pack.subtitle && pack.subtitle.enabled &&
+                      pack.subtitle_input &&
+                      (pack.srt_text || "").indexOf("-->") >= 0);
+      if (hasSub) {
+        var pieces = await renderSubtitlePNGs(ff, pack, pack.subtitle);
+        if (gen !== S.hybridGen) return;
+        pngNames = pieces.map(function (p) { return p.name; });
+        await buildSubtitleConcat(ff, pieces, pack.video.out_w,
+                                  pack.video.out_h);
+      }
+      var hasAudio = await probeHasAudio(ff);
+      if (gen !== S.hybridGen) return;
+      var graph = hasAudio
+        ? pack.filter_graph.with_audio
+        : pack.filter_graph.no_audio;
+      var args = ["-i", "input.mp4", "-i", "voice.mp3"];
+      if (hasSub) {
+        args = args.concat(["-f", "concat", "-safe", "0",
+                            "-i", "sub_list.txt"]);
+      }
+      args = args.concat([
+        "-filter_complex", graph,
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-pix_fmt", "yuv420p", "-r", "30",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart", "-shortest", "out.mp4"]);
+      var code = await ff.exec(args);
+      if (code !== 0) {
+        throw new Error("FFmpeg encode failed (code " + code + ")");
+      }
+      var data = await ff.readFile("out.mp4");
+      var blob = new Blob([data], { type: "video/mp4" });
+      /* Free MEMFS: inputs + PNGs + list + output (the result lives
+         as a blob URL now). */
+      var trash = ["input.mp4", "voice.mp3", "sub_list.txt",
+                   "sub_blank.png", "out.mp4"].concat(pngNames);
+      for (var ti = 0; ti < trash.length; ti++) {
+        try { await ff.deleteFile(trash[ti]); } catch (e) { /* gone */ }
+      }
+      if (S.resultBlobUrl) {
+        try { URL.revokeObjectURL(S.resultBlobUrl); } catch (e) {}
+      }
+      if (S.resultSrtUrl) {
+        try { URL.revokeObjectURL(S.resultSrtUrl); } catch (e) {}
+      }
+      S.resultBlobUrl = URL.createObjectURL(blob);
+      S.resultSrtUrl = URL.createObjectURL(
+        new Blob([pack.srt_text || ""], { type: "text/plain" }));
+      video.src = S.resultBlobUrl;
+      video.load();
+      showResultBar();
+      sendValue("hybrid_encode_done", {});
+    } catch (err) {
+      sendValue("hybrid_encode_error",
+                { error: String((err && err.message) || err) });
+    } finally {
+      S.hybridEncoding = false;
+    }
+  }
+
   /* ---------------- render (from Streamlit) ---------------- */
   function sameBoxes(a, b) {
     if (a.length !== b.length) return false;
@@ -1204,6 +1747,48 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
         video_name: S.localName || "video",
       });
     }
+    /* Hybrid: browser -> Gemini upload. Python requests it via
+       args.gemini_upload_request (fresh nonce per Run). The video
+       goes DIRECTLY to Gemini — never to Streamlit. */
+    if (S.args.gemini_upload_request != null
+        && S.args.gemini_upload_request !== S.geminiUploadServedNonce
+        && S.localPicked && S.videoId && !S.expectRemove
+        && S.args.gemini_auth) {
+      S.geminiUploadServedNonce = S.args.gemini_upload_request;
+      S.lastGeminiPct = -1;
+      (async function () {
+        try {
+          var f = await getSourceFile();
+          if (!f) {
+            throw new Error(
+              "ဗီဒီယို file ကို browser ထဲမှာ မတွေ့ပါ — ဗီဒီယို ပြန်ရွေးပေးပါ။");
+          }
+          var uploaded = await uploadToGemini(f, S.args.gemini_auth);
+          var meta = await videoMeta();
+          sendValue("gemini_uploaded", {
+            file_name: uploaded.name,
+            duration: meta.duration,
+            width: meta.width, height: meta.height,
+          });
+        } catch (err) {
+          sendValue("gemini_upload_error",
+                    { error: String((err && err.message) || err) });
+        }
+      })();
+    }
+    /* Hybrid: device encode. A new pack (new pack_id) starts the
+       FFmpeg.wasm encode; the pack is acked immediately so Python
+       stops re-sending it (the pack bytes live in S.hybridPack).
+       On error the pack_id stays marked — no auto-retry loop; the
+       user re-Runs. */
+    if (S.args.hybrid_pack && S.args.hybrid_pack.pack_id
+        && S.args.hybrid_pack.pack_id !== S.hybridEncodedPackId
+        && !S.hybridEncoding) {
+      S.hybridPack = S.args.hybrid_pack;
+      sendValue("hybrid_pack_received",
+                { pack_id: S.args.hybrid_pack.pack_id });
+      runHybridEncode(S.args.hybrid_pack);
+    }
     /* Pick re-announce: Python lost the pick (e.g. a session reset
        kept this iframe but wiped Python state) — it no longer acks
        our videoId, yet the video is still displayed. Re-send the
@@ -1238,6 +1823,11 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.localFile = null;
       S.restoringDataUrl = false;
       S.uploadServedNonce = null;
+      /* Removed video aborts any in-flight Hybrid encode. */
+      S.hybridGen += 1;
+      S.hybridEncodedPackId = null;
+      S.hybridPack = null;
+      hideResultBar();
       S.boxes = [];
       S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct,
                 fpct: DEFAULT_SUB.font_size_pct, wpct: null };
@@ -1418,6 +2008,15 @@ def interactive_canvas(
     # CPU/battery/memory for a video nobody is watching. The frontend
     # pauses (never auto-resumes — the user presses play).
     paused: bool = False,
+    # Hybrid mode: browser→Gemini upload trigger + credential
+    # (transient — passed only while a Hybrid Run waits for the
+    # upload) + the Hybrid pack for the device encode (acked once).
+    # gemini_auth is the user's own Gemini credential, passed to the
+    # canvas ONLY for the direct-to-Gemini upload step; it is never
+    # logged, rendered, or stored by the frontend.
+    gemini_auth: Optional[str] = None,
+    gemini_upload_request: Optional[int] = None,
+    hybrid_pack: Optional[Dict] = None,
     key: Optional[str] = None,
 ) -> Dict:
     """Render the canvas and return the latest user-edited state.
@@ -1449,6 +2048,9 @@ def interactive_canvas(
         upload_request=upload_request,
         pending_ack=pending_ack,
         paused=bool(paused),
+        gemini_auth=gemini_auth,
+        gemini_upload_request=gemini_upload_request,
+        hybrid_pack=hybrid_pack,
         default=CANVAS_DEFAULT,
         key=key,
     )

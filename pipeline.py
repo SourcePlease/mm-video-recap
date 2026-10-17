@@ -15,6 +15,8 @@ only passed through to ai_analyzer (Bring-Your-Own-Key).
 """
 from __future__ import annotations
 
+import base64
+import json
 import os
 import shutil
 import tempfile
@@ -27,6 +29,7 @@ from ai_analyzer import (
     analyze_video_for_recap,
     analyze_video_pro_blocks,
     analyze_video_pro_fill,
+    delete_gemini_file,
     generate_mock_pro_plan,
     generate_mock_recap_plan,
     validate_pro_blocks,
@@ -38,8 +41,13 @@ from tts_manager import (
     measure_audio_duration,
 )
 from video_editor import (
+    SUBTITLE_COLOR_RGB,
     _offset_srt_timestamps,
+    _subtitle_font_file,
+    build_hybrid_filter_graph,
+    build_pro_srt,
     fit_audio_to_duration,
+    mix_pro_block_audio,
     render_pro_recap_video,
     render_recap_video,
 )
@@ -207,6 +215,174 @@ def _concat_audios(paths: List[str], out_path: str) -> str:
     return out_path
 
 
+def _clean_pack_dir(run_dir: str) -> None:
+    """Delete everything in a Hybrid pack dir except the pack itself.
+
+    Keeps pack.json + voiceover.mp3 (the device encode inputs) and
+    drops all intermediates (block audio, merged/fitted temp files).
+    job_status.json is written later by the caller — it is not here
+    yet, so nothing else needs preserving.
+    """
+    if not run_dir or not os.path.isdir(str(run_dir)):
+        return
+    _keep = {"pack.json", "voiceover.mp3"}
+    for _name in os.listdir(run_dir):
+        if _name in _keep:
+            continue
+        _p = os.path.join(run_dir, _name)
+        try:
+            if os.path.isfile(_p):
+                os.remove(_p)
+            elif os.path.isdir(_p):
+                shutil.rmtree(_p, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def _build_hybrid_pack(
+    *,
+    run_dir: str,
+    processing_mode: str,
+    title: str,
+    script_text: str,
+    sync_method: str,
+    narration_coverage: Dict,
+    aspect_ratio: str,
+    video_duration: float,
+    src_w: int,
+    src_h: int,
+    fit_mode,
+    crop_align: str,
+    inner_scale: float,
+    vertical_pos: float,
+    horizontal_pos: float,
+    mirror_horizontal: bool,
+    copyright_zoom: float,
+    random_crop_offset: bool,
+    bg_volume: float,
+    blur_boxes,
+    subtitle_config: Optional[Dict],
+    burn_subtitles: bool,
+    voiceover_path: str,
+    srt_path: Optional[str],
+    extra: Optional[Dict] = None,
+) -> Dict:
+    """Build the Hybrid pack: everything the device encode needs.
+
+    Writes voiceover.mp3 + pack.json into ``run_dir`` (the persistence
+    for a session reset: the pack is re-sent from these files) and
+    returns the pack dict (no audio bytes — the voiceover travels as
+    the separate voiceover.mp3 file, re-read when the pack is sent).
+    The pack is small by design: voiceover (~5-10MB) + SRT (~35KB) +
+    plan JSON + font (~1MB) — no per-cue PNGs, no video bytes.
+    """
+    os.makedirs(run_dir, exist_ok=True)
+    if not os.path.isfile(str(voiceover_path)):
+        raise PipelineError("Hybrid pack: voiceover ဖိုင် မတွေ့ပါ။")
+    _pack_voice = os.path.join(run_dir, "voiceover.mp3")
+    shutil.copyfile(str(voiceover_path), _pack_voice)
+
+    _srt_text = ""
+    if srt_path and os.path.isfile(str(srt_path)):
+        with open(str(srt_path), encoding="utf-8") as _f:
+            _srt_text = _f.read()
+    # Subtitles are burned only when enabled AND the SRT has cues.
+    _sub_enabled = bool(burn_subtitles) and ("-->" in _srt_text)
+
+    _cfg = dict(subtitle_config or {})
+    _graphs = build_hybrid_filter_graph(
+        src_w=int(src_w or 0), src_h=int(src_h or 0),
+        aspect_ratio=aspect_ratio, fit_mode=fit_mode,
+        crop_align=crop_align, inner_scale=inner_scale,
+        vertical_pos=vertical_pos, horizontal_pos=horizontal_pos,
+        mirror_horizontal=mirror_horizontal,
+        copyright_zoom=copyright_zoom,
+        random_crop_offset=random_crop_offset,
+        blur_boxes=blur_boxes, subtitle_enabled=_sub_enabled,
+        bg_volume=bg_volume)
+    _out_w, _out_h = _graphs["out_w"], _graphs["out_h"]
+
+    # Subtitle geometry — same normalization as the server's
+    # _subtitle_step (clamped fpct, pixel pos from fractions).
+    try:
+        _fx = min(1.0, max(0.0, float(_cfg.get("x_pct", 0.5))))
+        _fy = min(1.0, max(0.0, float(_cfg.get("y_pct", 0.82))))
+        if _cfg.get("font_size_pct") is not None:
+            _fpct = float(_cfg["font_size_pct"])
+        else:
+            _fpct = float(_cfg.get("font_size", 22)) / 400.0
+    except (TypeError, ValueError):
+        _fx, _fy, _fpct = 0.5, 0.82, 0.055
+    _fpct = min(0.30, max(0.02, _fpct))
+    _fs = min(200, max(8, int(round(_fpct * _out_w))))
+    _font_family = str(_cfg.get("font_family", "Pyidaungsu"))
+    _color_name = str(_cfg.get("color", "Yellow"))
+    _rgb = SUBTITLE_COLOR_RGB.get(_color_name, (255, 255, 0))
+    _font_b64 = None
+    _font_bold = False
+    try:
+        _font_path = _subtitle_font_file(_font_family)
+        # The server renders with the Bold face when one ships (same
+        # helper) — tell the device so its canvas weight matches.
+        _font_bold = "bold" in os.path.basename(_font_path).lower()
+        with open(_font_path, "rb") as _ff:
+            _font_b64 = base64.b64encode(_ff.read()).decode()
+    except (OSError, ValueError):
+        _font_b64 = None
+
+    _pack = {
+        "pack_id": os.path.basename(str(run_dir)),
+        "pack_version": 1,
+        "processing_mode": processing_mode,
+        "title": title,
+        "script_text": script_text,
+        "sync_method": sync_method,
+        "narration_coverage": narration_coverage,
+        "aspect_ratio": aspect_ratio,
+        "video": {
+            "duration": round(float(video_duration or 0), 3),
+            "src_w": int(src_w or 0),
+            "src_h": int(src_h or 0),
+            "out_w": _out_w,
+            "out_h": _out_h,
+        },
+        "fit_mode": fit_mode,
+        "crop_align": crop_align,
+        "copyright_applied": _graphs["copyright_applied"],
+        "blur_boxes": _graphs["blur_boxes"],
+        "subtitle": {
+            "enabled": _sub_enabled,
+            "x_pct": _fx,
+            "y_pct": _fy,
+            "font_size_pct": _fpct,
+            "font_size": _fs,
+            "pos_x": int(round(_fx * _out_w)),
+            "pos_y": int(round(_fy * _out_h)),
+            "w_pct": _cfg.get("w_pct"),
+            "font_family": _font_family,
+            "color": _color_name,
+            "color_rgb": [_rgb[0], _rgb[1], _rgb[2]],
+            "font_b64": _font_b64,
+            "font_bold": _font_bold,
+        },
+        "filter_graph": {
+            "with_audio": _graphs["with_audio"],
+            "no_audio": _graphs["no_audio"],
+        },
+        "subtitle_input": _graphs["subtitle_input"],
+        "bg_volume": bg_volume,
+        "srt_text": _srt_text,
+        "voiceover_file": "voiceover.mp3",
+    }
+    if extra:
+        _pack["diagnostics"] = dict(extra)
+    with open(os.path.join(run_dir, "pack.json"), "w",
+              encoding="utf-8") as _f:
+        json.dump(_pack, _f)
+    _clean_pack_dir(run_dir)
+    return _pack
+
+
 def run_full_recap_pipeline(
     video_path: Optional[str] = None,
     video_url: Optional[str] = None,
@@ -247,6 +423,18 @@ def run_full_recap_pipeline(
     # a faked creeping bar). Pro TTS and both renders report real
     # measured sub-progress (per-block completion, ffmpeg -progress).
     on_progress: Optional[Callable[[float, str, str], None]] = None,
+    # Hybrid mode (device-side encode): the server does Gemini analysis
+    # + TTS + pack building only — NO FFmpeg render. The browser holds
+    # the source video (never uploaded to Streamlit) and encodes with
+    # FFmpeg.wasm from the returned pack. gemini_file_name is the
+    # already-uploaded Gemini file (browser-uploaded); video_duration /
+    # src_width / src_height are the browser's video metadata (there is
+    # no local file to ffprobe). Server mode ignores all of these.
+    hybrid_pack: bool = False,
+    gemini_file_name: Optional[str] = None,
+    video_duration: Optional[float] = None,
+    src_width: Optional[int] = None,
+    src_height: Optional[int] = None,
 ) -> Dict:
     """Run the full recap pipeline end to end.
 
@@ -299,10 +487,11 @@ def run_full_recap_pipeline(
         pass
 
     # Progress reporting: phase weights as (base, span) — analyze
-    # 0–30, TTS 30–55, render 55–100. Single calls (Gemini analyze,
-    # one-shot TTS) report only phase start/end — no faked creep.
+    # 0–30, TTS 30–55, render 55–100 (Hybrid: pack 55–100, no render).
+    # Single calls (Gemini analyze, one-shot TTS) report only phase
+    # start/end — no faked creep.
     _PHASES = {"analyze": (0.0, 30.0), "tts": (30.0, 25.0),
-               "render": (55.0, 45.0)}
+               "render": (55.0, 45.0), "pack": (55.0, 45.0)}
 
     def _report(phase: str, frac: float, detail: str) -> None:
         if on_progress is None:
@@ -313,29 +502,50 @@ def run_full_recap_pipeline(
 
     # 1) ingest
     _report("analyze", 0.0, "ဗီဒီယို ရယူနေသည်…")
-    local_path, metadata = prepare_video_source(
-        uploaded_file_path=video_path, video_url=video_url, work_dir=work_dir
-    )
+    if hybrid_pack:
+        # No server-side video: the browser holds the source (it is
+        # NEVER uploaded to Streamlit in Hybrid mode). Metadata comes
+        # from the browser (local file) or the demo sample (mock runs).
+        if video_duration is None or float(video_duration) <= 0:
+            raise PipelineError("Hybrid: video_duration လိုအပ်ပါသည်။")
+        local_path = None
+        metadata = {
+            "duration": float(video_duration),
+            "width": int(src_width or 0),
+            "height": int(src_height or 0),
+            "fps": None,
+            # The device probes the real value before encoding.
+            "has_audio": True,
+            "file_size_mb": 0.0,
+        }
+    else:
+        local_path, metadata = prepare_video_source(
+            uploaded_file_path=video_path, video_url=video_url,
+            work_dir=work_dir,
+        )
 
     # Disk guard (part 2): estimate what THIS run will newly write —
     # output (~0.4 MB/s at ~3.2 Mbps, crf 20) + intermediates + margin.
     # A fixed threshold misfires (a 20s test needs ~150MB, an 8-min
     # video ~350MB), so scale by duration. Fail fast, not mid-render.
-    try:
-        _dur = float(metadata.get("duration") or 0)
-        _need_mb = _dur * 0.4 + 150.0
-        _free2_mb = shutil.disk_usage(work_dir).free / (1024 * 1024)
-        if _free2_mb < _need_mb:
-            raise PipelineError(
-                "Server မှာ နေရာလွတ် မလောက်တော့ပါ "
-                f"({_free2_mb:.0f}MB သာ ကျန်သည်၊ "
-                f"ဒီ video အတွက် ~{_need_mb:.0f}MB လိုသည်) — "
-                "ခဏစောင့်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။"
-            )
-    except PipelineError:
-        raise
-    except Exception:
-        pass
+    # Hybrid skips it: the server writes only the pack (~15MB), never
+    # a full render.
+    if not hybrid_pack:
+        try:
+            _dur = float(metadata.get("duration") or 0)
+            _need_mb = _dur * 0.4 + 150.0
+            _free2_mb = shutil.disk_usage(work_dir).free / (1024 * 1024)
+            if _free2_mb < _need_mb:
+                raise PipelineError(
+                    "Server မှာ နေရာလွတ် မလောက်တော့ပါ "
+                    f"({_free2_mb:.0f}MB သာ ကျန်သည်၊ "
+                    f"ဒီ video အတွက် ~{_need_mb:.0f}MB လိုသည်) — "
+                    "ခဏစောင့်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။"
+                )
+        except PipelineError:
+            raise
+        except Exception:
+            pass
 
     # 2) recap plan (live AI or mock / prebuilt) — mode-aware.
     # Plans are re-validated here so even a directly-passed plan gets
@@ -352,7 +562,10 @@ def run_full_recap_pipeline(
                 plan = generate_mock_pro_plan(_video_dur)
             else:
                 plan = analyze_video_pro_blocks(
-                    local_path, user_api_key, model=model)
+                    local_path, user_api_key, model=model,
+                    gemini_file_name=gemini_file_name,
+                    video_duration=_video_dur,
+                    delete_remote=False)
         else:
             if use_mock_plan:
                 plan = generate_mock_recap_plan(_video_dur)
@@ -361,6 +574,9 @@ def run_full_recap_pipeline(
                     local_path, user_api_key,
                     target_duration=target_duration, style=style,
                     model=model,
+                    gemini_file_name=gemini_file_name,
+                    video_duration=_video_dur,
+                    delete_remote=False,
                 )
     if processing_mode == "pro_ai_recap":
         plan = validate_pro_blocks(plan, _video_dur)
@@ -394,7 +610,9 @@ def run_full_recap_pipeline(
                         try:
                             _filled = analyze_video_pro_fill(
                                 local_path, user_api_key,
-                                _empty[_i:_i + PRO_FILL_BATCH], model=model)
+                                _empty[_i:_i + PRO_FILL_BATCH], model=model,
+                                gemini_file_name=gemini_file_name,
+                                delete_remote=False)
                             _filled_blocks.extend(
                                 _filled.get("blocks", []) or [])
                         except Exception:
@@ -432,7 +650,9 @@ def run_full_recap_pipeline(
                             _exp = analyze_video_pro_fill(
                                 local_path, user_api_key,
                                 _under[_i:_i + PRO_FILL_BATCH],
-                                model=model)
+                                model=model,
+                                gemini_file_name=gemini_file_name,
+                                delete_remote=False)
                             _exp_blocks.extend(
                                 _exp.get("blocks", []) or [])
                         except Exception:
@@ -473,6 +693,58 @@ def run_full_recap_pipeline(
         _pro_covered = sum(
             b["audio_len"] for b in blocks
             if str(b.get("text", "")).strip())
+
+        # Hybrid: no server render — pre-mix the block audios into ONE
+        # track (speech on the dialogue windows, silence elsewhere),
+        # rebuild the SRT on the original timeline, build the pack.
+        if hybrid_pack:
+            _report("pack", 0.0, "Hybrid pack ထုတ်နေသည်…")
+            _mixed = mix_pro_block_audio(
+                blocks, work_dir,
+                os.path.join(work_dir, "voiceover_mixed.mp3"))
+            _pro_srt_path = os.path.join(work_dir, "pro_subtitles.srt")
+            build_pro_srt(blocks, _pro_srt_path)
+            _pack = _build_hybrid_pack(
+                run_dir=work_dir, processing_mode="pro_ai_recap",
+                title=title, script_text=script_text,
+                sync_method="pro_blocks",
+                narration_coverage=_narration_coverage(
+                    _pro_covered, _video_dur),
+                aspect_ratio=aspect_ratio,
+                video_duration=_video_dur,
+                src_w=metadata.get("width") or 0,
+                src_h=metadata.get("height") or 0,
+                fit_mode=fit_mode, crop_align=crop_align,
+                inner_scale=inner_scale, vertical_pos=vertical_pos,
+                horizontal_pos=horizontal_pos,
+                mirror_horizontal=mirror_horizontal,
+                copyright_zoom=copyright_zoom,
+                random_crop_offset=random_crop_offset,
+                bg_volume=bg_volume, blur_boxes=blur_boxes,
+                subtitle_config=subtitle_config,
+                burn_subtitles=burn_subtitles,
+                voiceover_path=_mixed, srt_path=_pro_srt_path,
+                extra={"pro_fill_status": _pro_fill_status},
+            )
+            _report("pack", 1.0, "Hybrid pack အဆင်သင့်")
+            if gemini_file_name:
+                delete_gemini_file(user_api_key, gemini_file_name)
+            return {
+                "hybrid_pack": True,
+                "pack_dir": work_dir,
+                "pack": _pack,
+                "title": title,
+                "script_text": script_text,
+                "subtitle_mode": ("burned_in" if burn_subtitles
+                                  else "soft"),
+                "sync_method": "pro_blocks",
+                "narration_coverage": _narration_coverage(
+                    _pro_covered, _video_dur),
+                "video_speed_factor": None,
+                "aspect_ratio": aspect_ratio,
+                "processing_mode": "pro_ai_recap",
+                "pro_fill_status": _pro_fill_status,
+            }
 
         # 5) Pro render (blocks define the timeline + synced subtitles)
         final_path = os.path.join(output_dir, output_name)
@@ -612,7 +884,9 @@ def run_full_recap_pipeline(
                         local_path, user_api_key,
                         from_time=audio_duration,
                         video_duration=_video_dur,
-                        style=style, model=model)
+                        style=style, model=model,
+                        gemini_file_name=gemini_file_name,
+                        delete_remote=False)
                     _cont_text = str(
                         _tail.get("burmese_script", "")).strip()
                 except Exception as _e:
@@ -636,7 +910,9 @@ def run_full_recap_pipeline(
                             from_time=audio_duration,
                             video_duration=_video_dur,
                             style=style, model=model,
-                            delivered_words=_delivered_words)
+                            delivered_words=_delivered_words,
+                            gemini_file_name=gemini_file_name,
+                            delete_remote=False)
                         _cont_text2 = str(
                             _tail2.get("burmese_script", "")).strip()
                         _reasked = True
@@ -699,6 +975,66 @@ def run_full_recap_pipeline(
         # pad silence if shorter; atempo (+ scaled SRT) if longer.
         fitted_audio, fitted_srt, audio_fit = fit_audio_to_duration(
             voiceover_path, srt_path, _video_dur, work_dir)
+
+        # Hybrid: no server render — build the pack and return. The
+        # device encodes from the pack (source + voiceover + SRT +
+        # filter graph). The shared Gemini file is deleted once here,
+        # after ALL analysis calls for this run.
+        if hybrid_pack:
+            _report("pack", 0.0, "Hybrid pack ထုတ်နေသည်…")
+            _pack = _build_hybrid_pack(
+                run_dir=work_dir, processing_mode="ai_recap",
+                title=title, script_text=script_text,
+                sync_method="full_narration",
+                narration_coverage=_narration_coverage(
+                    audio_duration, _video_dur),
+                aspect_ratio=aspect_ratio,
+                video_duration=_video_dur,
+                src_w=metadata.get("width") or 0,
+                src_h=metadata.get("height") or 0,
+                fit_mode=fit_mode, crop_align=crop_align,
+                inner_scale=inner_scale, vertical_pos=vertical_pos,
+                horizontal_pos=horizontal_pos,
+                mirror_horizontal=mirror_horizontal,
+                copyright_zoom=copyright_zoom,
+                random_crop_offset=random_crop_offset,
+                bg_volume=bg_volume, blur_boxes=blur_boxes,
+                subtitle_config=subtitle_config,
+                burn_subtitles=burn_subtitles,
+                voiceover_path=fitted_audio, srt_path=fitted_srt,
+                extra={
+                    "tts_rate": _tts_rate_used,
+                    "audio_fit": audio_fit,
+                    "continuation_rounds": len(_cont_log),
+                    "continuation_cap_hit": _cont_cap_hit,
+                    "continuation_log": _cont_log,
+                    "continuation_error": _cont_error,
+                },
+            )
+            _report("pack", 1.0, "Hybrid pack အဆင်သင့်")
+            if gemini_file_name:
+                delete_gemini_file(user_api_key, gemini_file_name)
+            return {
+                "hybrid_pack": True,
+                "pack_dir": work_dir,
+                "pack": _pack,
+                "title": title,
+                "script_text": script_text,
+                "subtitle_mode": ("burned_in" if burn_subtitles
+                                  else "soft"),
+                "sync_method": "full_narration",
+                "narration_coverage": _narration_coverage(
+                    audio_duration, _video_dur),
+                "video_speed_factor": 1.0,
+                "aspect_ratio": aspect_ratio,
+                "processing_mode": "ai_recap",
+                "tts_rate": _tts_rate_used,
+                "audio_fit": audio_fit,
+                "continuation_rounds": len(_cont_log),
+                "continuation_cap_hit": _cont_cap_hit,
+                "continuation_log": _cont_log,
+                "continuation_error": _cont_error,
+            }
 
         # 5) render — full footage (highlights tile the whole video),
         # video speed exactly 1.0, narration as master.
@@ -768,7 +1104,8 @@ def run_full_recap_pipeline(
     for name in ("segments",):
         shutil.rmtree(os.path.join(work_dir, name), ignore_errors=True)
     try:
-        if os.path.abspath(local_path).startswith(os.path.abspath(work_dir)):
+        if local_path and os.path.abspath(local_path).startswith(
+                os.path.abspath(work_dir)):
             os.remove(local_path)
     except OSError:
         pass

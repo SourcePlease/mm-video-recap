@@ -203,6 +203,35 @@ def _discover_flash_models(client: genai.Client,
         return []
 
 
+def _resolve_uploaded(client: genai.Client, path: str,
+                      gemini_file_name: Optional[str] = None):
+    """Return the Gemini File object for analysis.
+
+    Default (server mode): upload the local file. When
+    ``gemini_file_name`` is given (Hybrid mode — the browser uploaded
+    the video directly to the Gemini Files API), fetch the
+    already-uploaded file instead of uploading again.
+    """
+    if gemini_file_name:
+        return client.files.get(name=str(gemini_file_name))
+    return client.files.upload(file=path)
+
+
+def delete_gemini_file(user_api_key: str, gemini_file_name: str) -> None:
+    """Best-effort delete of a Gemini remote file (Hybrid cleanup).
+
+    Never raises — a failed cleanup must not fail the run.
+    """
+    try:
+        _k = _require_key(user_api_key)
+        if not gemini_file_name:
+            return
+        _client = genai.Client(**{"api_key": _k})
+        _client.files.delete(name=str(gemini_file_name))
+    except Exception:
+        pass
+
+
 def _wait_for_active(client: genai.Client, file_name: str,
                      timeout_s: int = 600, interval_s: int = 5):
     """Poll the uploaded file until its state becomes ACTIVE."""
@@ -483,6 +512,9 @@ def analyze_video_for_recap(
     target_duration: int = 30,
     style: str = DEFAULT_STYLE,
     model: Optional[str] = None,
+    gemini_file_name: Optional[str] = None,
+    video_duration: Optional[float] = None,
+    delete_remote: bool = True,
 ) -> Dict[str, Any]:
     """Analyze a video with the USER's own Gemini key; return a recap plan.
 
@@ -499,16 +531,24 @@ def analyze_video_for_recap(
     """
     api_key = _require_key(user_api_key)
 
-    path = str(video_path)
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Video file not found: {path}")
-
-    # Real duration FIRST — the full-duration prompt needs it.
-    metadata = get_video_metadata(path)
-    duration = metadata.get("duration") or 0
+    path = str(video_path) if video_path else ""
+    if gemini_file_name:
+        # Hybrid mode: the browser uploaded the video to Gemini
+        # directly — there is no local file to ffprobe, so the
+        # duration comes from the browser's video metadata.
+        if not video_duration:
+            raise AnalyzerError(
+                "Hybrid: video_duration လိုအပ်ပါသည်။")
+        duration = float(video_duration)
+    else:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Video file not found: {path}")
+        # Real duration FIRST — the full-duration prompt needs it.
+        metadata = get_video_metadata(path)
+        duration = metadata.get("duration") or 0
 
     client = genai.Client(api_key=api_key)
-    uploaded = client.files.upload(file=path)
+    uploaded = _resolve_uploaded(client, path, gemini_file_name)
     try:
         _wait_for_active(client, uploaded.name)
         prompt = _build_prompt(duration, style)
@@ -517,16 +557,22 @@ def analyze_video_for_recap(
         return validate_recap_plan(plan, duration)
     finally:
         # Keep the user's free cloud storage clean, even on failure.
-        try:
-            client.files.delete(name=uploaded.name)
-        except Exception:
-            pass
+        # Hybrid: the shared file is deleted once by the pipeline
+        # after ALL analysis calls (continuation/fill reuse it).
+        if delete_remote:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
 
 
 def analyze_video_pro_blocks(
     video_path,
     user_api_key: str,
     model: Optional[str] = None,
+    gemini_file_name: Optional[str] = None,
+    video_duration: Optional[float] = None,
+    delete_remote: bool = True,
 ) -> Dict[str, Any]:
     """Analyze a dialogue video with the USER's own Gemini key (Step 15).
 
@@ -539,24 +585,32 @@ def analyze_video_pro_blocks(
     """
     api_key = _require_key(user_api_key)
 
-    path = str(video_path)
-    if not os.path.isfile(path):
+    path = str(video_path) if video_path else ""
+    if not gemini_file_name and not os.path.isfile(path):
         raise FileNotFoundError(f"Video file not found: {path}")
 
     client = genai.Client(api_key=api_key)
-    uploaded = client.files.upload(file=path)
+    uploaded = _resolve_uploaded(client, path, gemini_file_name)
     try:
         _wait_for_active(client, uploaded.name)
         prompt = _build_pro_prompt()
         plan = _generate_with_fallback(
             client, uploaded, prompt, PRO_BLOCKS_JSON_SCHEMA, model)
-        metadata = get_video_metadata(path)
-        return validate_pro_blocks(plan, metadata.get("duration") or 0)
+        if gemini_file_name:
+            if not video_duration:
+                raise AnalyzerError(
+                    "Hybrid: video_duration လိုအပ်ပါသည်။")
+            _dur = float(video_duration)
+        else:
+            metadata = get_video_metadata(path)
+            _dur = metadata.get("duration") or 0
+        return validate_pro_blocks(plan, _dur)
     finally:
-        try:
-            client.files.delete(name=uploaded.name)
-        except Exception:
-            pass
+        if delete_remote:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
 
 
 def analyze_video_continuation(
@@ -567,6 +621,8 @@ def analyze_video_continuation(
     style: str = DEFAULT_STYLE,
     model: Optional[str] = None,
     delivered_words: Optional[int] = None,
+    gemini_file_name: Optional[str] = None,
+    delete_remote: bool = True,
 ) -> Dict[str, Any]:
     """Ask Gemini for narration covering ONLY [from_time, video_duration].
 
@@ -583,14 +639,14 @@ def analyze_video_continuation(
     """
     api_key = _require_key(user_api_key)
 
-    path = str(video_path)
-    if not os.path.isfile(path):
+    path = str(video_path) if video_path else ""
+    if not gemini_file_name and not os.path.isfile(path):
         raise FileNotFoundError(f"Video file not found: {path}")
     if float(video_duration) <= float(from_time):
         raise AnalyzerError("ဆက်လက် ဇာတ်ကြောင်းပြောရန် အပိုင်း မကျန်ပါ။")
 
     client = genai.Client(api_key=api_key)
-    uploaded = client.files.upload(file=path)
+    uploaded = _resolve_uploaded(client, path, gemini_file_name)
     try:
         _wait_for_active(client, uploaded.name)
         if delivered_words is not None:
@@ -607,10 +663,11 @@ def analyze_video_continuation(
                 "AI က ဆက်လက် ဇာတ်ကြောင်းပြော ပြန်မပေးနိုင်ပါ။")
         return {"burmese_script": script}
     finally:
-        try:
-            client.files.delete(name=uploaded.name)
-        except Exception:
-            pass
+        if delete_remote:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
 
 
 def analyze_video_pro_fill(
@@ -618,6 +675,8 @@ def analyze_video_pro_fill(
     user_api_key: str,
     windows,
     model: Optional[str] = None,
+    gemini_file_name: Optional[str] = None,
+    delete_remote: bool = True,
 ) -> Dict[str, Any]:
     """Ask Gemini for Myanmar narration for the given empty windows.
 
@@ -630,15 +689,15 @@ def analyze_video_pro_fill(
     """
     api_key = _require_key(user_api_key)
 
-    path = str(video_path)
-    if not os.path.isfile(path):
+    path = str(video_path) if video_path else ""
+    if not gemini_file_name and not os.path.isfile(path):
         raise FileNotFoundError(f"Video file not found: {path}")
     windows = [(float(s), float(e)) for s, e in (windows or []) if e > s]
     if not windows:
         return {"blocks": []}
 
     client = genai.Client(api_key=api_key)
-    uploaded = client.files.upload(file=path)
+    uploaded = _resolve_uploaded(client, path, gemini_file_name)
     try:
         _wait_for_active(client, uploaded.name)
         prompt = _build_pro_fill_prompt(windows)
@@ -655,10 +714,11 @@ def analyze_video_pro_fill(
                 blocks.append({"start": s, "end": e, "text": text})
         return {"blocks": blocks}
     finally:
-        try:
-            client.files.delete(name=uploaded.name)
-        except Exception:
-            pass
+        if delete_remote:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass
 
 
 def validate_recap_plan(
