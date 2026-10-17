@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-17 coverage-fix v3.1"
+BUILD_VERSION = "2026-10-17 coverage-fix v3.2"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -167,6 +167,19 @@ div[role="tabpanel"] {
   background: #e5e5e5;
   box-shadow: 0 10px 34px rgba(0, 0, 0, 0.6),
               0 0 0 1px rgba(255, 255, 255, 0.4) inset;
+}
+/* The label inside a primary button is a nested span: Streamlit's
+   own primary style colours that span white, which beats the
+   inherited black above and leaves white text on a white button
+   (invisible). Force the label — and the disabled state — black. */
+.stApp button[data-testid="stBaseButton-primary"] *,
+.stApp button[data-testid="stBaseButton-primary"]:disabled,
+.stApp button[data-testid="stBaseButton-primary"]:disabled * {
+  color: #000000 !important;
+}
+.stApp button[data-testid="stBaseButton-primary"]:disabled {
+  background: #e5e5e5;
+  opacity: 1;
 }
 
 /* ---- Step 16: Source tab controls (blue accents, per the reference) ---- */
