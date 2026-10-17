@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-17 coverage-fix v3"
+BUILD_VERSION = "2026-10-17 coverage-fix v3.1"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -954,7 +954,8 @@ st.caption(
 # Step 16: live canvas preview of the Source settings (read from
 # session_state — the widgets below update it on every rerun).
 _preview = {
-    "aspect_ratio": str(st.session_state.get("aspect_ratio", "9:16")),
+    "aspect_ratio": str(
+        st.session_state.get("aspect_ratio", "9:16")).strip().lower(),
     "fit_mode": str(st.session_state.get("fit_mode", "crop")),
     "crop_align": str(st.session_state.get("crop_align", "center")),
     "inner_scale": float(st.session_state.get("inner_scale", 1.22)),
@@ -1562,8 +1563,11 @@ if run_btn and not _run_blocked:
         # tab's 5-way pill selector, not the old Advanced radio).
         "processing_mode": str(
             st.session_state.get("processing_mode", "ai_recap")),
+        # Normalize: the pills offer "Original" (capital O) but the
+        # render contract is lowercase "original" — without this,
+        # picking Original fails the Run with a ValueError.
         "aspect_ratio": str(
-            st.session_state.get("aspect_ratio", "9:16")),
+            st.session_state.get("aspect_ratio", "9:16")).strip().lower(),
         "fit_mode": str(st.session_state.get("fit_mode", "crop")),
         "crop_align": str(
             st.session_state.get("crop_align", "center")),

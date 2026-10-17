@@ -580,8 +580,19 @@ ASPECT_TARGETS: Dict[str, Tuple[int, int]] = {
 PROCESSING_MODES = ("ai_recap", "pro_ai_recap")
 
 
+def _normalize_aspect(aspect_ratio) -> str:
+    """Normalize a UI aspect label to the render contract.
+
+    The Source tab's pills offer "Original" (capital O); the render
+    contract is lowercase "original". Without this, picking Original
+    fails the Run with "aspect_ratio must be 'original', ...".
+    """
+    return str(aspect_ratio or "").strip().lower()
+
+
 def _resolve_aspect_target(aspect_ratio: str, src_meta: Dict) -> Tuple[int, int]:
     """Map an aspect name to the (W, H) render target."""
+    aspect_ratio = _normalize_aspect(aspect_ratio)
     if aspect_ratio == "original":
         w = int(src_meta.get("width") or 0)
         h = int(src_meta.get("height") or 0)
@@ -1067,6 +1078,7 @@ def render_recap_video(
     aspect_ratio, video_speed_factor, duration, width, height, has_audio,
     blur_boxes_applied, subtitle_position, copyright_applied, fit_mode.
     """
+    aspect_ratio = _normalize_aspect(aspect_ratio)
     if aspect_ratio not in ("original", "16:9", "9:16", "1:1", "4:5"):
         raise ValueError(
             "aspect_ratio must be 'original', '16:9', '9:16', '1:1' or '4:5'.")
@@ -1274,6 +1286,7 @@ def render_pro_recap_video(
     speed 1.0), duration, width, height, has_audio, blur_boxes_applied,
     subtitle_position, copyright_applied, fit_mode, srt_path.
     """
+    aspect_ratio = _normalize_aspect(aspect_ratio)
     if aspect_ratio not in ("original", "16:9", "9:16", "1:1", "4:5"):
         raise ValueError(
             "aspect_ratio must be 'original', '16:9', '9:16', '1:1' or '4:5'.")
