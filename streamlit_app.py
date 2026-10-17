@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-17 hybrid v1.1"
+BUILD_VERSION = "2026-10-18 hybrid v1.2"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -247,6 +247,81 @@ div[role="tabpanel"] {
    positioned with translate(-50%, -50%) inside the slider. */
 .stApp [data-testid="stSlider"] div[style*="translate(-50%, -50%)"] {
   background-color: #3b82f6;
+}
+
+/* ---- Responsive: automatic desktop / mobile layout (CSS only) ----
+   No widget-tree change: same controls, same order, same labels,
+   same B&W + Step 16 blue accents. Breakpoint 768px — phones keep
+   the phone-first stacked layout; wider screens get a wider content
+   column + a larger (capped) canvas. No new colours in this block:
+   layout / sizing / spacing only. */
+@media (max-width: 768px) {
+  /* Mobile: tight padding so canvas + controls use the full width. */
+  .stApp [data-testid="stMainBlockContainer"] {
+    padding-left: 12px;
+    padding-right: 12px;
+    padding-top: 0.75rem;
+    max-width: 100%;
+  }
+  /* Title fits a narrow screen. */
+  .stApp h1 {
+    font-size: 1.6rem;
+    line-height: 1.25;
+  }
+  /* Run button: full width, easy thumb target. The button alone
+     is not enough: Streamlit shrink-wraps the stButton /
+     stElementContainer wrappers to the button's intrinsic width,
+     so the wrappers must stretch too. */
+  .stApp [data-testid="stElementContainer"]:has(> div[data-testid="stButton"]) {
+    width: 100%;
+  }
+  .stApp [data-testid="stButton"] {
+    width: 100%;
+  }
+  .stApp button[data-testid="stBaseButton-primary"] {
+    width: 100%;
+  }
+  /* Tabs: compact + horizontally scrollable instead of clipped. */
+  div[data-testid="stTabs"] div[role="tablist"] {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  div[data-testid="stTabs"] div[role="tab"] {
+    padding: 8px 10px;
+    font-size: 14px;
+    white-space: nowrap;
+  }
+  /* Pills: wrap to the next line instead of clipping off-screen. */
+  .stApp [data-testid="stButtonGroup"] {
+    flex-wrap: wrap;
+  }
+  .stApp [data-testid="stButtonGroup"] button[data-variant="pills"] {
+    padding: 6px 12px;
+    font-size: 14px;
+  }
+  /* Guard: a squeezed slider/stepper row must never cause page scroll. */
+  .stApp {
+    overflow-x: hidden;
+  }
+}
+@media (min-width: 769px) {
+  /* Desktop: wider content column, comfortable reading width. */
+  .stApp [data-testid="stMainBlockContainer"] {
+    max-width: 980px;
+    padding-left: 2rem;
+    padding-right: 2rem;
+  }
+  /* Run button: prominent, not stretched across the whole column. */
+  .stApp button[data-testid="stBaseButton-primary"] {
+    min-width: 320px;
+    padding: 16px 28px;
+    font-size: 17px;
+  }
+  /* Pills: comfortable wrap. */
+  .stApp [data-testid="stButtonGroup"] {
+    flex-wrap: wrap;
+  }
 }
 </style>
 """
@@ -1577,9 +1652,15 @@ with tab_src:
 
     # ---- Hybrid: Render Location (device encode vs server encode) ----
     st.markdown("### Render Location")
+    # Explicit default= on every pills call: Streamlit's implicit
+    # first-option selection is not a contract — a fresh load must
+    # deterministically land on the intended defaults (Hybrid, 9:16,
+    # Crop, Center). default= only applies when the key is absent,
+    # so it never overrides a user's existing choice.
     st.pills(
         "Render Location",
         options=["hybrid", "server"],
+        default="hybrid",
         format_func=lambda m: (
             "Hybrid — ဖုန်းမှာ ပေါင်းမည်" if m == "hybrid"
             else "Server — server မှာ ပေါင်းမည်"),
@@ -1602,6 +1683,7 @@ with tab_src:
     st.pills(
         "Aspect Ratio",
         options=["Original", "9:16", "1:1", "4:5", "16:9"],
+        default="9:16",
         key="aspect_ratio",
         label_visibility="collapsed",
     )
@@ -1609,6 +1691,7 @@ with tab_src:
     st.pills(
         "Fit Mode",
         options=["crop", "pad"],
+        default="crop",
         format_func=lambda m: (
             "Crop (fill)" if m == "crop" else "Pad (blur bg)"),
         key="fit_mode",
@@ -1618,6 +1701,7 @@ with tab_src:
         st.pills(
             "Crop alignment",
             options=["top", "center", "bottom"],
+            default="center",
             format_func=lambda a: a.capitalize(),
             key="crop_align",
             label_visibility="collapsed",

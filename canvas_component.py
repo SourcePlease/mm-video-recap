@@ -363,6 +363,26 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 }
 .mmr-hidden { display: none !important; }
 
+/* ---- Responsive: the phone mockup scales with its container ----
+   The iframe's own width is the viewport here (Streamlit column
+   width). Mobile keeps the current 400px cap (effectively full
+   width on a phone, never huge on a tablet); desktop gets a larger
+   but capped phone so it never stretches huge or looks lost.
+   fitHeight() already sizes the iframe from content height, so no
+   JS change is needed — the phone scales purely by CSS. */
+@media (min-width: 769px) {
+  .mmr-phone { width: min(480px, 100%); }
+  .mmr-empty { padding: 32px 28px; }
+}
+@media (max-width: 768px) {
+  .mmr-wrap { padding: 4px 0 8px; }
+  /* Compact in-canvas controls on a narrow phone. */
+  .mmr-pillbtn { padding: 10px 16px; font-size: 14px; }
+  .mmr-empty { padding: 22px 14px; gap: 10px; }
+  .mmr-empty-icon { font-size: 42px; }
+  .mmr-empty-title { font-size: 17px; }
+}
+
 </style>
 </head>
 <body>
@@ -1224,60 +1244,127 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     return null;
   }
 
+  /* Parse WxH from an `ffmpeg -i` log (header-only probe, no decode).
+     Pure function (unit-tested under node): ffmpeg prints e.g.
+       Stream #0:0(und): Video: hevc (Main) (hvc1 / 0x...),
+         yuv420p(tv), 720x1280, 1234 kb/s, ...
+     The first `<digits>x<digits>` after "Video:" is the display
+     size. Returns null when the log has no Video stream. */
+  function parseDimsFromFFmpegLog(log) {
+    /* Stream id "[0x1]" appears in real ffmpeg ≥5 output
+       (Stream #0:0[0x1](und): Video: ...); older output omits it. */
+    var m = /Stream #\d+:\d+(?:\[0x[0-9a-f]+\])?(?:\([^)]*\))?: Video:[^\n]*?(\d{2,5})x(\d{2,5})/
+      .exec(log || "");
+    if (!m) return null;
+    var w = parseInt(m[1], 10), h = parseInt(m[2], 10);
+    if (!(w > 0 && h > 0)) return null;
+    return { width: w, height: h };
+  }
+
+  /* Header-only dimension probe via FFmpeg.wasm: writes the file,
+     runs `ffmpeg -i` (no output, no decode), parses dims from the
+     log, deletes the file again. Used when the browser decoder
+     reports a duration but videoWidth == 0 (HEVC: the browser fires
+     loadedmetadata with duration yet cannot decode frames). Throws
+     when FFmpeg is unavailable (CDN) — the caller falls back. */
+  async function probeDimsViaFFmpeg(file) {
+    var ff = await loadFFmpeg();
+    var buf = new Uint8Array(await file.arrayBuffer());
+    await ff.writeFile("probe.mp4", buf);
+    S.hybridLogLines = [];
+    try { await ff.exec(["-i", "probe.mp4"]); } catch (e) {
+      /* No output file: expected for a probe-only run. */
+    }
+    var dims = parseDimsFromFFmpegLog(S.hybridLogLines.join("\n"));
+    try { await ff.deleteFile("probe.mp4"); } catch (e) { /* gone */ }
+    return dims;
+  }
+
   /* Video metadata (duration / dims), probed ONCE at pick time and
-     cached. The probe runs in the background while the user adjusts
-     settings; by Run time it is usually done. Retries once with a
-     fresh load (slow HEVC decode), 15s per attempt. Returns null when
-     the browser truly cannot read the metadata — the Run then fails
-     fast BEFORE the Gemini upload, never after it. */
+     cached. Decoder-independent: the DURATION comes from the <video>
+     element (valid even when the browser cannot decode the frames —
+     HEVC fires loadedmetadata with duration but videoWidth == 0),
+     and the DIMENSIONS come from an FFmpeg.wasm header probe when
+     the element reports none. The probe runs in the background while
+     the user adjusts settings; by Run time it is usually done.
+     Returns null when metadata is truly unreadable — the Run then
+     fails fast BEFORE the Gemini upload, never after it. */
   function probeMetaAtPick(vid) {
     S.cachedMeta = null;
     S.cachedMetaFor = null;
     S.metaFailedFor = null;
-    var attempt = 0;
-    function tryOnce() {
-      attempt += 1;
-      return new Promise(function (resolve) {
-        if (video.videoWidth > 0 && isFinite(video.duration)
-            && video.duration > 0) {
-          resolve({
-            duration: video.duration,
-            width: video.videoWidth, height: video.videoHeight,
-          });
-          return;
+    S.metaProbePromise = (async function () {
+      /* 1) Duration from the <video> element. NEVER attach a
+         loadedmetadata listener without checking the element's
+         current state first: the event may already have fired
+         (readyState >= HAVE_METADATA) and the listener would wait
+         forever. Reading current state IS the already-fired fix. */
+      function elementMeta() {
+        var dur = video.duration;
+        if (isFinite(dur) && dur > 0) {
+          return {
+            duration: dur,
+            width: video.videoWidth > 0 ? video.videoWidth : 0,
+            height: video.videoHeight > 0 ? video.videoHeight : 0,
+          };
         }
-        var done = false;
-        var to = setTimeout(function () {
-          if (!done) { done = true; resolve(null); }
-        }, 15000);
-        video.addEventListener("loadedmetadata", function h() {
-          if (done) return;
-          done = true;
-          clearTimeout(to);
-          video.removeEventListener("loadedmetadata", h);
-          resolve({
-            duration: video.duration,
-            width: video.videoWidth, height: video.videoHeight,
+        return null;
+      }
+      function waitForElementMeta(timeoutMs) {
+        var cur = elementMeta();
+        if (cur) return Promise.resolve(cur);
+        return new Promise(function (resolve) {
+          var done = false;
+          var to = setTimeout(function () {
+            if (!done) { done = true; resolve(null); }
+          }, timeoutMs);
+          video.addEventListener("loadedmetadata", function h() {
+            if (done) return;
+            done = true;
+            clearTimeout(to);
+            video.removeEventListener("loadedmetadata", h);
+            resolve(elementMeta());
           });
         });
-      }).then(function (meta) {
-        if (meta && meta.width > 0 && isFinite(meta.duration)
-            && meta.duration > 0) {
-          S.cachedMeta = meta;
-          S.cachedMetaFor = vid;
-          S.metaProbePromise = null;
-          return meta;
-        }
-        if (attempt < 2) {
+      }
+      var meta = elementMeta();
+      if (!meta) {
+        meta = await waitForElementMeta(15000);
+        if (!meta) {
           try { video.load(); } catch (e) { /* retry load failed */ }
-          return tryOnce();
+          meta = await waitForElementMeta(15000);
         }
+      }
+      if (!meta) {
         S.metaFailedFor = vid;
         S.metaProbePromise = null;
         return null;
-      });
-    }
-    S.metaProbePromise = tryOnce();
+      }
+      /* 2) Dimensions: element first; FFmpeg.wasm header probe when
+         the decoder reports none (HEVC). If FFmpeg is unavailable
+         (CDN), fall through to the element dims (0 here) and the
+         fail-fast below — never after a successful upload. */
+      if (!(meta.width > 0 && meta.height > 0)) {
+        try {
+          var f = await getSourceFile();
+          var dims = f ? await probeDimsViaFFmpeg(f) : null;
+          if (dims) {
+            meta.width = dims.width;
+            meta.height = dims.height;
+          }
+        } catch (e) { /* FFmpeg unavailable — fall through */ }
+      }
+      if (meta.width > 0 && meta.height > 0
+          && isFinite(meta.duration) && meta.duration > 0) {
+        S.cachedMeta = meta;
+        S.cachedMetaFor = vid;
+        S.metaProbePromise = null;
+        return meta;
+      }
+      S.metaFailedFor = vid;
+      S.metaProbePromise = null;
+      return null;
+    })();
     return S.metaProbePromise;
   }
 
