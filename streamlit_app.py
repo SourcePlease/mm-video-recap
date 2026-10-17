@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-17 hybrid v1"
+BUILD_VERSION = "2026-10-17 hybrid v1.1"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -537,7 +537,42 @@ _JOB_RESTART_MSG = (
 )
 _JOB_STALE_RUNNING_S = 15 * 60  # file untouched this long -> worker dead
 _JOB_LOST_MIN_S = 60  # file missing sooner -> worker may not have started yet
+# Hybrid: the browser→Gemini upload alone takes ~45s, and a throttled
+# server is slow to launch the worker — give a Hybrid Run longer
+# before its missing status file counts as lost.
+_JOB_LOST_MIN_S_HYBRID = 180
 _JOB_LOST_MAX_S = 30 * 60  # file missing later -> stale entry, ignore
+# Distinct message when the Run never started on the server (run dir
+# exists but no status file was ever written — the handoff dropped
+# the Run, e.g. the gemini_uploaded action never reached the
+# starter). This is NOT a server restart: do not blame one.
+_JOB_NEVER_STARTED_MSG = (
+    "Run က server မှာ မစတင်ခဲ့ပါ — အလုပ် server ကို မရောက်ခဲ့ပါ။ "
+    "Run ကို ထပ်နှိပ်ပြီး ပြန်စပေးပါ။"
+)
+
+
+def _lost_message(saved_at, run_dir, last_detail="") -> str:
+    """Honest lost-job message for a missing status file.
+
+    The restart claim rests on the boot-time check (the process
+    booted after the save) — that holds even when the run dir
+    survived (a restart does not always wipe /tmp). The NEW
+    distinction is the never-started case: the process did NOT
+    boot after the save, yet no status file exists even though
+    the run dir does — the Run never started on the server
+    (the handoff dropped it), so say that instead of blaming a
+    restart. Appends the last known stage when it is known.
+    """
+    if _classify_lost_job(saved_at) == "server_restart":
+        _msg = _JOB_RESTART_MSG
+    elif os.path.isdir(str(run_dir)):
+        _msg = _JOB_NEVER_STARTED_MSG
+    else:
+        _msg = _JOB_LOST_MSG
+    if last_detail:
+        _msg = f"{_msg} (နောက်ဆုံး အဆင့်: {last_detail})"
+    return _msg
 
 
 def _classify_lost_job(saved_at, boot_time=BOOT_TIME) -> str:
@@ -933,13 +968,28 @@ def _render_run_progress() -> None:
                     except OSError:
                         _fage = 0.0
                     if _fage > _JOB_STALE_RUNNING_S:
-                        _msg = (
-                            _JOB_RESTART_MSG
-                            if _classify_lost_job(
-                                _fstatus.get("started_at")
-                                or _stored.get("saved_at")) == "server_restart"
-                            else _JOB_LOST_MSG)
-                        if st.session_state.get("run_error") != _msg:
+                        # A terminal error already recorded (e.g. the
+                        # worker's real error, or an upload error) is
+                        # NEVER overwritten by the generic lost /
+                        # restart message — the real cause wins.
+                        if not st.session_state.get("run_error"):
+                            _msg = (
+                                _JOB_RESTART_MSG
+                                if _classify_lost_job(
+                                    _fstatus.get("started_at")
+                                    or _stored.get("saved_at")) == "server_restart"
+                                else _JOB_LOST_MSG)
+                            # Honest lost message: include the job's
+                            # last known phase/detail from its status
+                            # file instead of a bare generic claim.
+                            _flast = (
+                                f"{_fstatus.get('phase', '')} — "
+                                f"{_fstatus.get('detail', '')}"
+                            ).strip(" —")
+                            if _flast:
+                                _msg = (
+                                    f"{_msg} "
+                                    f"(နောက်ဆုံး အဆင့်: {_flast})")
                             st.session_state["run_error"] = _msg
                             st.rerun(scope="app")
                     else:
@@ -965,18 +1015,22 @@ def _render_run_progress() -> None:
                 # one (or the container wiped /tmp). Only call it lost
                 # inside a window — too soon and the worker may not
                 # have started yet; too late and it's a stale entry.
+                # Hybrid gets the longer grace window (its Gemini
+                # upload alone takes ~45s on top of throttled start).
                 _saved_at = float(_stored.get("saved_at") or 0)
                 _fage = time.time() - _saved_at if _saved_at else 0.0
-                if _JOB_LOST_MIN_S < _fage < _JOB_LOST_MAX_S:
-                    _msg = (
-                        _JOB_RESTART_MSG
-                        if _classify_lost_job(
-                            _stored.get("saved_at")) == "server_restart"
-                        else _JOB_LOST_MSG)
-                    if st.session_state.get("run_error") != _msg:
-                        st.session_state["run_error"] = _msg
+                _flost_min = (
+                    _JOB_LOST_MIN_S_HYBRID
+                    if _stored.get("render_location") == "hybrid"
+                    else _JOB_LOST_MIN_S)
+                if _flost_min < _fage < _JOB_LOST_MAX_S:
+                    # A terminal error already recorded is NEVER
+                    # overwritten by the lost / restart message.
+                    if not st.session_state.get("run_error"):
+                        st.session_state["run_error"] = _lost_message(
+                            _stored.get("saved_at"), _fdir)
                         st.rerun(scope="app")
-                elif _fage <= _JOB_LOST_MIN_S:
+                elif _fage <= _flost_min:
                     # The worker may not have written its status file
                     # yet — say the job is remembered instead of
                     # showing a silently idle page.
@@ -1207,6 +1261,10 @@ _val = interactive_canvas(
     # see above) + the pack for the device encode (acked once).
     gemini_auth=_gemini_auth,
     gemini_upload_request=st.session_state.get("gemini_nonce"),
+    # Ack for the browser→Gemini upload result: lets the canvas stop
+    # re-sending gemini_uploaded / gemini_upload_error (sticky until
+    # acked, so a later sendValue can never silently lose them).
+    gemini_ack=st.session_state.get("gemini_ack"),
     hybrid_pack=_hybrid_pack_arg,
     key="mmr_canvas",
 )
@@ -1231,8 +1289,12 @@ if isinstance(_val, dict):
     if _action == "gemini_uploaded":
         # The browser uploaded the video directly to Gemini — the
         # server never sees the bytes. Record the file + metadata so
-        # the starter can launch the Hybrid worker.
+        # the starter can launch the Hybrid worker. Ack it (the
+        # canvas re-sends until acked); re-processing the same file
+        # is idempotent.
         _gf_name = _val.get("file_name")
+        if _gf_name:
+            st.session_state["gemini_ack"] = _gf_name
         if _gf_name:
             try:
                 st.session_state["gemini_file"] = {
@@ -1253,6 +1315,8 @@ if isinstance(_val, dict):
         except (TypeError, ValueError):
             pass
     elif _action == "gemini_upload_error":
+        # Ack the error too (the canvas re-sends until acked).
+        st.session_state["gemini_ack"] = "error"
         st.session_state["run_error"] = (
             _val.get("error") or "Gemini တင်မှု မအောင်မြင်ပါ")
         st.session_state["pending_job"] = None
@@ -1930,19 +1994,24 @@ if run_btn and not _run_blocked:
     st.session_state["hybrid_encode"] = None
     st.session_state["gemini_file"] = None
     st.session_state["gemini_upload"] = None
+    # A fresh Run supersedes any previous Gemini-upload ack.
+    st.session_state["gemini_ack"] = None
     # Remember this Run in the browser: if the session dies mid-run,
     # a fresh session re-attaches to the job's status file instead of
     # going silently idle. The load nonce bump forces a fresh read.
+    # render_location rides along so the fragment's lost-job window
+    # can use the longer Hybrid grace after a reload.
     _job_saved_at = time.time()
     st.session_state["stored_job"] = {
-        "run_dir": _run_dir, "saved_at": _job_saved_at}
+        "run_dir": _run_dir, "saved_at": _job_saved_at,
+        "render_location": _render_location}
     st.session_state["restored_job_dir"] = None
     st.session_state["job_save_nonce"] = (
         int(st.session_state.get("job_save_nonce") or 0) + 1)
     streamlit_js_eval(
         js_expressions=(
             f"localStorage.setItem('{LS_JOB}',"
-            f"{json.dumps(json.dumps({'run_dir': _run_dir, 'saved_at': _job_saved_at}))})"
+            f"{json.dumps(json.dumps({'run_dir': _run_dir, 'saved_at': _job_saved_at, 'render_location': _render_location}))})"
         ),
         key=f"mmr_job_save_{st.session_state['job_save_nonce']}",
     )
@@ -2029,6 +2098,18 @@ if _pending and not st.session_state.get("run_job"):
         }
         st.session_state["run_job"] = job
         st.session_state["pending_job"] = None
+        # The status file exists from the moment the worker launches
+        # (before the thread even starts): a started worker can never
+        # look "missing" to the fragment's lost-job check, so a
+        # missing file now honestly means the worker never launched.
+        _write_job_status(_snap.get("run_dir"), {
+            "status": "running",
+            "pct": 0.0,
+            "phase": "analyze",
+            "detail": "စတင်နေသည်…",
+            "started_at": job["started_at"],
+            "snapshot": _job_file_snapshot(_snap),
+        })
         threading.Thread(
             target=_run_pipeline_job, args=(job,), daemon=True).start()
 

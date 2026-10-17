@@ -425,6 +425,19 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     /* ---- Hybrid mode: browser -> Gemini upload + device encode ---- */
     geminiUploadServedNonce: null,
     lastGeminiPct: -1,
+    /* Pick-time video metadata (duration / dims), probed ONCE when the
+       video is picked and cached. Run time uses ONLY this cache —
+       re-probing after the Gemini upload used to time out (HEVC /
+       re-pick race) and kill the Run AFTER a successful upload. */
+    cachedMeta: null,
+    cachedMetaFor: null,
+    metaProbePromise: null,
+    metaFailedFor: null,
+    /* Gemini upload result awaiting Python's ack (args.gemini_ack).
+       The component value can be overwritten by a later sendValue
+       (e.g. a font ack) before Python's rerun reads it — the result
+       is re-sent until acked so it can never be silently lost. */
+    geminiResultPending: null,
     hybridPack: null,
     hybridEncodedPackId: null,
     hybridEncoding: false,
@@ -526,6 +539,11 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     S.hybridEncodedPackId = null;
     S.hybridPack = null;
     S.geminiUploadServedNonce = null;
+    S.cachedMeta = null;
+    S.cachedMetaFor = null;
+    S.metaProbePromise = null;
+    S.metaFailedFor = null;
+    S.geminiResultPending = null;
     hideResultBar();
     if (S.resultBlobUrl) {
       try { URL.revokeObjectURL(S.resultBlobUrl); } catch (e) {}
@@ -912,6 +930,9 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.localDataUrl = dataUrl;
       S.localName = name;
       S.localFile = file;
+      /* Probe metadata NOW (cached for Run time) — the element state
+         is fresh right after this load. */
+      probeMetaAtPick(vid);
       sendValue("video_picked", {
         video_id: vid, video_name: name,
       });
@@ -1203,31 +1224,61 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     return null;
   }
 
-  /* Video metadata (duration / dims) from the <video> element. */
-  function videoMeta() {
-    if (video.videoWidth > 0 && isFinite(video.duration)
-        && video.duration > 0) {
-      return Promise.resolve({
-        duration: video.duration,
-        width: video.videoWidth, height: video.videoHeight,
+  /* Video metadata (duration / dims), probed ONCE at pick time and
+     cached. The probe runs in the background while the user adjusts
+     settings; by Run time it is usually done. Retries once with a
+     fresh load (slow HEVC decode), 15s per attempt. Returns null when
+     the browser truly cannot read the metadata — the Run then fails
+     fast BEFORE the Gemini upload, never after it. */
+  function probeMetaAtPick(vid) {
+    S.cachedMeta = null;
+    S.cachedMetaFor = null;
+    S.metaFailedFor = null;
+    var attempt = 0;
+    function tryOnce() {
+      attempt += 1;
+      return new Promise(function (resolve) {
+        if (video.videoWidth > 0 && isFinite(video.duration)
+            && video.duration > 0) {
+          resolve({
+            duration: video.duration,
+            width: video.videoWidth, height: video.videoHeight,
+          });
+          return;
+        }
+        var done = false;
+        var to = setTimeout(function () {
+          if (!done) { done = true; resolve(null); }
+        }, 15000);
+        video.addEventListener("loadedmetadata", function h() {
+          if (done) return;
+          done = true;
+          clearTimeout(to);
+          video.removeEventListener("loadedmetadata", h);
+          resolve({
+            duration: video.duration,
+            width: video.videoWidth, height: video.videoHeight,
+          });
+        });
+      }).then(function (meta) {
+        if (meta && meta.width > 0 && isFinite(meta.duration)
+            && meta.duration > 0) {
+          S.cachedMeta = meta;
+          S.cachedMetaFor = vid;
+          S.metaProbePromise = null;
+          return meta;
+        }
+        if (attempt < 2) {
+          try { video.load(); } catch (e) { /* retry load failed */ }
+          return tryOnce();
+        }
+        S.metaFailedFor = vid;
+        S.metaProbePromise = null;
+        return null;
       });
     }
-    return new Promise(function (resolve, reject) {
-      var done = false;
-      var to = setTimeout(function () {
-        if (!done) { done = true; reject(new Error("video metadata timeout")); }
-      }, 10000);
-      video.addEventListener("loadedmetadata", function h() {
-        if (done) return;
-        done = true;
-        clearTimeout(to);
-        video.removeEventListener("loadedmetadata", h);
-        resolve({
-          duration: video.duration,
-          width: video.videoWidth, height: video.videoHeight,
-        });
-      });
-    });
+    S.metaProbePromise = tryOnce();
+    return S.metaProbePromise;
   }
 
   /* Resumable upload of the picked file DIRECTLY to the Gemini Files
@@ -1749,12 +1800,20 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     }
     /* Hybrid: browser -> Gemini upload. Python requests it via
        args.gemini_upload_request (fresh nonce per Run). The video
-       goes DIRECTLY to Gemini — never to Streamlit. */
+       goes DIRECTLY to Gemini — never to Streamlit.
+       Metadata comes ONLY from the pick-time cache (probeMetaAtPick)
+       — never re-probed after the upload: the old post-upload probe
+       timed out on HEVC / re-picked videos and killed the Run AFTER
+       a successful upload. If the cache is empty, fail fast BEFORE
+       the upload. The result is sticky (geminiResultPending) until
+       Python acks it via args.gemini_ack — a later sendValue must
+       never silently lose it. */
     if (S.args.gemini_upload_request != null
         && S.args.gemini_upload_request !== S.geminiUploadServedNonce
         && S.localPicked && S.videoId && !S.expectRemove
         && S.args.gemini_auth) {
       S.geminiUploadServedNonce = S.args.gemini_upload_request;
+      S.geminiResultPending = null;
       S.lastGeminiPct = -1;
       (async function () {
         try {
@@ -1763,18 +1822,59 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
             throw new Error(
               "ဗီဒီယို file ကို browser ထဲမှာ မတွေ့ပါ — ဗီဒီယို ပြန်ရွေးပေးပါ။");
           }
+          /* Wait out a still-running pick-time probe, then use ONLY
+             the cache. */
+          if (S.metaProbePromise) {
+            try { await S.metaProbePromise; } catch (e) { /* use cache */ }
+          }
+          var meta = (S.cachedMetaFor === S.videoId) ? S.cachedMeta : null;
+          if (!meta) {
+            throw new Error(
+              "ဒီ video ရဲ့ metadata ကို browser က ဖတ်မရပါ — "
+              + "Server ပုံစံနဲ့ စမ်းကြည့်ပေးပါ "
+              + "(ဒါမှမဟုတ် တခြား video ရွေးပေးပါ)။");
+          }
           var uploaded = await uploadToGemini(f, S.args.gemini_auth);
-          var meta = await videoMeta();
+          S.geminiResultPending = {
+            kind: "uploaded",
+            file_name: uploaded.name,
+            duration: meta.duration,
+            width: meta.width, height: meta.height,
+          };
           sendValue("gemini_uploaded", {
             file_name: uploaded.name,
             duration: meta.duration,
             width: meta.width, height: meta.height,
           });
         } catch (err) {
-          sendValue("gemini_upload_error",
-                    { error: String((err && err.message) || err) });
+          var _emsg = String((err && err.message) || err);
+          S.geminiResultPending = { kind: "error", error: _emsg };
+          sendValue("gemini_upload_error", { error: _emsg });
         }
       })();
+    }
+    /* Sticky Gemini result: re-send until Python acks it
+       (args.gemini_ack === file_name, or "error"). The component
+       value can be overwritten by a later sendValue before Python's
+       rerun reads it — without this, the upload result (or error)
+       is silently lost and the Run stalls or dies. */
+    if (S.geminiResultPending) {
+      var _ack = S.args.gemini_ack;
+      var _want = S.geminiResultPending.kind === "uploaded"
+        ? S.geminiResultPending.file_name : "error";
+      if (_ack === _want) {
+        S.geminiResultPending = null;
+      } else if (S.geminiResultPending.kind === "uploaded") {
+        sendValue("gemini_uploaded", {
+          file_name: S.geminiResultPending.file_name,
+          duration: S.geminiResultPending.duration,
+          width: S.geminiResultPending.width,
+          height: S.geminiResultPending.height,
+        });
+      } else {
+        sendValue("gemini_upload_error",
+                  { error: S.geminiResultPending.error });
+      }
     }
     /* Hybrid: device encode. A new pack (new pack_id) starts the
        FFmpeg.wasm encode; the pack is acked immediately so Python
@@ -1797,6 +1897,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
        a missed ack from spinning reruns. Without this, Run errors
        "select a video" while the video is still on screen. */
     if (S.localPicked && S.videoId && !S.expectRemove
+        && !S.geminiResultPending
         && S.args.pending_ack !== S.videoId
         && Date.now() - S.lastPickAnnounce > 2000) {
       S.lastPickAnnounce = Date.now();
@@ -1827,6 +1928,11 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.hybridGen += 1;
       S.hybridEncodedPackId = null;
       S.hybridPack = null;
+      S.cachedMeta = null;
+      S.cachedMetaFor = null;
+      S.metaProbePromise = null;
+      S.metaFailedFor = null;
+      S.geminiResultPending = null;
       hideResultBar();
       S.boxes = [];
       S.sub = { x: DEFAULT_SUB.x_pct, y: DEFAULT_SUB.y_pct,
@@ -2016,6 +2122,11 @@ def interactive_canvas(
     # logged, rendered, or stored by the frontend.
     gemini_auth: Optional[str] = None,
     gemini_upload_request: Optional[int] = None,
+    # Ack for the browser→Gemini upload result: the frontend re-sends
+    # gemini_uploaded / gemini_upload_error until it sees this
+    # (file_name, or "error") — otherwise a later sendValue can
+    # silently overwrite the result before Python reads it.
+    gemini_ack: Optional[str] = None,
     hybrid_pack: Optional[Dict] = None,
     key: Optional[str] = None,
 ) -> Dict:
@@ -2050,6 +2161,7 @@ def interactive_canvas(
         paused=bool(paused),
         gemini_auth=gemini_auth,
         gemini_upload_request=gemini_upload_request,
+        gemini_ack=gemini_ack,
         hybrid_pack=hybrid_pack,
         default=CANVAS_DEFAULT,
         key=key,
