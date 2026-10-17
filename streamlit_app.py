@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-18 hybrid v1.2"
+BUILD_VERSION = "2026-10-18 hybrid v1.3"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -1341,6 +1341,10 @@ _val = interactive_canvas(
     # acked, so a later sendValue can never silently lose them).
     gemini_ack=st.session_state.get("gemini_ack"),
     hybrid_pack=_hybrid_pack_arg,
+    # Tell the canvas the current Render Location so it gates the
+    # browser-side FFmpeg header probe to Hybrid mode only.
+    render_location=str(
+        st.session_state.get("render_location", "hybrid")),
     key="mmr_canvas",
 )
 if isinstance(_val, dict):

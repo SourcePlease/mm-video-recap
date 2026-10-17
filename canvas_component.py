@@ -1341,10 +1341,16 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
         return null;
       }
       /* 2) Dimensions: element first; FFmpeg.wasm header probe when
-         the decoder reports none (HEVC). If FFmpeg is unavailable
-         (CDN), fall through to the element dims (0 here) and the
-         fail-fast below — never after a successful upload. */
-      if (!(meta.width > 0 && meta.height > 0)) {
+         the decoder reports none (HEVC) — HYBRID MODE ONLY. In
+         Server mode the server ffprobes the uploaded file itself,
+         so browser-side FFmpeg must never load at pick time (a
+         Server-mode user with an HEVC video would otherwise hit a
+         Worker/CDN error for a feature Server mode never needs).
+         Server mode caches duration-only metadata (dims may stay 0);
+         Hybrid mode requires real dims and fails fast below. */
+      var _hybridProbe =
+        ((S.args && S.args.render_location) || "hybrid") === "hybrid";
+      if (_hybridProbe && !(meta.width > 0 && meta.height > 0)) {
         try {
           var f = await getSourceFile();
           var dims = f ? await probeDimsViaFFmpeg(f) : null;
@@ -1354,7 +1360,10 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
           }
         } catch (e) { /* FFmpeg unavailable — fall through */ }
       }
-      if (meta.width > 0 && meta.height > 0
+      var _dimsOk = _hybridProbe
+        ? (meta.width > 0 && meta.height > 0)
+        : true;
+      if (_dimsOk
           && isFinite(meta.duration) && meta.duration > 0) {
         S.cachedMeta = meta;
         S.cachedMetaFor = vid;
@@ -1643,34 +1652,56 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   /* Load FFmpeg.wasm (single-threaded core — Streamlit Cloud cannot
      set COOP/COEP, so the multi-threaded core is not an option).
      CDN risk: ~30MB core per session; if the CDN is unreachable the
-     encode cannot start (the user falls back to Server mode). */
+     encode cannot start (the user falls back to Server mode).
+     Worker CORS: a raw cross-origin URL passed to ff.load() makes
+     FFmpeg derive a cross-origin worker.js, and
+     `new Worker(crossOriginUrl)` is blocked by the browser
+     ("Failed to construct 'Worker'..." — hit live on the user's
+     phone). The documented fix is toBlobURL (@ffmpeg/util): fetch
+     each file via CORS and hand FFmpeg a same-origin blob: URL for
+     core, wasm AND worker. */
   async function loadFFmpeg() {
     if (S.ffmpeg) return S.ffmpeg;
     if (S.ffmpegLoading) return S.ffmpegLoading;
     S.ffmpegLoading = (async function () {
-      var mod = await import(
-        "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js");
-      var ff = new mod.FFmpeg();
-      ff.on("log", function (e) {
-        S.hybridLogLines.push(e.message);
-        if (S.hybridLogLines.length > 200) S.hybridLogLines.shift();
-      });
-      ff.on("progress", function (e) {
-        var pct = Math.round((e.progress || 0) * 100);
-        var now = Date.now();
-        if (pct !== S.lastEncodePct && now - S.lastEncodeSent > 2000) {
-          S.lastEncodePct = pct;
-          S.lastEncodeSent = now;
-          sendValue("hybrid_encode_progress",
-                    { pct: pct, detail: "" });
-        }
-      });
-      await ff.load({
-        coreURL: "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm/ffmpeg-core.js",
-        wasmURL: "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm/ffmpeg-core.wasm",
-      });
-      S.ffmpeg = ff;
-      return ff;
+      try {
+        var mod = await import(
+          "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js");
+        var util = await import(
+          "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/esm/index.js");
+        var ff = new mod.FFmpeg();
+        ff.on("log", function (e) {
+          S.hybridLogLines.push(e.message);
+          if (S.hybridLogLines.length > 200) S.hybridLogLines.shift();
+        });
+        ff.on("progress", function (e) {
+          var pct = Math.round((e.progress || 0) * 100);
+          var now = Date.now();
+          if (pct !== S.lastEncodePct && now - S.lastEncodeSent > 2000) {
+            S.lastEncodePct = pct;
+            S.lastEncodeSent = now;
+            sendValue("hybrid_encode_progress",
+                      { pct: pct, detail: "" });
+          }
+        });
+        var coreBase =
+          "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm";
+        await ff.load({
+          coreURL: await util.toBlobURL(
+            coreBase + "/ffmpeg-core.js", "text/javascript"),
+          wasmURL: await util.toBlobURL(
+            coreBase + "/ffmpeg-core.wasm", "application/wasm"),
+          workerURL: await util.toBlobURL(
+            coreBase + "/ffmpeg-core.worker.js", "text/javascript"),
+        });
+        S.ffmpeg = ff;
+        return ff;
+      } catch (e) {
+        /* Do not cache a rejected promise: a transient CDN blip
+           must not permanently poison later retries. */
+        S.ffmpegLoading = null;
+        throw e;
+      }
     })();
     return S.ffmpegLoading;
   }
@@ -1920,6 +1951,19 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
               "ဒီ video ရဲ့ metadata ကို browser က ဖတ်မရပါ — "
               + "Server ပုံစံနဲ့ စမ်းကြည့်ပေးပါ "
               + "(ဒါမှမဟုတ် တခြား video ရွေးပေးပါ)။");
+          }
+          /* Fail fast BEFORE the Gemini upload if browser-side
+             FFmpeg cannot load (CDN / Worker): the device encode
+             would fail after the upload anyway. loadFFmpeg() is
+             cached, so the encode reuses this instance — no double
+             download. Never a raw browser exception: a friendly
+             message directing the user to Server mode. */
+          try {
+            await loadFFmpeg();
+          } catch (e) {
+            throw new Error(
+              "ဖုန်းထဲက FFmpeg ကို ဖွင့်မရပါ (CDN / browser) — "
+              + "Server ပုံစံနဲ့ စမ်းကြည့်ပေးပါ။");
           }
           var uploaded = await uploadToGemini(f, S.args.gemini_auth);
           S.geminiResultPending = {
@@ -2215,6 +2259,10 @@ def interactive_canvas(
     # silently overwrite the result before Python reads it.
     gemini_ack: Optional[str] = None,
     hybrid_pack: Optional[Dict] = None,
+    # Render location ("hybrid" / "server"): the frontend gates the
+    # browser-side FFmpeg header probe to Hybrid mode only — Server
+    # mode must never load browser FFmpeg at pick time.
+    render_location: str = "hybrid",
     key: Optional[str] = None,
 ) -> Dict:
     """Render the canvas and return the latest user-edited state.
@@ -2250,6 +2298,7 @@ def interactive_canvas(
         gemini_upload_request=gemini_upload_request,
         gemini_ack=gemini_ack,
         hybrid_pack=hybrid_pack,
+        render_location=render_location,
         default=CANVAS_DEFAULT,
         key=key,
     )
