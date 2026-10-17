@@ -1784,7 +1784,12 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
      ("Failed to construct 'Worker'..." — hit live on the user's
      phone). The documented fix is toBlobURL (@ffmpeg/util): fetch
      each file via CORS and hand FFmpeg a same-origin blob: URL for
-     core, wasm AND worker. */
+     core, wasm, worker AND the class worker (classWorkerURL:
+     `.../dist/esm/worker.js` — v1.3 blob-ified the first three but
+     missed this one, so FFmpeg derived it from jsDelivr and the
+     probe still threw; v1.5's reason-reporting finally surfaced
+     it). After this fix the load call contains NO raw jsDelivr
+     URL at all. */
   async function loadFFmpeg() {
     if (S.ffmpeg) return S.ffmpeg;
     if (S.ffmpegLoading) return S.ffmpegLoading;
@@ -1818,6 +1823,12 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
             coreBase + "/ffmpeg-core.wasm", "application/wasm"),
           workerURL: await util.toBlobURL(
             coreBase + "/ffmpeg-core.worker.js", "text/javascript"),
+          /* v1.6: the FFmpeg CLASS worker (worker.js in the
+             @ffmpeg/ffmpeg ESM package — NOT workerURL, which is
+             the multithreading core worker). Without this FFmpeg
+             derives it from the jsDelivr ESM location and
+             `new Worker(jsDelivrUrl)` throws. */
+          classWorkerURL: await util.toBlobURL("https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/worker.js", "text/javascript"),
         });
         S.ffmpeg = ff;
         return ff;
