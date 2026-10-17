@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-18 hybrid v1.6"
+BUILD_VERSION = "2026-10-18 hybrid v1.7"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -420,6 +420,10 @@ if "job_load_nonce" not in st.session_state:
     st.session_state["job_load_nonce"] = 0
 if "job_save_nonce" not in st.session_state:
     st.session_state["job_save_nonce"] = 0
+if "job_clear_pending" not in st.session_state:
+    st.session_state["job_clear_pending"] = False
+if "job_clear_nonce" not in st.session_state:
+    st.session_state["job_clear_nonce"] = 0
 if "forget_just_clicked" not in st.session_state:
     st.session_state["forget_just_clicked"] = False
 
@@ -515,6 +519,20 @@ if isinstance(_parsed_job, dict) and _parsed_job.get("run_dir"):
     st.session_state["stored_job"] = _parsed_job
 elif _parsed_job is not None:
     st.session_state["stored_job"] = None
+# Consume a stale remembered job (v1.7): the fragment schedules this
+# when a remembered job is older than the stale window — the entry
+# is removed from localStorage so the lost message shows ONCE and
+# never nags on later loads. Runs in the main script (not the
+# fragment): a js-eval placed before the fragment's st.rerun() would
+# never render, because st.rerun() discards the current run's output.
+if st.session_state.get("job_clear_pending"):
+    st.session_state["job_clear_pending"] = False
+    st.session_state["job_clear_nonce"] = (
+        int(st.session_state.get("job_clear_nonce") or 0) + 1)
+    streamlit_js_eval(
+        js_expressions=f"localStorage.removeItem('{LS_JOB}')",
+        key=f"mmr_job_clear_{st.session_state['job_clear_nonce']}",
+    )
 
 st.markdown(HEADER_TOP)
 
@@ -1120,6 +1138,20 @@ def _render_run_progress() -> None:
                     # yet — say the job is remembered instead of
                     # showing a silently idle page.
                     st.caption("ထုတ်လုပ်မှု မှတ်ထားသည် — စတင်နေသည်…")
+                else:
+                    # Ancient entry (older than the stale window):
+                    # previously ignored silently, so a Run lost to
+                    # a restart after a long hang showed a fresh
+                    # form with no explanation. Show the lost
+                    # message ONCE, then consume the entry (the main
+                    # script removes it from localStorage) so it
+                    # never nags on later loads.
+                    if not st.session_state.get("run_error"):
+                        st.session_state["run_error"] = _lost_message(
+                            _stored.get("saved_at"), _fdir)
+                        st.session_state["restored_job_dir"] = _fdir
+                        st.session_state["job_clear_pending"] = True
+                        st.rerun(scope="app")
         return
     with job["lock"]:
         status = job["status"]

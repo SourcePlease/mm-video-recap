@@ -1502,41 +1502,138 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     return meta;
   }
 
+  /* Gemini upload timeouts (v1.7): the v1.6 live test froze at
+     "Gemini upload 0%" for ~169 minutes with NO error — the
+     initiation fetch had no timeout and the chunk XHR had no
+     timeout / retry / stall detection, so a stalled connection
+     never settled the promise. Now: the initiation aborts after
+     30s, the chunk aborts after 120s with no progress event, and
+     the whole upload retries ONCE on transient failures (fresh
+     resumable session). Errors carry the stage — (စတင်) for
+     initiation, (bytes) for the chunk — so the next failure tells
+     WHERE it stuck. 4xx (bad key / permission) is NOT retried. */
+  var GEMINI_UPLOAD_START_TIMEOUT_MS = 30000;
+  var GEMINI_UPLOAD_STALL_MS = 120000;
+  var GEMINI_UPLOAD_WATCHDOG_CHECK_MS = 5000;
+
+  /* Stage-carrying upload error. `retryable` marks transient
+     failures (timeout / stall / network / 5xx / 429) — the
+     wrapper retries those once. 4xx auth errors are NOT
+     retryable: retrying a bad key cannot help. */
+  function _geminiUploadError(stage, kind, detail) {
+    var msg;
+    if (kind === "timeout") {
+      msg = "Gemini ကို ဗီဒီယို တင်နေစဉ် (" + stage + ") — 30s အတွင်း မတုံ့ပြန်ပါ။ အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။";
+    } else if (kind === "stall") {
+      msg = "Gemini ကို ဗီဒီယို တင်နေစဉ် (" + stage + ") — 120s ကြာ ဘာမှ မတက်ပါ။ အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။";
+    } else if (kind === "network") {
+      msg = "Gemini ကို ဗီဒီယို တင်နေစဉ် (" + stage + ") — ကွန်ရက် အမှား။ အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။";
+    } else if (kind === "http") {
+      msg = "Gemini ကို ဗီဒီယို တင်နေစဉ် (" + stage + ") — HTTP " + detail + "။";
+      if (detail === 401 || detail === 403) {
+        msg += " API Key ကို စစ်ပေးပါ။";
+      } else {
+        msg += " ခဏနေ Run ကို ထပ်နှိပ်ပေးပါ။";
+      }
+    } else if (kind === "nosession") {
+      msg = "Gemini ကို ဗီဒီယို တင်နေစဉ် (" + stage + ") — session URL မရပါ။ Run ကို ထပ်နှိပ်ပေးပါ။";
+    } else {
+      msg = "Gemini ကို ဗီဒီယို တင်နေစဉ် (" + stage + ") — တုံ့ပြန်မှု မမှန်ပါ။ Run ကို ထပ်နှိပ်ပေးပါ။";
+    }
+    var err = new Error(msg);
+    err.retryable = (kind === "timeout" || kind === "stall"
+      || kind === "network"
+      || (kind === "http" && (detail >= 500 || detail === 429)));
+    return err;
+  }
+
   /* Resumable upload of the picked file DIRECTLY to the Gemini Files
      API. Returns the file resource ({name: "files/xxx", ...}).
      The credential goes only to Google's API (never to Streamlit,
      never logged, never rendered). The URL is built as "?k"+"ey="
-     so this source line never looks like a credential assignment. */
+     so this source line never looks like a credential assignment.
+     Retries ONCE on transient failures with a FRESH resumable
+     session (the old session URI may be dead). Non-retryable
+     errors (4xx auth) throw immediately. */
   async function uploadToGemini(file, auth) {
-    var startRes = await fetch(
-      GEMINI_UPLOAD_BASE + "?k" + "ey=" + encodeURIComponent(auth), {
-        method: "POST",
-        headers: {
-          "X-Goog-Upload-Protocol": "resumable",
-          "X-Goog-Upload-Command": "start",
-          "X-Goog-Upload-Header-Content-Length": String(file.size),
-          "X-Goog-Upload-Header-Content-Type": file.type || "video/mp4",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(
-          { file: { display_name: file.name || "video" } }),
-      });
+    var lastErr = null;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      S.lastGeminiPct = -1;
+      try {
+        return await uploadToGeminiOnce(file, auth);
+      } catch (e) {
+        lastErr = e;
+        if (attempt === 0 && e && e.retryable) { continue; }
+        throw e;
+      }
+    }
+    throw lastErr;
+  }
+
+  /* One upload attempt: initiation (30s timeout) + chunk PUT
+     (stall watchdog). */
+  async function uploadToGeminiOnce(file, auth) {
+    var ctrl = new AbortController();
+    var timer = setTimeout(function () {
+      try { ctrl.abort(); } catch (e) { /* already settled */ }
+    }, GEMINI_UPLOAD_START_TIMEOUT_MS);
+    var startRes;
+    try {
+      startRes = await fetch(
+        GEMINI_UPLOAD_BASE + "?k" + "ey=" + encodeURIComponent(auth), {
+          method: "POST",
+          headers: {
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Length": String(file.size),
+            "X-Goog-Upload-Header-Content-Type": file.type || "video/mp4",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(
+            { file: { display_name: file.name || "video" } }),
+          signal: ctrl.signal,
+        });
+    } catch (e) {
+      if (e && e.name === "AbortError") {
+        throw _geminiUploadError("စတင်", "timeout");
+      }
+      throw _geminiUploadError("စတင်", "network");
+    } finally {
+      clearTimeout(timer);
+    }
     if (!startRes.ok) {
-      throw new Error("Gemini upload start failed: " + startRes.status);
+      throw _geminiUploadError("စတင်", "http", startRes.status);
     }
     var sessionUrl = startRes.headers.get("X-Goog-Upload-URL");
     if (!sessionUrl) {
-      throw new Error("Gemini upload: no session URL");
+      throw _geminiUploadError("စတင်", "nosession");
     }
     /* Upload bytes with progress: fetch has no upload-progress, so
-       XHR carries the bytes. */
+       XHR carries the bytes. The stall watchdog aborts when no
+       progress event arrives for GEMINI_UPLOAD_STALL_MS — a hung
+       connection can no longer freeze the Run at 0% forever. */
     var data = await new Promise(function (resolve, reject) {
       var xhr = new XMLHttpRequest();
+      var settled = false;
+      var lastEventAt = Date.now();
+      function finish(fn, arg) {
+        if (settled) return;
+        settled = true;
+        clearInterval(watchdog);
+        fn(arg);
+      }
+      var watchdog = setInterval(function () {
+        if (Date.now() - lastEventAt > GEMINI_UPLOAD_STALL_MS) {
+          try { xhr.abort(); } catch (e) { /* already gone */ }
+          finish(reject, _geminiUploadError("bytes", "stall"));
+        }
+      }, GEMINI_UPLOAD_WATCHDOG_CHECK_MS);
       xhr.open("PUT", sessionUrl, true);
       xhr.setRequestHeader("Content-Length", String(file.size));
       xhr.setRequestHeader("X-Goog-Upload-Command", "upload, finalize");
       xhr.setRequestHeader("X-Goog-Upload-Offset", "0");
       xhr.upload.onprogress = function (e) {
+        lastEventAt = Date.now();
         if (e.lengthComputable) {
           var pct = Math.round((e.loaded / e.total) * 100);
           if (pct !== S.lastGeminiPct) {
@@ -1545,18 +1642,22 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
           }
         }
       };
+      xhr.onprogress = function () { lastEventAt = Date.now(); };
       xhr.onload = function () {
         if (xhr.status >= 200 && xhr.status < 300) {
-          try { resolve(JSON.parse(xhr.responseText)); }
+          try { finish(resolve, JSON.parse(xhr.responseText)); }
           catch (err) {
-            reject(new Error("Gemini upload: bad response"));
+            finish(reject, _geminiUploadError("bytes", "badresponse"));
           }
         } else {
-          reject(new Error("Gemini upload failed: " + xhr.status));
+          finish(reject, _geminiUploadError("bytes", "http", xhr.status));
         }
       };
       xhr.onerror = function () {
-        reject(new Error("Gemini upload network error"));
+        finish(reject, _geminiUploadError("bytes", "network"));
+      };
+      xhr.onabort = function () {
+        finish(reject, _geminiUploadError("bytes", "stall"));
       };
       xhr.send(file);
     });
