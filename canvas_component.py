@@ -1261,13 +1261,29 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     return { width: w, height: h };
   }
 
-  /* Header-only dimension probe via FFmpeg.wasm: writes the file,
-     runs `ffmpeg -i` (no output, no decode), parses dims from the
-     log, deletes the file again. Used when the browser decoder
-     reports a duration but videoWidth == 0 (HEVC: the browser fires
-     loadedmetadata with duration yet cannot decode frames). Throws
-     when FFmpeg is unavailable (CDN) — the caller falls back. */
-  async function probeDimsViaFFmpeg(file) {
+  /* Parse duration (seconds) from an `ffmpeg -i` log: ffmpeg prints
+     e.g. `Duration: 00:08:04.20, start: 0.000000, bitrate: ...`.
+     Returns null when absent (`Duration: N/A`) or unparseable.
+     Pure function (unit-tested under node). */
+  function parseDurationFromFFmpegLog(log) {
+    var m = /Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)/.exec(log || "");
+    if (!m) return null;
+    var s = parseInt(m[1], 10) * 3600
+      + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+    return (isFinite(s) && s > 0) ? s : null;
+  }
+
+  /* Header-only metadata probe via FFmpeg.wasm: writes the file,
+     runs `ffmpeg -i` (no output, no decode), parses BOTH duration
+     and dims from the same log, deletes the file again. Used when
+     the browser decoder cannot read the file at all (HEVC: the
+     <video> element gives NOTHING — "Unable to play media" — so the
+     element path below can never supply a duration) and when the
+     decoder reports a duration but videoWidth == 0 (dims fill-in).
+     Returns { duration (may be null), width, height } (dims 0 when
+     the log has no Video stream). Throws when FFmpeg is unavailable
+     (CDN) — the caller falls back / fails fast. */
+  async function probeMetaViaFFmpeg(file) {
     var ff = await loadFFmpeg();
     var buf = new Uint8Array(await file.arrayBuffer());
     await ff.writeFile("probe.mp4", buf);
@@ -1275,20 +1291,29 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     try { await ff.exec(["-i", "probe.mp4"]); } catch (e) {
       /* No output file: expected for a probe-only run. */
     }
-    var dims = parseDimsFromFFmpegLog(S.hybridLogLines.join("\n"));
+    var log = S.hybridLogLines.join("\n");
+    var dims = parseDimsFromFFmpegLog(log);
+    var dur = parseDurationFromFFmpegLog(log);
     try { await ff.deleteFile("probe.mp4"); } catch (e) { /* gone */ }
-    return dims;
+    return {
+      duration: dur,
+      width: dims ? dims.width : 0,
+      height: dims ? dims.height : 0,
+    };
   }
 
   /* Video metadata (duration / dims), probed ONCE at pick time and
-     cached. Decoder-independent: the DURATION comes from the <video>
-     element (valid even when the browser cannot decode the frames —
-     HEVC fires loadedmetadata with duration but videoWidth == 0),
-     and the DIMENSIONS come from an FFmpeg.wasm header probe when
-     the element reports none. The probe runs in the background while
-     the user adjusts settings; by Run time it is usually done.
-     Returns null when metadata is truly unreadable — the Run then
-     fails fast BEFORE the Gemini upload, never after it. */
+     cached. Decoder-independent: the <video> element is only a FAST
+     PATH (valid even when the browser cannot decode the frames —
+     HEVC fires loadedmetadata with duration but videoWidth == 0).
+     When the element gives NOTHING (HEVC "Unable to play media"),
+     the FFmpeg.wasm header probe supplies BOTH duration and dims
+     from one `ffmpeg -i` log; when the element gives a duration but
+     no dims, the header probe fills in the dims. The probe runs in
+     the background while the user adjusts settings; by Run time it
+     is usually done. Returns null when metadata is truly unreadable
+     — the Run then fails fast BEFORE the Gemini upload, never
+     after it. */
   function probeMetaAtPick(vid) {
     S.cachedMeta = null;
     S.cachedMetaFor = null;
@@ -1318,15 +1343,43 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
           var to = setTimeout(function () {
             if (!done) { done = true; resolve(null); }
           }, timeoutMs);
-          video.addEventListener("loadedmetadata", function h() {
+          /* Both handlers are hoisted declarations (NOT named
+             function expressions): each removes the OTHER, so the
+             names must be visible in this enclosing scope — a named
+             function expression's name is visible only inside
+             itself, and referencing it from the sibling handler
+             throws ReferenceError and hangs the probe forever. */
+          function h() {
             if (done) return;
             done = true;
             clearTimeout(to);
             video.removeEventListener("loadedmetadata", h);
+            video.removeEventListener("error", herr);
             resolve(elementMeta());
-          });
+          }
+          /* An undecodable file (HEVC: "Unable to play media") fires
+             `error` and NEVER fires loadedmetadata — without this
+             listener the wait would burn the full timeout (x2) before
+             the FFmpeg fallback below ever runs. */
+          function herr() {
+            if (done) return;
+            done = true;
+            clearTimeout(to);
+            video.removeEventListener("loadedmetadata", h);
+            video.removeEventListener("error", herr);
+            resolve(null);
+          }
+          video.addEventListener("loadedmetadata", h);
+          video.addEventListener("error", herr);
         });
       }
+      /* Hybrid-only gate for every browser-FFmpeg step below. In
+         Server mode the server ffprobes the uploaded file itself,
+         so browser-side FFmpeg must never load at pick time (a
+         Server-mode user with an HEVC video would otherwise hit a
+         Worker/CDN error for a feature Server mode never needs). */
+      var _hybridProbe =
+        ((S.args && S.args.render_location) || "hybrid") === "hybrid";
       var meta = elementMeta();
       if (!meta) {
         meta = await waitForElementMeta(15000);
@@ -1335,26 +1388,38 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
           meta = await waitForElementMeta(15000);
         }
       }
+      /* 1b) Element gave NOTHING (HEVC "Unable to play media") —
+         fall back to the FFmpeg.wasm header probe for BOTH duration
+         and dims (Hybrid only). The Run uses this FFmpeg-probed
+         duration for the Gemini/analyze steps — element metadata is
+         only a fast path, never a requirement. FFmpeg failure falls
+         through to the fail-fast below. */
+      if (!meta && _hybridProbe) {
+        try {
+          var f0 = await getSourceFile();
+          var fm = f0 ? await probeMetaViaFFmpeg(f0) : null;
+          if (fm && isFinite(fm.duration) && fm.duration > 0) {
+            meta = {
+              duration: fm.duration,
+              width: fm.width, height: fm.height,
+            };
+          }
+        } catch (e) { /* FFmpeg unavailable — fail fast below */ }
+      }
       if (!meta) {
         S.metaFailedFor = vid;
         S.metaProbePromise = null;
         return null;
       }
       /* 2) Dimensions: element first; FFmpeg.wasm header probe when
-         the decoder reports none (HEVC) — HYBRID MODE ONLY. In
-         Server mode the server ffprobes the uploaded file itself,
-         so browser-side FFmpeg must never load at pick time (a
-         Server-mode user with an HEVC video would otherwise hit a
-         Worker/CDN error for a feature Server mode never needs).
+         the decoder reports none (HEVC) — HYBRID MODE ONLY.
          Server mode caches duration-only metadata (dims may stay 0);
          Hybrid mode requires real dims and fails fast below. */
-      var _hybridProbe =
-        ((S.args && S.args.render_location) || "hybrid") === "hybrid";
       if (_hybridProbe && !(meta.width > 0 && meta.height > 0)) {
         try {
           var f = await getSourceFile();
-          var dims = f ? await probeDimsViaFFmpeg(f) : null;
-          if (dims) {
+          var dims = f ? await probeMetaViaFFmpeg(f) : null;
+          if (dims && dims.width > 0 && dims.height > 0) {
             meta.width = dims.width;
             meta.height = dims.height;
           }

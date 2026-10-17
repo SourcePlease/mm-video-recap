@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-18 hybrid v1.3"
+BUILD_VERSION = "2026-10-18 hybrid v1.4"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -350,6 +350,14 @@ VOICE_CHOICES = [
 
 def _parse_voice(choice: str) -> str:
     return (choice or "").split(" — ")[0].strip() or "my-MM-ThihaNeural"
+
+
+def _format_pitch_hz(value) -> str:
+    """Voice-tab slider value (-10..+10) -> Edge-TTS pitch string."""
+    try:
+        return f"{int(value):+d}Hz"
+    except (TypeError, ValueError):
+        return "+0Hz"
 
 
 MODEL_OPTIONS = [
@@ -854,6 +862,7 @@ def _run_pipeline_job(job: Dict) -> None:
                 video_url=None,
                 user_api_key=snap["key"] or None,
                 voice_name=snap["voice_name"],
+                pitch=_format_pitch_hz(snap.get("voice_pitch_hz", 0)),
                 processing_mode=snap["processing_mode"],
                 aspect_ratio=snap["aspect_ratio"],
                 fit_mode=snap["fit_mode"],
@@ -890,6 +899,7 @@ def _run_pipeline_job(job: Dict) -> None:
                 # No target_duration: AI Recap is always full-duration
                 # (pipeline ignores target_duration; see pipeline.py).
                 voice_name=snap["voice_name"],
+                pitch=_format_pitch_hz(snap.get("voice_pitch_hz", 0)),
                 processing_mode=snap["processing_mode"],
                 aspect_ratio=snap["aspect_ratio"],
                 fit_mode=snap["fit_mode"],
@@ -1606,15 +1616,27 @@ def _bump(key: str, delta: float, lo: float, hi: float) -> None:
 
 
 def _stepper_slider(label: str, key: str, lo: float, hi: float,
-                    step: float, fmt: str) -> None:
-    """A slider flanked by − / + buttons (Step 16 reference layout)."""
+                    step: float, fmt: str, default: float = None) -> None:
+    """A slider flanked by − / + buttons (Step 16 reference layout).
+
+    `default` is the slider's FIRST-render value and MUST be passed:
+    without an explicit value=, Streamlit initializes a keyed slider
+    to lo (min). The _STEP16_DEFAULTS seeding block already sets the
+    intended values in session_state before the widgets render (so the
+    Run snapshot was never actually 1.00x), but passing value= makes
+    the widget agree with the seeded value explicitly instead of
+    depending on seeding alone — belt and braces, so the widget,
+    the readout, and the Run snapshot can never disagree.
+    """
     c1, c2, c3 = st.columns([1, 6, 1])
     with c1:
         st.button("−", key=f"{key}_minus", on_click=_bump,
                   args=(key, -step, lo, hi))
     with c2:
+        if default is None:
+            default = lo
         st.slider(label, lo, hi, key=key, step=step, format=fmt,
-                  label_visibility="collapsed")
+                  label_visibility="collapsed", value=default)
     with c3:
         st.button("+", key=f"{key}_plus", on_click=_bump,
                   args=(key, step, lo, hi))
@@ -1716,19 +1738,19 @@ with tab_src:
             f"{float(st.session_state.get('inner_scale', 1.22)):.2f}×"
         )
         _stepper_slider("Inner scale", "inner_scale", 0.5, 2.0, 0.01,
-                        "%.2f×")
+                        "%.2f×", 1.22)
         st.markdown(
             f"**Vertical position** — "
             f"{float(st.session_state.get('vertical_pos', 0.0)):+.0f}%"
         )
         _stepper_slider("Vertical position", "vertical_pos", -50.0, 50.0,
-                        1.0, "%+.0f%%")
+                        1.0, "%+.0f%%", 0.0)
         st.markdown(
             f"**Horizontal position** — "
             f"{float(st.session_state.get('horizontal_pos', 0.0)):+.0f}%"
         )
         _stepper_slider("Horizontal position", "horizontal_pos", -50.0,
-                        50.0, 1.0, "%+.0f%%")
+                        50.0, 1.0, "%+.0f%%", 0.0)
         st.caption(
             "Source ကို pad frame ထဲမှာ ချဲ့/ရွှေ့ချင်ရင် — မြင်ပပျောက်တဲ့ "
             "အပိုင်းကို crop လုပ်ပါတယ်။ Preview မှာ တိုက်ရိုက် မြင်ရပါတယ်။"
@@ -1742,7 +1764,7 @@ with tab_src:
         f"{float(st.session_state.get('copyright_zoom', 1.07)):.2f}×"
     )
     _stepper_slider("Zoom (copyright nudge)", "copyright_zoom", 1.0, 1.25,
-                    0.01, "%.2f×")
+                    0.01, "%.2f×", 1.07)
     st.toggle("Small random crop offset", key="random_crop_offset")
     st.caption(
         "Mirror ကို bounding box/pad position တွေထက် အရင်ချမှတ်ပါတယ် — "
@@ -1757,6 +1779,11 @@ with tab_voice:
     voice_choice = st.radio(" မြန်မာ AI အသံ ရွေးပါ", VOICE_CHOICES, index=0)
     bg_volume = st.slider(
         " မူရင်းနောက်ခံအသံ အတိုးအကျယ်", 0.0, 0.5, 0.0, 0.05
+    )
+    pitch_hz = st.slider(" အသံ Tone (အနိမ့်–အမြင့်)", -10, 10, 0, 1)
+    st.caption(
+        "လက်ရှိ Tone: "
+        + ("0 (မူရင်း)" if pitch_hz == 0 else f"{pitch_hz:+d}Hz")
     )
 
 with tab_sub:
@@ -2050,6 +2077,7 @@ if run_btn and not _run_blocked:
         "random_crop_offset": bool(
             st.session_state.get("random_crop_offset", False)),
         "bg_volume": float(bg_volume),
+        "voice_pitch_hz": int(pitch_hz),
         "burn_subtitles": bool(burn_subtitles),
         "tts_proxy": tts_proxy,
         "model": _parse_model(model_choice),
