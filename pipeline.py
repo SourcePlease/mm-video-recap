@@ -54,8 +54,16 @@ class PipelineError(Exception):
 # for the missing part (AI continuation / Pro fill).
 NARRATION_COVERAGE_TARGET = 0.90
 # Max extra Gemini narration rounds per Run (each costs one more
-# analyze call + one more TTS pass).
-NARRATION_RETRY_MAX = 2
+# analyze call + one more TTS pass). 2 was not enough: measured live
+# 2026-10-17, first script + 2 continuations reached only 6:39/8:04
+# (82%) — the loop ran out of rounds below the 90% target.
+NARRATION_RETRY_MAX = 5
+# A continuation round that adds less than this many seconds means
+# Gemini has stalled on the tail — stop instead of burning calls.
+NARRATION_MIN_ROUND_S = 5.0
+# Max empty windows per Pro fill call: one giant call for all empty
+# windows returns truncated / re-segmented JSON that matches nothing.
+PRO_FILL_BATCH = 10
 
 
 def _narration_coverage(covered_s: float, total_s: float) -> Dict[str, float]:
@@ -70,6 +78,48 @@ def _narration_coverage(covered_s: float, total_s: float) -> Dict[str, float]:
     return {"covered_s": round(covered, 1),
             "total_s": round(total, 1),
             "pct": round(pct, 1)}
+
+
+def _fill_blocks_by_overlap(blocks, filled_blocks) -> int:
+    """Fill empty Pro blocks from fill results by window overlap.
+
+    Gemini may re-segment windows, so exact (start, end) equality
+    misses. Each empty block takes the text of the filled block
+    overlapping it most (same filled block may serve several empty
+    blocks — duplication beats silence). Returns filled count.
+    """
+    _filled = 0
+    for _b in blocks:
+        if str(_b.get("text", "")).strip():
+            continue
+        try:
+            _bs = float(_b.get("start", 0))
+            _be = float(_b.get("end", 0))
+        except (TypeError, ValueError):
+            continue
+        _best = None
+        _best_ov = 0.0
+        for _fb in filled_blocks or []:
+            # Empty-text candidates must not win the overlap race:
+            # they would beat a real candidate, then be rejected,
+            # leaving the block unfilled.
+            if not str(_fb.get("text", "")).strip():
+                continue
+            try:
+                _fs = float(_fb.get("start", 0))
+                _fe = float(_fb.get("end", 0))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            _ov = min(_be, _fe) - max(_bs, _fs)
+            if _ov > _best_ov:
+                _best_ov = _ov
+                _best = _fb
+        if _best is not None and _best_ov > 0:
+            _txt = str(_best.get("text", "")).strip()
+            if _txt:
+                _b["text"] = _txt
+                _filled += 1
+    return _filled
 
 
 def _renumber_srt(srt_path: str) -> str:
@@ -309,18 +359,21 @@ def run_full_recap_pipeline(
                       if not str(b.get("text", "")).strip()]
             if _empty:
                 try:
-                    _filled = analyze_video_pro_fill(
-                        local_path, user_api_key, _empty, model=model)
-                    _by_window = {(round(float(b.get("start", 0)), 2),
-                                   round(float(b.get("end", 0)), 2)): b
-                                  for b in _filled.get("blocks", []) or []}
-                    for _b in blocks:
-                        _key = (round(float(_b.get("start", 0)), 2),
-                                round(float(_b.get("end", 0)), 2))
-                        if not str(_b.get("text", "")).strip() \
-                                and _key in _by_window:
-                            _b["text"] = str(
-                                _by_window[_key].get("text", "")).strip()
+                    # Batched fill: one giant call for ALL empty windows
+                    # returns truncated / re-segmented JSON that
+                    # matches nothing (measured live 2026-10-17:
+                    # 2:37/8:04). Small batches return complete JSON.
+                    _filled_blocks = []
+                    for _i in range(0, len(_empty), PRO_FILL_BATCH):
+                        try:
+                            _filled = analyze_video_pro_fill(
+                                local_path, user_api_key,
+                                _empty[_i:_i + PRO_FILL_BATCH], model=model)
+                            _filled_blocks.extend(
+                                _filled.get("blocks", []) or [])
+                        except Exception:
+                            continue
+                    _fill_blocks_by_overlap(blocks, _filled_blocks)
                     plan = validate_pro_blocks(
                         {"title": title, "blocks": blocks}, _video_dur)
                     blocks = plan.get("blocks") or []
@@ -500,6 +553,10 @@ def run_full_recap_pipeline(
                 voiceover_path = _merged_audio
                 script_text = (script_text + " " + _cont_text).strip()
                 audio_duration = audio_duration + _cont_len
+                # A round that adds almost nothing means Gemini has
+                # stalled on the tail — stop instead of burning calls.
+                if _cont_len < NARRATION_MIN_ROUND_S:
+                    break
 
         # 4) fit the AUDIO to the full video duration (video stays 1.0x):
         # pad silence if shorter; atempo (+ scaled SRT) if longer.
