@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-17 narration-coverage v1"
+BUILD_VERSION = "2026-10-17 job-diagnostic v1"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -766,6 +766,17 @@ def _render_run_progress() -> None:
         # page silently going idle (the observed Pro failure).
         _stored = st.session_state.get("stored_job") or {}
         _fdir = _stored.get("run_dir")
+        # DIAGNOSTIC: show whether the browser remembers a Run, so a
+        # lost job can be told apart from a job that was never saved.
+        # Shown only while the remembered job has NOT been restored
+        # yet (after a success it would be stale noise).
+        if _fdir and st.session_state.get("restored_job_dir") != _fdir:
+            _dsaved = float(_stored.get("saved_at") or 0)
+            _dage = max(0.0, time.time() - _dsaved) if _dsaved else 0.0
+            st.caption(
+                f"🔎 မှတ်ထားတဲ့ Run ရှိသည်: "
+                f"{os.path.basename(str(_fdir))} | "
+                f"{_dage:.0f}s အလို သိမ်းထားသည်")
         if _fdir and st.session_state.get("restored_job_dir") != _fdir:
             _fstatus = _read_job_status(_fdir)
             if _fstatus is not None:
@@ -862,6 +873,14 @@ def _render_run_progress() -> None:
         st.progress(min(1.0, pct / 100.0),
                     text=f"{label} — {pct:.0f}% | {elapsed:.0f}s ကြာပြီး{eta}")
         st.caption(detail or "")
+        # DIAGNOSTIC: confirm the browser-side job save happened for
+        # THIS run — if this line is missing during a Run, the save
+        # never ran and a later reload cannot re-attach.
+        _dstored = st.session_state.get("stored_job") or {}
+        if (_dstored.get("run_dir")
+                and _dstored.get("run_dir")
+                == (job.get("snapshot") or {}).get("run_dir")):
+            st.caption("🔎 Job မှတ်ထားပြီ ✓ — session ပြတ်လည်း ပြန်ချိတ်လို့ရသည်")
         return
     if status == "done" and result is not None:
         st.session_state["recap_result"] = _apply_job_result(
