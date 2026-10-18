@@ -32,7 +32,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-18 webcodecs v1"
+BUILD_VERSION = "2026-10-18 webcodecs v1.1"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -1615,6 +1615,16 @@ if st.session_state.get("hybrid_pack_dir"):
             with open(_pvoice, "rb") as _vf:
                 _hybrid_pack_arg["voiceover_b64"] = base64.b64encode(
                     _vf.read()).decode()
+            # v1.15: server pre-rendered final audio (bg_volume == 0) —
+            # the device muxes it with a pure stream copy. Kept out of
+            # pack.json (audio bytes travel only in this component arg,
+            # like voiceover_b64). Absent => old wasm-mix path.
+            _pfinal = os.path.join(_pdir, "audio.m4a")
+            if (_hybrid_pack_arg.get("audio_final_file")
+                    and os.path.isfile(_pfinal)):
+                with open(_pfinal, "rb") as _af:
+                    _hybrid_pack_arg["audio_final_b64"] = base64.b64encode(
+                        _af.read()).decode()
             if (st.session_state.get("hybrid_pack_acked_id")
                     == _hybrid_pack_arg.get("pack_id")):
                 _hybrid_pack_arg = None

@@ -45,6 +45,7 @@ from tts_manager import (
 from video_editor import (
     QUALITY_PRESETS,
     SUBTITLE_COLOR_RGB,
+    LOUDNORM_FILTER,
     _audio_is_silent,
     _offset_srt_timestamps,
     _resolve_aspect_target,
@@ -249,7 +250,7 @@ def _clean_pack_dir(run_dir: str) -> None:
     """
     if not run_dir or not os.path.isdir(str(run_dir)):
         return
-    _keep = {"pack.json", "voiceover.mp3"}
+    _keep = {"pack.json", "voiceover.mp3", "audio.m4a"}
     for _name in os.listdir(run_dir):
         if _name in _keep:
             continue
@@ -261,6 +262,40 @@ def _clean_pack_dir(run_dir: str) -> None:
                 shutil.rmtree(_p, ignore_errors=True)
         except OSError:
             pass
+
+
+def _prerender_final_audio(voiceover_path: str, run_dir: str,
+                           loudnorm: bool) -> str:
+    """Render the final Hybrid audio track on the server (v1.15).
+
+    Used only when bg_volume == 0: the fitted voiceover IS the whole
+    soundtrack, so the -16 LUFS loudnorm + AAC encode happens here
+    (server CPU) instead of in single-threaded FFmpeg.wasm on the
+    device. The device mux then becomes a pure ``-c copy`` stream
+    copy (seconds, not minutes).
+
+    Returns the path of audio.m4a inside run_dir. Raises
+    PipelineError on ffmpeg failure — callers fall back to the
+    device-side mix path instead of failing the run.
+    """
+    import subprocess
+
+    out_path = os.path.join(str(run_dir), "audio.m4a")
+    _af = LOUDNORM_FILTER + ",aresample=44100" if loudnorm \
+        else "aresample=44100"
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-i", str(voiceover_path),
+         "-af", _af, "-c:a", "aac", "-b:a", "128k",
+         "-movflags", "+faststart", out_path],
+        capture_output=True, text=True, timeout=600)
+    if proc.returncode != 0:
+        raise PipelineError(
+            "အသံဖိုင် ပြင်ဆင်မှု မအောင်မြင်ပါ: "
+            f"{proc.stderr.strip()[:200]}")
+    if (not os.path.isfile(out_path)
+            or os.path.getsize(out_path) < 1000):
+        raise PipelineError("အသံဖိုင် ပြင်ဆင်မှု မအောင်မြင်ပါ။")
+    return out_path
 
 
 def _build_hybrid_pack(
@@ -361,6 +396,20 @@ def _build_hybrid_pack(
                             "y": int(_lg_prep["y"])})
         _idx += 1
     _ln_flag = not _audio_is_silent(str(voiceover_path))
+    # v1.15: when the original audio is fully off (bg_volume == 0, the
+    # default), the fitted voiceover IS the whole soundtrack — render
+    # it to final AAC here (server CPU, -16 LUFS) so the device mux is
+    # a pure stream copy. Any failure here falls back to the old
+    # device-side mix path (pack simply omits audio_final_file).
+    _bg0 = abs(float(bg_volume or 0.0)) < 1e-9
+    _final_audio_file = None
+    if _bg0:
+        try:
+            _prerender_final_audio(
+                str(voiceover_path), str(run_dir), loudnorm=_ln_flag)
+            _final_audio_file = "audio.m4a"
+        except Exception:  # noqa: BLE001 - fall back to device mix
+            _final_audio_file = None
     _graphs = build_hybrid_filter_graph(
         src_w=int(src_w or 0), src_h=int(src_h or 0),
         aspect_ratio=aspect_ratio, fit_mode=fit_mode,
@@ -412,7 +461,7 @@ def _build_hybrid_pack(
                             QUALITY_PRESETS["fast"])
     _pack = {
         "pack_id": os.path.basename(str(run_dir)),
-        "pack_version": 3,
+        "pack_version": 4,
         "quality": {"name": str(quality or "fast"),
                     "preset": str(_q["preset"]),
                     "crf": _q["crf"]},
@@ -466,6 +515,10 @@ def _build_hybrid_pack(
         "bg_volume": bg_volume,
         "srt_text": _srt_text,
         "voiceover_file": "voiceover.mp3",
+        # v1.15: server pre-rendered final audio (bg_volume == 0 only).
+        # The device muxes it with a pure -c copy; packs without it
+        # (bg>0, pre-render failure, old packs) use the wasm mix path.
+        "audio_final_file": _final_audio_file,
     }
     if extra:
         _pack["diagnostics"] = dict(extra)

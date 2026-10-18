@@ -3410,6 +3410,25 @@ var MmrMp4Muxer = (function () {
   async function muxHWAudo(ff, pack, gen, hasAudio) {
     var af = pack.audio_filter || null;
     if (!af) throw new Error("pack မှာ audio_filter မပါပါ");
+    if (gen !== S.hybridGen) return;
+    /* v1.15: server pre-rendered the final audio track (bg_volume=0)
+       — pure stream copy, no filters, no re-encode. On ANY failure
+       fall through to the filter-graph mux (never rip that path). */
+    if (pack.audio_final_b64 && (pack.pack_version || 0) >= 4) {
+      try {
+        await ff.writeFile("audio.m4a",
+                           b64ToBytes(pack.audio_final_b64));
+        if (gen !== S.hybridGen) return;
+        sendValue("hybrid_encode_progress",
+                  { pct: 99, detail: "အသံ တွဲနေသည်… (မြန်)" });
+        var fastArgs = ["-i", "hw_video.mp4", "-i", "audio.m4a",
+          "-map", "0:v", "-c:v", "copy",
+          "-map", "1:a", "-c:a", "copy",
+          "-movflags", "+faststart", "-shortest", "out.mp4"];
+        var fastCode = await ff.exec(fastArgs);
+        if (fastCode === 0) return;
+      } catch (eFast) { /* fall through to the filter-graph mux */ }
+    }
     var graph = hasAudio ? af.with_audio : af.no_audio;
     if (gen !== S.hybridGen) return;
     sendValue("hybrid_encode_progress",
@@ -3486,7 +3505,7 @@ var MmrMp4Muxer = (function () {
       var blob = new Blob([data], { type: "video/mp4" });
       /* Free MEMFS: inputs + PNGs + list + intermediates + output (the
          result lives as a blob URL now). */
-      var trash = ["input.mp4", "voice.mp3", "sub_list.txt",
+      var trash = ["input.mp4", "voice.mp3", "audio.m4a", "sub_list.txt",
                    "sub_blank.png", "watermark.png", "logo.png",
                    "hw_video.mp4", "out.mp4"].concat(pngNames);
       for (var ti = 0; ti < trash.length; ti++) {
