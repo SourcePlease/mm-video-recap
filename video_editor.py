@@ -229,30 +229,49 @@ def _wrap_subtitle_lines(text: str, font, max_width: int) -> List[str]:
     return lines or [text]
 
 
-def _split_subtitle_chunks(text: str, max_chars: int = 30) -> List[str]:
-    """Split a long cue into short chunks (<= max_chars), greedy on spaces.
+def _split_subtitle_chunks(text: str, max_chars: int = 30,
+                           words_per_caption: Optional[int] = None
+                           ) -> List[str]:
+    """Split a long cue into short chunks, greedy on spaces.
+
+    Two chunking modes:
+    - words_per_caption set (UI slider): at most N words per chunk
+      (DeepRecap-style words-per-caption). Overlong single words are
+      still hard-split so no chunk exceeds max_chars.
+    - default: chunks of <= max_chars (legacy behavior).
 
     A 5-line wall of text covering the speaker's face is unreadable, so
     long cues are shown as short chunks in turn, each fitting at most
-    2 lines (see _split_chunk_to_pieces). Overlong single words are
-    hard-split so no chunk exceeds max_chars.
+    2 lines (see _split_chunk_to_pieces). The <= 2-line invariant is
+    enforced downstream regardless of the chunking mode.
     """
     words = text.split(" ")
     chunks: List[str] = []
     cur = ""
+    cur_words = 0
     for w in words:
         while len(w) > max_chars:
             if cur:
                 chunks.append(cur)
                 cur = ""
+                cur_words = 0
             chunks.append(w[:max_chars])
             w = w[max_chars:]
+        if not w:
+            continue
+        if (words_per_caption is not None and cur_words >= words_per_caption
+                and cur):
+            chunks.append(cur)
+            cur = ""
+            cur_words = 0
         cand = (cur + " " + w).strip()
         if cur and len(cand) > max_chars:
             chunks.append(cur)
             cur = w
+            cur_words = 1
         else:
             cur = cand
+            cur_words = cur_words + 1 if cur else 0
     if cur:
         chunks.append(cur)
     return chunks or [text]
@@ -278,7 +297,9 @@ def _split_chunk_to_pieces(chunk: str, font, max_width: int,
 def _render_subtitle_pngs(srt_path: str, font_file: str, font_size: int,
                           out_w: int, out_h: int, pos_x: int, pos_y: int,
                           rgb: tuple, work_dir: str,
-                          wrap_w_pct: Optional[float] = None) -> List[Dict]:
+                          wrap_w_pct: Optional[float] = None,
+                          words_per_caption: Optional[int] = None
+                          ) -> List[Dict]:
     """Render every SRT cue as full-size transparent PNGs (Pillow RAQM).
 
     RAQM (HarfBuzz) shapes Myanmar correctly: the e-vowel (ေ) reorders to
@@ -316,7 +337,8 @@ def _render_subtitle_pngs(srt_path: str, font_file: str, font_size: int,
     png_idx = 0
     for start, end, text in _parse_srt_cues(srt_path):
         pieces: List[List[str]] = []
-        for chunk in _split_subtitle_chunks(text):
+        for chunk in _split_subtitle_chunks(
+                text, words_per_caption=words_per_caption):
             pieces.extend(_split_chunk_to_pieces(chunk, font, max_width))
         n = len(pieces)
         dur = float(end) - float(start)
@@ -799,7 +821,8 @@ def _subtitle_step(cur_label: str, srt_path: Optional[str],
     subtitle_pngs = _render_subtitle_pngs(
         srt_path, font["file"], fs, out_w, out_h,
         pos_x, pos_y, _rgb, work_dir,
-        wrap_w_pct=cfg.get("w_pct"))
+        wrap_w_pct=cfg.get("w_pct"),
+        words_per_caption=cfg.get("words_per_caption"))
     if not subtitle_pngs:
         raise VideoEditorError("SRT တွင် စာတန်းမတွေ့ပါ။")
     # One concat video input + ONE overlay (see _build_subtitle_concat
@@ -811,6 +834,355 @@ def _subtitle_step(cur_label: str, srt_path: Optional[str],
             "burned_in",
             dict(_sub_pos, method="raqm_png", cues=len(subtitle_pngs)),
             subtitle_concat)
+
+
+# ---------------------------------------------------------------------------
+# Feature pack v1.13: quality presets, image overlays (watermark/logo),
+# -16 LUFS normalize, Post Kit thumbnail.
+# ---------------------------------------------------------------------------
+
+# Render quality presets (v1.13). Fast = v1.12 behavior (ultrafast,
+# unconstrained size — the default); Normal = the pre-v1.12 server
+# default; High = best quality (slow on device, warns in the UI).
+QUALITY_PRESETS: Dict[str, Dict[str, Optional[int]]] = {
+    "fast": {"preset": "ultrafast", "crf": None},
+    "normal": {"preset": "veryfast", "crf": 23},
+    "high": {"preset": "medium", "crf": 20},
+}
+
+
+def quality_encode_args(quality: str) -> List[str]:
+    """libx264 encode args for a quality name (fast/normal/high)."""
+    q = QUALITY_PRESETS.get(str(quality or "fast").lower(),
+                            QUALITY_PRESETS["fast"])
+    args = ["-preset", str(q["preset"])]
+    if q["crf"] is not None:
+        args += ["-crf", str(q["crf"])]
+    return args
+
+
+# Single-pass -16 LUFS normalization (streaming/podcast standard).
+# Verified present in the FFmpeg.wasm core (strings check) so it can run
+# in the device encode's filter graph as well as server-side.
+# NOTE: loudnorm emits NaN on digital silence — callers must skip it
+# for silent inputs (see _audio_is_silent).
+LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
+
+
+def _audio_is_silent(audio_path: str) -> bool:
+    """True if the audio file is (near) digital silence.
+
+    loudnorm produces NaN/+-Inf on silent input (breaking the AAC
+    encoder), so silent inputs must skip the loudnorm stage — there is
+    nothing to normalize anyway.
+    """
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "info", "-i", str(audio_path),
+             "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60)
+        m = re.search(r"mean_volume:\s*(-inf|[\d.\-]+)\s*dB",
+                      proc.stderr or "")
+        if not m:
+            return False
+        v = m.group(1)
+        return v == "-inf" or float(v) < -90.0
+    except Exception:  # noqa: BLE001 - assume not silent on error
+        return False
+
+
+def _image_overlay_steps(overlays: List[Tuple[int, int, int]]
+                         ) -> List[str]:
+    """Append PNG overlay steps after the [vout] stage.
+
+    overlays: [(input_idx, x_px, y_px), ...] in z-order. The chain
+    always ends with a [vout] label so existing -map [vout] calls keep
+    working. Returns [] when overlays is empty.
+    """
+    steps: List[str] = []
+    cur = "vout"
+    for i, (idx, x, y) in enumerate(overlays):
+        nxt = f"vov{i}"
+        steps.append(f"[{cur}][{int(idx)}:v]"
+                     f"overlay={int(x)}:{int(y)}:format=auto[{nxt}]")
+        cur = nxt
+    if overlays:
+        steps.append(f"[{cur}]null[vout]")
+    return steps
+
+
+def extra_image_inputs(subtitle_concat: Optional[str],
+                       watermark_png: Optional[str],
+                       logo_png: Optional[str]
+                       ) -> Tuple[List[str], Dict[str, int]]:
+    """Build -i args for the optional image inputs.
+
+    Fixed slots: 0 = source video, 1 = voiceover. Everything else is
+    appended in a fixed order so the filter graph and the arg list
+    always agree. Returns (args, {"subtitle"|"watermark"|"logo": idx}).
+    """
+    args: List[str] = []
+    idx: Dict[str, int] = {}
+    n = 2
+    if subtitle_concat:
+        args += ["-f", "concat", "-safe", "0", "-i", subtitle_concat]
+        idx["subtitle"] = n
+        n += 1
+    if watermark_png:
+        args += ["-i", watermark_png]
+        idx["watermark"] = n
+        n += 1
+    if logo_png:
+        args += ["-i", logo_png]
+        idx["logo"] = n
+        n += 1
+    return args, idx
+
+
+# Position presets for watermark (corners + center) and logo (corners).
+OVERLAY_POSITIONS = ("top-left", "top-right", "bottom-left",
+                     "bottom-right", "center")
+LOGO_POSITIONS = ("top-left", "top-right", "bottom-left", "bottom-right")
+
+
+def overlay_xy(position: str, out_w: int, out_h: int,
+               img_w: int, img_h: int, margin_pct: float = 0.03
+               ) -> Tuple[int, int]:
+    """Top-left (x, y) in px for an overlay image at a named position."""
+    m = int(round(min(out_w, out_h) * margin_pct))
+    pos = str(position or "bottom-right").lower()
+    if pos == "top-left":
+        return m, m
+    if pos == "top-right":
+        return out_w - img_w - m, m
+    if pos == "bottom-left":
+        return m, out_h - img_h - m
+    if pos == "center":
+        return (out_w - img_w) // 2, (out_h - img_h) // 2
+    return out_w - img_w - m, out_h - img_h - m  # bottom-right
+
+
+def render_text_watermark_png(text: str, out_path: str,
+                              font_size_px: int = 48,
+                              opacity: float = 0.5) -> Tuple[int, int]:
+    """Render a text watermark to a transparent PNG (Pillow RAQM).
+
+    Returns (width, height) of the PNG. Opacity 0..1 scales the alpha
+    channel. Uses the bundled Myanmar font so Myanmar text shapes
+    correctly.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    font_file = find_myanmar_font()
+    op = min(1.0, max(0.05, float(opacity)))
+    try:
+        font = ImageFont.truetype(font_file, int(font_size_px),
+                                  layout_engine=ImageFont.Layout.RAQM)
+    except Exception:
+        font = ImageFont.load_default()
+    pad = int(font_size_px * 0.4) + 8
+    # Measure with RAQM shaping.
+    tmp = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+    d0 = ImageDraw.Draw(tmp)
+    try:
+        bbox = d0.textbbox((0, 0), text, font=font, stroke_width=2)
+    except TypeError:
+        bbox = d0.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    img = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    alpha = int(round(255 * op))
+    try:
+        draw.text((pad - bbox[0], pad - bbox[1]), text, font=font,
+                  fill=(255, 255, 255, alpha),
+                  stroke_width=2, stroke_fill=(0, 0, 0, alpha))
+    except TypeError:
+        draw.text((pad - bbox[0], pad - bbox[1]), text, font=font,
+                  fill=(255, 255, 255, alpha))
+    img.save(out_path)
+    return img.size
+
+
+def prepare_logo_png(src_path: str, out_path: str, out_w: int,
+                     scale_pct: float = 12.0,
+                     opacity: float = 0.85) -> Tuple[int, int]:
+    """Scale an uploaded logo PNG to scale_pct % of the video width and
+    apply opacity. Returns (width, height) of the output PNG."""
+    from PIL import Image
+    img = Image.open(src_path).convert("RGBA")
+    target_w = max(16, int(round(out_w * min(0.40, max(0.03, float(scale_pct)))
+                                 / 100.0)))
+    r = target_w / max(1, img.size[0])
+    img = img.resize((target_w, max(16, int(round(img.size[1] * r)))),
+                     Image.LANCZOS)
+    op = min(1.0, max(0.05, float(opacity)))
+    if op < 1.0:
+        a = img.getchannel("A").point(lambda v: int(round(v * op)))
+        img.putalpha(a)
+    img.save(out_path)
+    return img.size
+
+
+def prepare_overlay_images(watermark: Optional[Dict], logo: Optional[Dict],
+                           out_w: int, out_h: int, work_dir: str) -> Dict:
+    """Build the watermark/logo overlay PNGs and their positions.
+
+    watermark: {"text": str, "position": str, "opacity": 0..1} or None.
+    logo: {"upload_path": str, "position": str, "scale": pct,
+           "opacity": 0..1} or None.
+    Returns {"watermark": {"png_path","x","y","w","h"},
+             "logo": {"png_path","x","y","w","h"}} — keys only when the
+    overlay is enabled and its PNG was built. Positions come from
+    overlay_xy (corners + center presets, 3% margin).
+    """
+    out: Dict[str, Dict] = {}
+    try:
+        os.makedirs(work_dir, exist_ok=True)
+        if watermark and str(watermark.get("text") or "").strip():
+            _wm_path = os.path.join(work_dir, "watermark.png")
+            _fs = max(24, int(round(out_h * 0.045)))
+            _pw, _ph = render_text_watermark_png(
+                str(watermark["text"]).strip(), _wm_path,
+                font_size_px=_fs,
+                opacity=float(watermark.get("opacity", 0.5)))
+            _x, _y = overlay_xy(str(watermark.get("position",
+                                                  "bottom-right")),
+                                out_w, out_h, _pw, _ph)
+            out["watermark"] = {"png_path": _wm_path, "x": _x, "y": _y,
+                                "w": _pw, "h": _ph}
+        if logo and logo.get("upload_path") and os.path.isfile(
+                str(logo["upload_path"])):
+            _lg_path = os.path.join(work_dir, "logo.png")
+            _lw, _lh = prepare_logo_png(
+                str(logo["upload_path"]), _lg_path, out_w,
+                scale_pct=float(logo.get("scale", 12.0)),
+                opacity=float(logo.get("opacity", 0.85)))
+            _x, _y = overlay_xy(str(logo.get("position", "top-right")),
+                                out_w, out_h, _lw, _lh)
+            out["logo"] = {"png_path": _lg_path, "x": _x, "y": _y,
+                           "w": _lw, "h": _lh}
+    except Exception:
+        # Overlays are decorative — never fail a render for them.
+        pass
+    return out
+
+
+def overlay_filter_args(watermark: Optional[Dict], logo: Optional[Dict],
+                        subtitle_concat: Optional[str],
+                        out_w: int, out_h: int, work_dir: str
+                        ) -> Tuple[List[str], List[str]]:
+    """v1.13: build the -i args + filter steps for watermark/logo.
+
+    watermark/logo are user specs (see prepare_overlay_images);
+    subtitle_concat is the burned-subtitle concat path or None.
+    Returns (input_args, filter_steps) ready to append to the ffmpeg
+    command / filter chain. The chain always ends with [vout].
+    """
+    _prepared = prepare_overlay_images(watermark, logo, out_w, out_h,
+                                       work_dir)
+    _ovl_inputs, _ovl_idx = extra_image_inputs(
+        subtitle_concat,
+        (_prepared.get("watermark") or {}).get("png_path"),
+        (_prepared.get("logo") or {}).get("png_path"))
+    _steps: List[Tuple[int, int, int]] = []
+    for _key in ("watermark", "logo"):
+        _spec = _prepared.get(_key)
+        if _spec and _key in _ovl_idx:
+            _steps.append((_ovl_idx[_key], int(_spec["x"]), int(_spec["y"])))
+    return _ovl_inputs, _image_overlay_steps(_steps)
+
+
+def sanitize_filename(name: str, default: str = "recap") -> str:
+    """Sanitize a user-supplied output filename (no path, no weird
+    chars). Keeps Myanmar letters, ASCII word chars, dash and space."""
+    import re
+    import unicodedata
+    base = unicodedata.normalize("NFC", str(name or "")).strip()
+    base = re.sub(r"[^\w\u1000-\u109F\uAA60-\uAA7F \-]", "_", base)
+    base = re.sub(r"\s+", " ", base).strip(" .")
+    if not base:
+        base = default
+    return base[:60]
+
+
+def make_thumbnail(video_path: str, title: str, out_path: str,
+                   font_size_px: int = 64) -> str:
+    """Post Kit thumbnail: 1080x1440 PNG — a frame at 10% of the video
+    with the title burned at the bottom (Pillow RAQM)."""
+    from PIL import Image, ImageDraw, ImageFont
+    meta = get_video_metadata(video_path)
+    dur = float(meta.get("duration") or 0)
+    ss = max(0.5, dur * 0.10)
+    frame = out_path + ".frame.jpg"
+    _run(
+        ["ffmpeg", "-y", "-v", "error", "-ss", f"{ss:.2f}",
+         "-i", video_path, "-vframes", "1", "-q:v", "3", frame],
+        "thumbnail frame")
+    try:
+        font_file = find_myanmar_font()
+        try:
+            font = ImageFont.truetype(font_file, font_size_px,
+                                      layout_engine=ImageFont.Layout.RAQM)
+        except Exception:
+            font = ImageFont.load_default()
+        img = Image.open(frame).convert("RGB")
+        # Cover 1080x1440.
+        tw, th = 1080, 1440
+        r = max(tw / img.size[0], th / img.size[1])
+        img = img.resize((int(img.size[0] * r) + 1, int(img.size[1] * r) + 1),
+                         Image.LANCZOS)
+        x0 = (img.size[0] - tw) // 2
+        y0 = (img.size[1] - th) // 2
+        img = img.crop((x0, y0, x0 + tw, y0 + th))
+        draw = ImageDraw.Draw(img, "RGBA")
+        # Bottom title band.
+        band_h = 320
+        draw.rectangle([0, th - band_h, tw, th], fill=(0, 0, 0, 160))
+        margin = 60
+        max_w = tw - margin * 2
+        words = str(title or "").split(" ")
+        lines, cur = [], ""
+        for w in words:
+            cand = (cur + " " + w).strip()
+            try:
+                ww = draw.textlength(cand, font=font)
+            except Exception:
+                ww = len(cand) * font_size_px * 0.6
+            if cur and ww > max_w:
+                lines.append(cur)
+                cur = w
+            else:
+                cur = cand
+            if len(lines) >= 2:
+                break
+        if cur and len(lines) < 3:
+            lines.append(cur)
+        lines = lines[:3]
+        try:
+            ascent, descent = font.getmetrics()
+            lh = ascent + descent + 12
+        except Exception:
+            lh = font_size_px + 12
+        y = th - band_h + (band_h - lh * len(lines)) // 2
+        for line in lines:
+            try:
+                lw = draw.textlength(line, font=font)
+            except Exception:
+                lw = len(line) * font_size_px * 0.6
+            try:
+                draw.text(((tw - lw) / 2, y), line, font=font,
+                          fill=(255, 255, 255, 255),
+                          stroke_width=2, stroke_fill=(0, 0, 0, 255))
+            except TypeError:
+                draw.text(((tw - lw) / 2, y), line, font=font,
+                          fill=(255, 255, 255, 255))
+            y += lh
+        img.save(out_path)
+        return out_path
+    finally:
+        try:
+            os.remove(frame)
+        except OSError:
+            pass
 
 
 def _srt_timestamp(sec: float) -> str:
@@ -1044,6 +1416,15 @@ def build_hybrid_filter_graph(
     blur_boxes: Optional[List[Dict]] = None,
     subtitle_enabled: bool = True,
     bg_volume: float = 0.0,
+    # v1.13: subtitle input index (2 normally; shifts when extra image
+    # inputs precede it — always computed by the pack builder), and
+    # optional PNG overlays: {"input_idx": int, "x": int, "y": int}.
+    subtitle_input_idx: int = 2,
+    watermark: Optional[Dict] = None,
+    logo: Optional[Dict] = None,
+    # v1.13: -16 LUFS normalization. False for silent voiceovers
+    # (loudnorm emits NaN on digital silence).
+    loudnorm: bool = True,
 ) -> Dict:
     """Build the FFmpeg filter graph for a Hybrid (device) encode.
 
@@ -1054,7 +1435,9 @@ def build_hybrid_filter_graph(
     (the browser renders the cue PNGs and feeds them as input 2).
 
     Inputs the browser must provide: 0 = source video, 1 = voiceover
-    audio, 2 = subtitle concat video (only when subtitle_enabled).
+    audio, then the optional image inputs in pack order (subtitle
+    concat, watermark PNG, logo PNG — the pack's overlay_inputs lists
+    the exact indices; the graph is built with the same indices).
     Returns {"with_audio", "no_audio", "copyright_applied", "out_w",
     "out_h", "blur_boxes" (pixel rects), "subtitle_input"}.
     The no_audio variant is used when the source has no audio stream
@@ -1092,19 +1475,31 @@ def build_hybrid_filter_graph(
         steps, cur_label = _blur_filter_steps(cur_label, boxes)
         vchain.extend(steps)
     if subtitle_enabled:
-        vchain.append(f"[{cur_label}][2:v]overlay=0:0:format=auto[vout]")
+        vchain.append(f"[{cur_label}][{int(subtitle_input_idx)}:v]"
+                      "overlay=0:0:format=auto[vout]")
     else:
         vchain.append(f"[{cur_label}]null[vout]")
+    # v1.13: watermark / logo PNG overlays (burned, both modes).
+    _ovl: List[Tuple[int, int, int]] = []
+    for _spec in (watermark, logo):
+        if _spec and _spec.get("input_idx") is not None:
+            _ovl.append((int(_spec["input_idx"]),
+                         int(_spec.get("x", 0)), int(_spec.get("y", 0))))
+    vchain.extend(_image_overlay_steps(_ovl))
     video_part = ";".join(vchain)
     # Audio: source at bg_volume mixed with the voiceover (server
     # render uses anull for factor 1.0 — same here, speed is 1.0).
+    # v1.13: single-pass -16 LUFS normalization at the end of the
+    # chain (present in the wasm core — verified via strings).
+    # Skipped for silent voiceovers (loudnorm emits NaN on silence).
+    _ln = LOUDNORM_FILTER + "," if loudnorm else ""
     audio_with = (
         f"[0:a]anull,volume={bg_volume}[bg];"
         "[bg][1:a]amix=inputs=2:duration=longest:"
         "dropout_transition=0:normalize=0,"
-        "alimiter=limit=0.95,aresample=44100[aout]"
+        f"alimiter=limit=0.95,{_ln}aresample=44100[aout]"
     )
-    audio_without = "[1:a]aresample=44100[aout]"
+    audio_without = f"[1:a]{_ln}aresample=44100[aout]"
     return {
         "with_audio": video_part + ";" + audio_with,
         "no_audio": video_part + ";" + audio_without,
@@ -1215,6 +1610,14 @@ def render_recap_video(
     # fraction measured from ffmpeg's own -progress output
     # (out_time_ms / voiceover duration — the audio is master).
     on_progress: Optional[Callable[[float], None]] = None,
+    # v1.13 feature pack: render quality (fast/normal/high), output
+    # fps, and optional burned overlays. watermark =
+    # {"text": str, "position": str, "opacity": 0..1}; logo =
+    # {"upload_path": str, "position": str, "scale": pct, "opacity": 0..1}.
+    quality: str = "fast",
+    fps: int = 30,
+    watermark: Optional[Dict] = None,
+    logo: Optional[Dict] = None,
 ) -> Dict:
     """Render the final recap video. Returns a result dict.
 
@@ -1332,7 +1735,15 @@ def render_recap_video(
                            out_w, out_h, work_dir)
         vchain.extend(sub_steps)
 
+        # 2c) v1.13: watermark / logo PNG overlays (burned, both modes).
+        _ovl_inputs, _ovl_fsteps = overlay_filter_args(
+            watermark, logo, subtitle_concat, out_w, out_h, work_dir)
+        vchain.extend(_ovl_fsteps)
+
         afilters: List[str] = []
+        # v1.13: -16 LUFS normalization, skipped for silent voiceovers
+        # (loudnorm emits NaN on digital silence).
+        _ln = "" if _audio_is_silent(voiceover_path) else LOUDNORM_FILTER + ","
         if has_src_audio:
             chain = _atempo_chain(factor) if abs(factor - 1.0) > 1e-6 else "anull"
             afilters.append(f"[0:a]{chain},volume={bg_volume}[bg]")
@@ -1341,31 +1752,32 @@ def render_recap_video(
             afilters.append(
                 "[bg][1:a]amix=inputs=2:duration=longest:"
                 "dropout_transition=0:normalize=0,"
-                "alimiter=limit=0.95,aresample=44100[aout]"
+                f"alimiter=limit=0.95,{_ln}aresample=44100[aout]"
             )
         else:
-            afilters.append("[1:a]aresample=44100[aout]")
+            afilters.append(f"[1:a]{_ln}aresample=44100[aout]")
 
         filtergraph = ";".join(vchain + afilters)
 
         cmd = ["ffmpeg", "-y", "-v", "error",
                "-i", concat_path, "-i", voiceover_path]
-        if subtitle_concat:
-            cmd += ["-f", "concat", "-safe", "0", "-i", subtitle_concat]
+        cmd += _ovl_inputs
         soft_srt_out = None
         if srt_path and subtitle_mode != "burned_in":
             # soft subtitles: mux as mov_text track + keep a sidecar .srt
+            # (its input index follows the optional image inputs).
+            _srt_idx = 2 + _ovl_inputs.count("-i")
             cmd += ["-i", srt_path]
             subtitle_mode = "soft"
             soft_srt_out = os.path.splitext(output_path)[0] + ".srt"
         cmd += ["-filter_complex", filtergraph,
                 "-map", "[vout]", "-map", "[aout]",
-                "-c:v", "libx264", "-preset", "veryfast",
-                "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:v", "libx264"] + quality_encode_args(quality) + [
+                "-pix_fmt", "yuv420p", "-r", str(int(fps)),
                 "-c:a", "aac", "-b:a", "128k",
                 "-movflags", "+faststart", "-shortest"]
         if subtitle_mode == "soft":
-            cmd += ["-map", "2:s", "-c:s", "mov_text"]
+            cmd += ["-map", f"{_srt_idx}:s", "-c:s", "mov_text"]
         cmd.append(output_path)
 
         # Render progress comes from ffmpeg itself (out_time_ms /
@@ -1425,6 +1837,14 @@ def render_pro_recap_video(
     # fills 0–0.40 (equal share per block), the final visual chain
     # fills 0.40–1.0 — both measured from ffmpeg's -progress output.
     on_progress: Optional[Callable[[float], None]] = None,
+    # v1.13 feature pack: render quality (fast/normal/high), output
+    # fps, and optional burned overlays. watermark =
+    # {"text": str, "position": str, "opacity": 0..1}; logo =
+    # {"upload_path": str, "position": str, "scale": pct, "opacity": 0..1}.
+    quality: str = "fast",
+    fps: int = 30,
+    watermark: Optional[Dict] = None,
+    logo: Optional[Dict] = None,
 ) -> Dict:
     """Render a Pro AI Recap video (dialogue dubbing, Step 15).
 
@@ -1536,13 +1956,19 @@ def render_pro_recap_video(
             else:
                 tts_fit = "anull"
             if seg_meta["has_audio"]:
+                # v1.13: -16 LUFS per block (the final concat copies
+                # audio, so per-block normalization carries through).
+                # Skipped for silent blocks (loudnorm emits NaN).
+                _ln = ("" if _audio_is_silent(b["audio_path"])
+                       else LOUDNORM_FILTER + ",")
                 fc = (
                     f"[0:v]null[v];"
                     f"[0:a]anull,volume={bg_volume}[bg];"
                     f"[1:a]{tts_fit},aresample=44100[tts];"
                     f"[bg][tts]amix=inputs=2:duration=shortest:"
                     f"dropout_transition=0:normalize=0,"
-                    f"alimiter=limit=0.95,aresample=44100[a]"
+                    f"alimiter=limit=0.95,{_ln}"
+                    f"aresample=44100[a]"
                 )
             else:
                 fc = (f"[0:v]null[v];"
@@ -1558,8 +1984,8 @@ def render_pro_recap_video(
                  "-i", seg, "-i", b["audio_path"],
                  "-filter_complex", fc,
                  "-map", "[v]", "-map", "[a]",
-                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                 "-pix_fmt", "yuv420p", "-r", "30",
+                 "-c:v", "libx264"] + quality_encode_args(quality) + [
+                 "-pix_fmt", "yuv420p", "-r", str(int(fps)),
                  "-c:a", "aac", "-b:a", "128k", out],
                 f"pro block {i} sync",
                 video_dur,
@@ -1616,15 +2042,18 @@ def render_pro_recap_video(
             _subtitle_step(cur_label, srt_path, subtitle_config,
                            out_w, out_h, work_dir, subtitle_input_idx=1)
         vchain.extend(sub_steps)
+        # v1.13: watermark / logo PNG overlays (burned, both modes).
+        _ovl_inputs, _ovl_fsteps = overlay_filter_args(
+            watermark, logo, subtitle_concat, out_w, out_h, work_dir)
+        vchain.extend(_ovl_fsteps)
         filtergraph = ";".join(vchain)
 
         cmd = ["ffmpeg", "-y", "-v", "error", "-i", concat_path]
-        if subtitle_concat:
-            cmd += ["-f", "concat", "-safe", "0", "-i", subtitle_concat]
+        cmd += _ovl_inputs
         cmd += ["-filter_complex", filtergraph,
                 "-map", "[vout]", "-map", "0:a",
-                "-c:v", "libx264", "-preset", "veryfast",
-                "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:v", "libx264"] + quality_encode_args(quality) + [
+                "-pix_fmt", "yuv420p", "-r", str(int(fps)),
                 "-c:a", "copy",
                 "-movflags", "+faststart"]
         cmd.append(output_path)

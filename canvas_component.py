@@ -81,6 +81,71 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   background: #111;
   color: #fff;
 }
+/* v1.13: Post Kit + Library inside the Hybrid result bar
+   (black & white only). */
+.mmr-postkit {
+  flex-basis: 100%;
+  background: #fff;
+  border: 1px solid #111;
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-top: 4px;
+  max-width: 480px;
+}
+.mmr-pkcap {
+  color: #111;
+  font-size: 14px;
+  margin-bottom: 6px;
+  white-space: pre-wrap;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.mmr-pktags {
+  color: #333;
+  font-size: 13px;
+  word-break: break-word;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.mmr-library {
+  flex-basis: 100%;
+  margin-top: 4px;
+  max-width: 480px;
+}
+.mmr-liblabel {
+  color: #111;
+  font-weight: 700;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+.mmr-liblist {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mmr-librow {
+  background: #fff;
+  border: 1px solid #999;
+  border-radius: 10px;
+  padding: 8px 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.mmr-libtitle {
+  flex-basis: 100%;
+  color: #111;
+  font-size: 13px;
+  font-weight: 600;
+}
+.mmr-libpk {
+  flex-basis: 100%;
+  color: #555;
+  font-size: 12px;
+  user-select: text;
+  -webkit-user-select: text;
+}
 .mmr-phone {
   position: relative;
   width: min(400px, 100%);
@@ -594,7 +659,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   var wrap, phone, stage, video, bgVideo, player, btnPlay, prog, progFill,
       timeEl, btnMute, btnFs, btnX, btnEdit, btnAddBlur, btnDone, subEl,
       subHandle, subWHandle, emptyEl, emptyUrl, fileInput,
-      resultBar, resMp4, resSrt;
+      resultBar, resMp4, resSrt,
+      resPk, resPkCap, resPkTags, resThumb, resLib, resLibList;
 
   function el(tag, cls, parent) {
     var e = document.createElement(tag);
@@ -686,7 +752,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     /* Hybrid result bar: MP4 + SRT download links for the video the
        DEVICE encoded (the result never goes to the server, so the
        browser offers the download from its own blob). Hidden until
-       a Hybrid encode finishes. */
+       a Hybrid encode finishes. v1.13 adds: Post Kit (caption +
+       hashtags + 3:4 thumbnail capture) and an in-session Library. */
     resultBar = el("div", "mmr-resultbar mmr-hidden", wrap);
     var resLabel = el("span", "mmr-resultlabel", resultBar);
     resLabel.textContent = "Hybrid result:";
@@ -696,6 +763,19 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     resSrt = el("a", "mmr-resultbtn", resultBar);
     resSrt.textContent = "SRT Download";
     resSrt.download = "subtitles.srt";
+    /* v1.13: Post Kit block (caption + hashtags, filled per run). */
+    resPk = el("div", "mmr-postkit mmr-hidden", resultBar);
+    resPkCap = el("div", "mmr-pkcap", resPk);
+    resPkTags = el("div", "mmr-pktags", resPk);
+    resThumb = el("a", "mmr-resultbtn", resultBar);
+    resThumb.textContent = "Thumbnail 3:4";
+    resThumb.style.display = "none";
+    /* v1.13: in-session library (browser blobs live in memory only —
+       the list is honest about that). */
+    resLib = el("div", "mmr-library mmr-hidden", resultBar);
+    var libLabel = el("div", "mmr-liblabel", resLib);
+    libLabel.textContent = "Library (ဒီ session အတွက်သာ):";
+    resLibList = el("div", "mmr-liblist", resLib);
 
     wirePlayer();
     wireTopButtons();
@@ -1881,22 +1961,28 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     return cues;
   }
 
-  /* Mirrors _split_subtitle_chunks: words, <=30 chars per chunk,
-     long words hard-split. */
-  function splitChunks(text, maxChars) {
+  /* Mirrors _split_subtitle_chunks: words, <=maxChars per chunk,
+     long words hard-split. wordsPerCaption (v1.13) caps words per
+     chunk; the <=2-line invariant is enforced by splitChunkToPieces. */
+  function splitChunks(text, maxChars, wordsPerCaption) {
     maxChars = maxChars || 30;
     var words = text.split(" ");
-    var chunks = [], cur = "";
+    var chunks = [], cur = "", curWords = 0;
     for (var wi = 0; wi < words.length; wi++) {
       var w = words[wi];
       while (w.length > maxChars) {
-        if (cur) { chunks.push(cur); cur = ""; }
+        if (cur) { chunks.push(cur); cur = ""; curWords = 0; }
         chunks.push(w.slice(0, maxChars));
         w = w.slice(maxChars);
       }
+      if (!w) continue;
+      if (wordsPerCaption && curWords >= wordsPerCaption && cur) {
+        chunks.push(cur); cur = ""; curWords = 0;
+      }
       var cand = (cur + " " + w).trim();
-      if (cur && cand.length > maxChars) { chunks.push(cur); cur = w; }
-      else { cur = cand; }
+      if (cur && cand.length > maxChars) {
+        chunks.push(cur); cur = w; curWords = 1;
+      } else { cur = cand; curWords = cur ? curWords + 1 : 0; }
     }
     if (cur) chunks.push(cur);
     return chunks.length ? chunks : [text];
@@ -1987,7 +2073,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     for (var ci = 0; ci < cues.length; ci++) {
       var cue = cues[ci];
       var groups = [];
-      splitChunks(cue.text, 30).forEach(function (ch) {
+      var wpc = pack.subtitle && pack.subtitle.words_per_caption;
+      splitChunks(cue.text, 30, wpc).forEach(function (ch) {
         groups = groups.concat(splitChunkToPieces(ch, ctx, maxWidth, 2));
       });
       var dur = cue.end - cue.start, n = groups.length;
@@ -2231,14 +2318,173 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     return /Stream #\d+:\d+.*Audio/.test(S.hybridLogLines.join("\n"));
   }
 
-  function showResultBar() {
-    if (resMp4) resMp4.href = S.resultBlobUrl || "";
-    if (resSrt) resSrt.href = S.resultSrtUrl || "";
+  function showResultBar(pack) {
+    var outName = (pack && pack.output_name) || "recap.mp4";
+    var baseName = outName.replace(/\.mp4$/i, "") || "recap";
+    if (resMp4) {
+      resMp4.href = S.resultBlobUrl || "";
+      resMp4.download = outName;
+    }
+    if (resSrt) {
+      resSrt.href = S.resultSrtUrl || "";
+      resSrt.download = baseName + ".srt";
+    }
+    /* v1.13: Post Kit — caption + hashtags from the pack. */
+    var pk = (pack && pack.postkit) || null;
+    if (resPk) {
+      var cap = pk && pk.caption, tags = pk && pk.hashtags;
+      if (cap || (tags && tags.length)) {
+        if (resPkCap) resPkCap.textContent = cap || "";
+        if (resPkTags) resPkTags.textContent = (tags || []).join(" ");
+        resPk.classList.remove("mmr-hidden");
+      } else {
+        resPk.classList.add("mmr-hidden");
+      }
+    }
+    /* v1.13: thumbnail button + library entry. */
+    if (resThumb) {
+      resThumb.style.display = "";
+      resThumb.onclick = function (e) {
+        e.preventDefault();
+        captureThumbnail(pack);
+        return false;
+      };
+    }
+    addLibraryEntry(pack);
     if (resultBar) resultBar.classList.remove("mmr-hidden");
     fitHeight();
   }
   function hideResultBar() {
     if (resultBar) resultBar.classList.add("mmr-hidden");
+  }
+
+  /* v1.13: capture a 1080x1440 thumbnail from the result video
+     (frame at 10%) with the title burned at the bottom — the
+     device-side equivalent of the server's make_thumbnail. */
+  function captureThumbnail(pack) {
+    try {
+      var v = video;
+      if (!v || !S.resultBlobUrl) return;
+      var dur = v.duration || 0;
+      var t = dur > 1 ? dur * 0.10 : 0;
+      var cv = document.createElement("canvas");
+      cv.width = 1080; cv.height = 1440;
+      var ctx = cv.getContext("2d");
+      var doCapture = function () {
+        try {
+          var vw = v.videoWidth || 720, vh = v.videoHeight || 1280;
+          var r = Math.max(1080 / vw, 1440 / vh);
+          var dw = vw * r, dh = vh * r;
+          ctx.drawImage(v, (1080 - dw) / 2, (1440 - dh) / 2, dw, dh);
+          /* Bottom title band. */
+          ctx.fillStyle = "rgba(0,0,0,0.62)";
+          ctx.fillRect(0, 1440 - 320, 1080, 320);
+          var title = (pack && pack.title) || "";
+          ctx.fillStyle = "#fff";
+          ctx.textAlign = "center";
+          var fs = 64, words = title.split(/\s+/), lines = [], cur = "";
+          ctx.font = "600 " + fs + "px sans-serif";
+          for (var i = 0; i < words.length && lines.length < 3; i++) {
+            var cand = (cur + " " + words[i]).trim();
+            if (cur && ctx.measureText(cand).width > 960) {
+              lines.push(cur); cur = words[i];
+            } else { cur = cand; }
+          }
+          if (cur && lines.length < 3) lines.push(cur);
+          lines = lines.slice(0, 3);
+          var lh = fs + 14, y0 = 1440 - 320 + (320 - lh * lines.length) / 2;
+          for (var li = 0; li < lines.length; li++) {
+            ctx.fillText(lines[li], 540, y0 + li * lh + fs * 0.8);
+          }
+          cv.toBlob(function (blob) {
+            if (!blob) return;
+            var a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = "thumbnail.png";
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(function () {
+              URL.revokeObjectURL(a.href);
+              a.remove();
+            }, 4000);
+          }, "image/png");
+        } catch (e) { /* best-effort */ }
+        v.removeEventListener("seeked", doCapture);
+      };
+      v.addEventListener("seeked", doCapture);
+      try { v.currentTime = t; } catch (e) { doCapture(); }
+      /* Fallback: if seeked never fires, capture the current frame. */
+      setTimeout(function () {
+        if (v.readyState >= 2) {
+          v.removeEventListener("seeked", doCapture);
+          doCapture();
+        }
+      }, 2500);
+    } catch (e) { /* best-effort */ }
+  }
+
+  /* v1.13: in-session library. Entries hold blob URLs (memory-only);
+     the list is capped at 5 to bound memory. */
+  function addLibraryEntry(pack) {
+    try {
+      S.library = S.library || [];
+      var outName = (pack && pack.output_name) || "recap.mp4";
+      S.library.unshift({
+        title: (pack && pack.title) || "Recap",
+        mode: (pack && pack.processing_mode) || "",
+        duration: (pack && pack.video && pack.video.duration) || 0,
+        mp4Url: S.resultBlobUrl || "",
+        mp4Name: outName,
+        srtUrl: S.resultSrtUrl || "",
+        srtName: (outName.replace(/\.mp4$/i, "") || "recap") + ".srt",
+        caption: (pack && pack.postkit && pack.postkit.caption) || "",
+        hashtags: ((pack && pack.postkit && pack.postkit.hashtags) || [])
+          .join(" "),
+      });
+      S.library = S.library.slice(0, 5);
+      renderLibrary();
+    } catch (e) { /* best-effort */ }
+  }
+  function renderLibrary() {
+    if (!resLib || !resLibList) return;
+    var lib = S.library || [];
+    resLibList.textContent = "";
+    if (!lib.length) {
+      resLib.classList.add("mmr-hidden");
+      return;
+    }
+    resLib.classList.remove("mmr-hidden");
+    for (var i = 0; i < lib.length; i++) {
+      (function (e) {
+        var row = document.createElement("div");
+        row.className = "mmr-librow";
+        var t = document.createElement("div");
+        t.className = "mmr-libtitle";
+        var mode = e.mode === "pro_ai_recap" ? "Pro" : "AI Recap";
+        t.textContent = e.title + " | " + mode + " | " +
+          Math.round(e.duration) + "s";
+        row.appendChild(t);
+        var mp4 = document.createElement("a");
+        mp4.className = "mmr-resultbtn";
+        mp4.textContent = "MP4";
+        mp4.href = e.mp4Url;
+        mp4.download = e.mp4Name;
+        row.appendChild(mp4);
+        var srt = document.createElement("a");
+        srt.className = "mmr-resultbtn";
+        srt.textContent = "SRT";
+        srt.href = e.srtUrl;
+        srt.download = e.srtName;
+        row.appendChild(srt);
+        if (e.caption || e.hashtags) {
+          var pk = document.createElement("div");
+          pk.className = "mmr-libpk";
+          pk.textContent = (e.caption ? e.caption + " " : "") + e.hashtags;
+          row.appendChild(pk);
+        }
+        resLibList.appendChild(row);
+      })(lib[i]);
+    }
   }
 
   /* The device encode: source + voiceover + subtitle PNGs, ONE
@@ -2277,15 +2523,37 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
         ? pack.filter_graph.with_audio
         : pack.filter_graph.no_audio;
       var args = ["-i", "input.mp4", "-i", "voice.mp3"];
-      if (hasSub) {
+      /* v1.13: overlay inputs in pack order (subtitle concat,
+         watermark PNG, logo PNG). Older packs (v1) have no
+         overlay_inputs — fall back to the subtitle-only logic. */
+      var overlayInputs = pack.overlay_inputs || null;
+      if (overlayInputs) {
+        for (var oi = 0; oi < overlayInputs.length; oi++) {
+          var o = overlayInputs[oi];
+          if (o.kind === "subtitle" && hasSub) {
+            args = args.concat(["-f", "concat", "-safe", "0",
+                                "-i", "sub_list.txt"]);
+          } else if ((o.kind === "watermark" || o.kind === "logo") &&
+                     o.png_b64) {
+            await ff.writeFile(o.kind + ".png", b64ToBytes(o.png_b64));
+            args.push("-i", o.kind + ".png");
+          }
+        }
+      } else if (hasSub) {
         args = args.concat(["-f", "concat", "-safe", "0",
                             "-i", "sub_list.txt"]);
       }
+      /* v1.13: quality (preset/crf) + fps from the pack. */
+      var q = pack.quality || { preset: "ultrafast", crf: null };
+      var vEnc = ["-c:v", "libx264", "-preset", q.preset || "ultrafast"];
+      if (q.crf !== null && q.crf !== undefined) {
+        vEnc = vEnc.concat(["-crf", String(q.crf)]);
+      }
       args = args.concat([
         "-filter_complex", graph,
-        "-map", "[vout]", "-map", "[aout]",
-        "-c:v", "libx264", "-preset", "ultrafast",
-        "-pix_fmt", "yuv420p", "-r", "30",
+        "-map", "[vout]", "-map", "[aout]"])
+        .concat(vEnc).concat([
+        "-pix_fmt", "yuv420p", "-r", String(pack.fps || 30),
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", "-shortest", "out.mp4"]);
       var code = await ff.exec(args);
@@ -2297,7 +2565,8 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       /* Free MEMFS: inputs + PNGs + list + output (the result lives
          as a blob URL now). */
       var trash = ["input.mp4", "voice.mp3", "sub_list.txt",
-                   "sub_blank.png", "out.mp4"].concat(pngNames);
+                   "sub_blank.png", "watermark.png", "logo.png",
+                   "out.mp4"].concat(pngNames);
       for (var ti = 0; ti < trash.length; ti++) {
         try { await ff.deleteFile(trash[ti]); } catch (e) { /* gone */ }
       }
@@ -2312,7 +2581,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
         new Blob([pack.srt_text || ""], { type: "text/plain" }));
       video.src = S.resultBlobUrl;
       video.load();
-      showResultBar();
+      showResultBar(pack);
       sendValue("hybrid_encode_done", {});
     } catch (err) {
       sendValue("hybrid_encode_error",

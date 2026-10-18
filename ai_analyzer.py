@@ -901,3 +901,94 @@ def generate_mock_recap_plan(video_duration: float) -> Dict[str, Any]:
         "burmese_script": script,
     }
     return validate_recap_plan(plan, duration)
+
+
+# ---------------------------------------------------------------------------
+# Post Kit (feature pack v1.13)
+# ---------------------------------------------------------------------------
+
+POST_KIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "caption": {"type": "string"},
+        "hashtags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["caption", "hashtags"],
+}
+
+
+def generate_post_kit(title, script_text, user_api_key, model=None,
+                      extra_hashtags="", append_fyp=True):
+    """Post Kit: Gemini writes a Burmese TikTok caption + hashtags.
+
+    Uses the caller's own BYOK key (same key as the recap analysis).
+    Returns {"caption": str, "hashtags": [str]} with the user's extra
+    hashtags appended and #fyp appended when the toggle is on.
+    Raises AnalyzerError on failure — callers catch it and skip the
+    Post Kit gracefully (it is a bonus, never fatal to the run).
+    """
+    key = _require_key(user_api_key)
+    client = genai.Client(**{"api_key": key})
+    script_excerpt = str(script_text or "")[:2000]
+    prompt = (
+        "You are writing a TikTok/Facebook post for a Myanmar video recap.\n"
+        "Video title: " + str(title or "") + "\n"
+        "Recap script excerpt: " + script_excerpt + "\n\n"
+        "Write in Burmese (Unicode Myanmar, never Zawgyi):\n"
+        "1. \"caption\": a catchy 1-2 line caption for the post.\n"
+        "2. \"hashtags\": 8-12 relevant hashtags (Myanmar and English mix, "
+        "each starting with #). Do NOT include #myanmartiktok.\n"
+        "Return ONLY strict JSON matching the schema."
+    )
+    candidates = []
+    if model:
+        candidates.append(model)
+    for m in MODEL_CANDIDATES:
+        if m not in candidates:
+            candidates.append(m)
+    last_err = None
+    data = None
+    for mid in candidates:
+        try:
+            resp = client.models.generate_content(
+                model=mid,
+                contents=[prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_json_schema=POST_KIT_SCHEMA,
+                ),
+            )
+            data = json.loads(resp.text)
+            break
+        except Exception as exc:  # noqa: BLE001 - try next model
+            if _looks_like_model_error(exc):
+                last_err = exc
+                continue
+            raise
+    if data is None:
+        raise AnalyzerError(
+            "Post Kit ဖန်တီးမရပါ။ "
+            f"({last_err if last_err else 'unknown error'})"
+        )
+    caption = str(data.get("caption") or "").strip()
+    tags = []
+    for h in data.get("hashtags") or []:
+        h = str(h).strip()
+        if not h:
+            continue
+        if not h.startswith("#"):
+            h = "#" + h
+        if h not in tags:
+            tags.append(h)
+    # User's custom hashtags.
+    for h in str(extra_hashtags or "").replace(",", " ").split():
+        h = h.strip()
+        if not h:
+            continue
+        if not h.startswith("#"):
+            h = "#" + h
+        if h not in tags:
+            tags.append(h)
+    if append_fyp and "#fyp" not in tags:
+        tags.append("#fyp")
+    return {"caption": caption, "hashtags": tags}

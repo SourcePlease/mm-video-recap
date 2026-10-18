@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-18 hybrid v1.12"
+BUILD_VERSION = "2026-10-18 feature-pack v1"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -44,6 +44,7 @@ from video_editor import (
     SUBTITLE_COLOR_RGB,
     SUBTITLE_FONTS,
     _subtitle_font_file,
+    sanitize_filename,
 )
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -352,6 +353,14 @@ def _parse_voice(choice: str) -> str:
     return (choice or "").split(" — ")[0].strip() or "my-MM-ThihaNeural"
 
 
+def _format_rate_pct(value) -> str:
+    """Voice-tab speed slider value (-50..+50) -> Edge-TTS rate string."""
+    try:
+        return f"{int(value):+d}%"
+    except (TypeError, ValueError):
+        return "+0%"
+
+
 def _format_pitch_hz(value) -> str:
     """Voice-tab slider value (-10..+10) -> Edge-TTS pitch string."""
     try:
@@ -585,10 +594,25 @@ def _delete_input_file() -> None:
 
 
 def _delete_result_files() -> None:
-    """Delete the previous run's output files (video + SRT), if any."""
+    """Delete the previous run's output files (video + SRT + thumbnail),
+    if any — except files still referenced by the in-session library."""
+    _lib_paths = set()
+    for _e in (st.session_state.get("recap_library") or []):
+        for _k in ("video_path", "srt_path", "thumbnail_path"):
+            if _e.get(_k):
+                try:
+                    _lib_paths.add(os.path.abspath(str(_e[_k])))
+                except OSError:
+                    pass
     _r = st.session_state.get("recap_result") or {}
-    _delete_quietly(_r.get("video_path"))
-    _delete_quietly(_r.get("srt_path"))
+    for _k in ("video_path", "srt_path", "thumbnail_path"):
+        _p = _r.get(_k)
+        if _p:
+            try:
+                if os.path.abspath(str(_p)) not in _lib_paths:
+                    _delete_quietly(_p)
+            except OSError:
+                _delete_quietly(_p)
     st.session_state["recap_result"] = None
 
 
@@ -816,11 +840,31 @@ def _apply_job_result(result, snap) -> Dict:
         "srt_path": result.get("srt_path"),
         "title": result.get("title"),
         "script_text": result.get("script_text"),
+        # v1.13: Post Kit + thumbnail + output naming + library entry.
+        "postkit": result.get("postkit"),
+        "thumbnail_path": result.get("thumbnail_path"),
+        "output_name": os.path.basename(
+            str(result.get("final_video_path") or "recap.mp4")),
+        "processing_mode": result.get("processing_mode"),
+        "duration": (result.get("metadata") or {}).get("duration"),
     }
     _cleanup_run_workdir(
         snap.get("run_dir"),
         [result.get("final_video_path"), result.get("srt_path"),
+         result.get("thumbnail_path"),
          _job_status_path(snap.get("run_dir"))])
+    # Library (v1.13): in-session list of completed runs. Streamlit
+    # Cloud disk is ephemeral — this list lives only for this session.
+    _lib = st.session_state.get("recap_library") or []
+    _lib = [_e for _e in _lib
+            if _e.get("video_path") != _recap["video_path"]]
+    _lib.insert(0, dict(_recap))
+    # Cap at 5 (disk): each entry keeps its MP4 on the ephemeral disk.
+    _old = _lib[5:]
+    st.session_state["recap_library"] = _lib[:5]
+    for _e in _old:
+        for _k in ("video_path", "srt_path", "thumbnail_path"):
+            _delete_quietly(_e.get(_k))
     # Auto-delete the uploaded input (the result no longer needs
     # it; a re-Run re-uploads from the canvas if asked).
     if snap.get("src_local_picked_at_start"):
@@ -895,13 +939,22 @@ def _run_pipeline_job(job: Dict) -> None:
                 burn_subtitles=snap["burn_subtitles"],
                 work_dir=snap["run_dir"],
                 output_dir=snap["run_dir"],
-                output_name="recap.mp4",
+                output_name=(
+                    sanitize_filename(
+                        snap.get("output_filename") or "recap") + ".mp4"),
                 use_mock_plan=snap["demo_active"],
                 tts_proxy=snap["tts_proxy"],
                 model=snap["model"],
                 blur_boxes=snap["blur_boxes"],
                 subtitle_config=snap["subtitle_config"],
                 on_progress=_cb,
+                rate=_format_rate_pct(snap.get("voice_speed_pct", 0)),
+                quality=str(snap.get("render_quality", "fast")),
+                fps=int(snap.get("output_fps", 30)),
+                watermark=snap.get("watermark"),
+                logo=snap.get("logo"),
+                postkit_extra_hashtags=snap.get("postkit_hashtags", ""),
+                postkit_append_fyp=bool(snap.get("postkit_fyp", True)),
                 hybrid_pack=True,
                 gemini_file_name=snap.get("gemini_file_name"),
                 video_duration=snap.get("video_duration"),
@@ -932,10 +985,19 @@ def _run_pipeline_job(job: Dict) -> None:
                 burn_subtitles=snap["burn_subtitles"],
                 work_dir=snap["run_dir"],
                 output_dir=snap["run_dir"],
-                output_name="recap.mp4",
+                output_name=(
+                    sanitize_filename(
+                        snap.get("output_filename") or "recap") + ".mp4"),
                 use_mock_plan=snap["demo_active"],
                 tts_proxy=snap["tts_proxy"],
                 model=snap["model"],
+                rate=_format_rate_pct(snap.get("voice_speed_pct", 0)),
+                quality=str(snap.get("render_quality", "fast")),
+                fps=int(snap.get("output_fps", 30)),
+                watermark=snap.get("watermark"),
+                logo=snap.get("logo"),
+                postkit_extra_hashtags=snap.get("postkit_hashtags", ""),
+                postkit_append_fyp=bool(snap.get("postkit_fyp", True)),
                 blur_boxes=snap["blur_boxes"],
                 subtitle_config=snap["subtitle_config"],
                 on_progress=_cb,
@@ -1257,6 +1319,20 @@ elif demo_active and os.path.isfile(DEMO_SAMPLE):
             _canvas_data_url = (
                 "data:video/mp4;base64," + base64.b64encode(_f.read()).decode()
             )
+elif st.session_state.get("url_hybrid_path"):
+    # v1.13: Hybrid + URL — the server downloaded the video; the
+    # browser fetches the file ONCE via a one-shot data URL, then the
+    # Hybrid flow continues as a local file.
+    _uhp = str(st.session_state["url_hybrid_path"])
+    _canvas_video_id = "urlhybrid_" + hashlib.md5(
+        _uhp.encode()).hexdigest()[:12]
+    if (st.session_state.get("canvas_vid_sent") != _canvas_video_id
+            and os.path.isfile(_uhp)):
+        with open(_uhp, "rb") as _f:
+            _canvas_data_url = (
+                "data:video/mp4;base64,"
+                + base64.b64encode(_f.read()).decode()
+            )
 elif (st.session_state.get("src_url") or "").strip():
     _u = (st.session_state.get("src_url") or "").strip()
     _canvas_video_id = "url_" + hashlib.md5(_u.encode()).hexdigest()[:12]
@@ -1571,6 +1647,7 @@ if isinstance(_val, dict):
                 _f.write(_raw)
             st.session_state["src_path"] = _dst
             st.session_state["src_url"] = None
+            st.session_state["url_hybrid_path"] = None
             st.session_state["src_video_id"] = _val.get("video_id")
             st.session_state["src_local_picked"] = True
             st.session_state["canvas_vid_sent"] = _val.get("video_id")
@@ -1598,6 +1675,7 @@ if isinstance(_val, dict):
             _delete_input_file()
             _delete_result_files()
             st.session_state["src_url"] = _u
+            st.session_state["url_hybrid_path"] = None
             st.session_state["pending_video_id"] = None
             st.session_state["pending_video_name"] = None
             st.session_state["pending_job"] = None
@@ -1760,6 +1838,33 @@ with tab_src:
     # 30s). The old 30/60/90/180 pills were removed because they
     # contradicted the full-duration spec. Pro is full-duration too.
 
+    # ---- Feature pack v1.13: Quality + FPS ----
+    st.markdown("### Quality")
+    st.pills(
+        "Quality",
+        options=["fast", "normal", "high"],
+        default="fast",
+        format_func=lambda q: (
+            "Fast — အမြန်ဆုံး" if q == "fast"
+            else "Normal — ပုံမှန်" if q == "normal"
+            else "High — အကောင်းဆုံး (နှေးမည်)"),
+        key="render_quality",
+        label_visibility="collapsed",
+    )
+    st.caption(
+        "Fast = ultrafast (v1.12 အတိုင်း, file ကြီးမည်) | "
+        "Normal = veryfast crf 23 | High = medium crf 20 (နှေးမည်)။"
+    )
+    st.markdown("### FPS")
+    st.pills(
+        "FPS",
+        options=[24, 30, 60],
+        default=30,
+        format_func=lambda f: f"{f} fps",
+        key="output_fps",
+        label_visibility="collapsed",
+    )
+
     # ---- Step 16: Aspect Ratio (5 pills) + Fit Mode (2 pills) ----
     st.markdown("### Aspect Ratio")
     st.pills(
@@ -1829,6 +1934,83 @@ with tab_src:
         "ကွဲပြားစေတယ်။"
     )
 
+    # ---- Feature pack v1.13: Watermark (text) ----
+    st.markdown("### Watermark (စာသား)")
+    watermark_text = st.text_input(
+        "Watermark စာသား (မထည့်ချင်ရင် ဗလာထားပါ)",
+        key="watermark_text",
+    )
+    if (watermark_text or "").strip():
+        st.pills(
+            "Watermark နေရာ",
+            options=["top-left", "top-right", "bottom-left",
+                     "bottom-right", "center"],
+            default="bottom-right",
+            format_func=lambda p: {
+                "top-left": "အပေါ်-ဘယ်", "top-right": "အပေါ်-ညာ",
+                "bottom-left": "အောက်-ဘယ်", "bottom-right": "အောက်-ညာ",
+                "center": "အလယ်"}[p],
+            key="watermark_pos",
+            label_visibility="collapsed",
+        )
+        st.slider("Watermark အထင်အရှား (%)", 10, 100, 50, 5,
+                  key="watermark_opacity")
+
+    # ---- Feature pack v1.13: Logo (image) ----
+    st.markdown("### Logo (ပုံ)")
+    logo_file = st.file_uploader(
+        "Logo PNG တင်ပါ (မထည့်ချင်ရင် ကျော်ပါ)",
+        type=["png"],
+        key="logo_upload",
+    )
+    if logo_file is not None:
+        st.pills(
+            "Logo နေရာ",
+            options=["top-left", "top-right", "bottom-left",
+                     "bottom-right"],
+            default="top-right",
+            format_func=lambda p: {
+                "top-left": "အပေါ်-ဘယ်", "top-right": "အပေါ်-ညာ",
+                "bottom-left": "အောက်-ဘယ်",
+                "bottom-right": "အောက်-ညာ"}[p],
+            key="logo_pos",
+            label_visibility="collapsed",
+        )
+        st.slider("Logo အရွယ်အစား (% of width)", 5, 30, 12, 1,
+                  key="logo_scale")
+        st.slider("Logo အထင်အရှား (%)", 10, 100, 85, 5,
+                  key="logo_opacity")
+
+    # ---- Feature pack v1.13: caption blur band (one-tap preset) ----
+    st.markdown("### Blur")
+    _has_band = any(
+        isinstance(_b, dict) and _b.get("band")
+        for _b in (st.session_state.get("canvas_blur") or []))
+    if st.button(
+            "စာတန်းဖုံး blur band ဖြုတ်မယ်" if _has_band
+            else "စာတန်းဖုံး blur band ထည့်မယ်",
+            key="blur_band_btn"):
+        _boxes = [dict(_b) for _b in
+                  (st.session_state.get("canvas_blur") or [])]
+        if _has_band:
+            _boxes = [_b for _b in _boxes if not _b.get("band")]
+        else:
+            # Full-width band over the current subtitle area (covers
+            # original burned-in subtitles).
+            _sub = st.session_state.get("canvas_sub") or {}
+            _y = float(_sub.get("y_pct", 0.82))
+            _boxes.append({
+                "x_pct": 0.0, "y_pct": max(0.0, _y - 0.07),
+                "w_pct": 1.0, "h_pct": 0.14,
+                "strength": 25, "band": True,
+            })
+        st.session_state["canvas_blur"] = _boxes
+        st.session_state["_canvas_rerun_needed"] = True
+    st.caption(
+        "မူရင်း video မှာ ကပ်ထားတဲ့ စာတန်းတွေ ဖုံးဖို့ "
+        "အလျားလိုက် blur band တစ်ခု ထည့်ပေးပါတယ်။"
+    )
+
     model_choice = st.selectbox(" AI Model ရွေးပါ", MODEL_OPTIONS, index=0)
 
 with tab_voice:
@@ -1841,6 +2023,40 @@ with tab_voice:
         "လက်ရှိ Tone: "
         + ("0 (မူရင်း)" if pitch_hz == 0 else f"{pitch_hz:+d}Hz")
     )
+    voice_speed_pct = st.slider(
+        " အသံ အမြန်နှုန်း", -50, 50, 0, 5,
+        key="voice_speed_pct",
+    )
+    st.caption(
+        "လက်ရှိ အမြန်နှုန်း: "
+        + ("0% (မူရင်း)" if voice_speed_pct == 0
+           else f"{voice_speed_pct:+d}%")
+    )
+    # Voice preview (v1.13): a short sample with the CURRENT voice +
+    # speed + tone — no full Run needed. Edge-TTS needs no API key.
+    if st.button("▶ အသံ နားထောင်ကြည့်မယ်", key="voice_preview_btn"):
+        _pv_voice = _parse_voice(voice_choice)
+        _pv_text = "မင်္ဂလာပါ။ ဒါက အသံ နမူနာ ဖြစ်ပါတယ်။"
+        try:
+            with st.spinner("အသံ နမူနာ ထုတ်နေသည်…"):
+                from tts_manager import generate_burmese_voiceover as _pv_tts
+                _pv_proxy = (os.environ.get("HTTPS_PROXY")
+                             or os.environ.get("https_proxy"))
+                _pv_audio = _pv_tts(
+                    _pv_text, os.path.join(
+                        tempfile.gettempdir(), "voice_preview.mp3"),
+                    voice_name=_pv_voice,
+                    rate=_format_rate_pct(voice_speed_pct),
+                    pitch=_format_pitch_hz(pitch_hz),
+                    proxy=_pv_proxy,
+                )
+                with open(_pv_audio, "rb") as _pf:
+                    st.session_state["voice_preview_audio"] = _pf.read()
+        except Exception as _pv_exc:  # noqa: BLE001 - show, don't crash
+            st.error(f"✕ အသံ နမူနာ ထုတ်မရပါ: {_pv_exc}")
+            st.session_state["voice_preview_audio"] = None
+    if st.session_state.get("voice_preview_audio"):
+        st.audio(st.session_state["voice_preview_audio"], format="audio/mp3")
 
 with tab_sub:
     burn_subtitles = st.checkbox(
@@ -1859,6 +2075,40 @@ with tab_sub:
         options=list(SUBTITLE_COLOR_RGB.keys()),
         index=list(SUBTITLE_COLOR_RGB.keys()).index("Yellow"),
         key="subtitle_color",
+    )
+    # v1.13: subtitle position (Bottom/Middle) + bottom margin. Writes
+    # straight into the canvas subtitle state so the preview mirrors it;
+    # a canvas Edit drag overwrites the same state afterwards.
+    subtitle_pos = st.pills(
+        " စာတန်းထိုး နေရာ",
+        options=["အောက်ခြေ", "အလယ်"],
+        default="အောက်ခြေ",
+        key="subtitle_pos",
+    )
+    subtitle_margin = st.slider(
+        " အောက်ခြေ အကွာအဝေး (%)", 5, 25, 12, 1,
+        key="subtitle_margin",
+        disabled=(subtitle_pos != "အောက်ခြေ"),
+    )
+    _sub_y = 0.5 if subtitle_pos == "အလယ်" else (1.0 - subtitle_margin / 100.0)
+    # Only push the pill value into the canvas state when the pills
+    # themselves changed — a canvas Edit drag writes the same state and
+    # must not be overwritten on the next rerun.
+    _pos_key = (subtitle_pos, subtitle_margin)
+    if st.session_state.get("_subtitle_pos_applied") != _pos_key:
+        st.session_state["_subtitle_pos_applied"] = _pos_key
+        _cs = dict(st.session_state.get("canvas_sub")
+                   or dict(CANVAS_DEFAULT["subtitle"]))
+        _cs["y_pct"] = _sub_y
+        st.session_state["canvas_sub"] = _cs
+    # v1.13: words per caption (DeepRecap-style). The ≤2-line invariant
+    # is enforced by the renderer regardless of this value.
+    words_per_caption = st.slider(
+        " စာတန်း တစ်ကွက်မှာ စာလုံး အများဆုံး", 2, 12, 6, 1,
+        key="words_per_caption",
+    )
+    st.caption(
+        "စာတန်းတစ်ကွက်ကို အများဆုံး ၂ ကြောင်းထက် မပိုစေပါ။"
     )
     _sub_info = st.session_state.get("canvas_sub") or dict(
         CANVAS_DEFAULT["subtitle"]
@@ -1979,6 +2229,28 @@ with tab_adv:
         )
         st.session_state["forget_just_clicked"] = False
 
+    # ---- Feature pack v1.13: output filename + Post Kit options ----
+    st.markdown("### Output")
+    st.text_input(
+        "ဖိုင်နာမည် (ဗလာထားရင် recap)",
+        key="output_filename",
+    )
+    st.caption("MP4 / SRT download တွေမှာ ဒီနာမည်ကို သုံးမယ်။")
+    st.markdown("### Post Kit")
+    st.text_input(
+        "ကိုယ်ပိုင် hashtags (space ခြား၊ # မပါလည်း ရပါတယ်)",
+        key="postkit_hashtags",
+    )
+    st.checkbox(
+        "အဆုံးမှာ #fyp ထည့်မယ်",
+        value=True,
+        key="postkit_fyp",
+    )
+    st.caption(
+        "Run ပြီးတိုင်း Gemini က Burmese caption + hashtags နဲ့ "
+        "3:4 thumbnail ထုတ်ပေးမယ်။"
+    )
+
 # A locally-picked video waits on the phone until Run is clicked
 # (deferred upload) — say so, so the user knows nothing has been
 # sent yet. Hidden once a result exists / a run is pending / active.
@@ -2066,8 +2338,32 @@ if run_btn and not _run_blocked:
         # Defaults are Step 13: Pyidaungsu + Yellow.
         "font_family": str(st.session_state.get("subtitle_font", "Pyidaungsu")),
         "color": str(st.session_state.get("subtitle_color", "Yellow")),
+        # v1.13: words per caption (DeepRecap-style chunking). The
+        # renderer keeps the ≤2-line invariant regardless.
+        "words_per_caption": int(
+            st.session_state.get("words_per_caption", 6)),
     }
     _blur_boxes = st.session_state.get("canvas_blur") or None
+
+    # v1.13: logo upload — persist the PNG into the run dir so the
+    # worker (thread) can use it after this rerun ends.
+    _logo_snap = None
+    _logo_up = st.session_state.get("logo_upload")
+    if _logo_up is not None:
+        try:
+            _logo_path = os.path.join(_run_dir, "logo_upload.png")
+            with open(_logo_path, "wb") as _lf:
+                _lf.write(_logo_up.getvalue())
+            _logo_snap = {
+                "upload_path": _logo_path,
+                "position": str(
+                    st.session_state.get("logo_pos", "top-right")),
+                "scale": float(st.session_state.get("logo_scale", 12)),
+                "opacity": float(
+                    st.session_state.get("logo_opacity", 85)) / 100.0,
+            }
+        except OSError:
+            _logo_snap = None
 
     # Hybrid: a URL video cannot be uploaded to Gemini from the
     # browser (it is not a local file) — fall back to Server mode for
@@ -2075,9 +2371,48 @@ if run_btn and not _run_blocked:
     _render_location = str(
         st.session_state.get("render_location", "hybrid"))
     st.session_state["hybrid_fell_back"] = False
-    if _render_location == "hybrid" and src_url:
-        _render_location = "server"
-        st.session_state["hybrid_fell_back"] = True
+    # v1.13: Hybrid + URL — the server downloads via yt-dlp and uploads
+    # to Gemini server-side; the browser fetches the file ONCE (one-shot
+    # data URL) and the Hybrid flow continues as a local file. Fail fast
+    # with a clear message if the download or upload fails — never
+    # silently. (The old behavior fell back to Server mode.)
+    st.session_state["url_hybrid_path"] = None
+    if _render_location == "hybrid" and src_url and not demo_active:
+        try:
+            with st.spinner("URL ကနေ ဗီဒီယို ဒေါင်းလုဒ်လုပ်နေသည်…"):
+                from video_processor import (
+                    download_video_from_url as _uh_dl,
+                    get_video_metadata as _uh_gvm)
+                _uh_path = _uh_dl(src_url, _run_dir)
+            _uh_meta = _uh_gvm(_uh_path)
+            with st.spinner("Gemini ကို ဗီဒီယို တင်နေသည်…"):
+                from google import genai as _uh_genai
+                _uh_client = _uh_genai.Client(api_key=key)
+                _uh_up = _uh_client.files.upload(file=_uh_path)
+                _uh_name = _uh_up.name
+                for _ in range(72):
+                    _uh_f = _uh_client.files.get(name=_uh_name)
+                    _uh_state = str(
+                        getattr(getattr(_uh_f, "state", None),
+                                "name", "") or "").upper()
+                    if _uh_state and _uh_state != "PROCESSING":
+                        break
+                    time.sleep(5)
+            st.session_state["gemini_file"] = {
+                "file_name": _uh_name,
+                "duration": float(_uh_meta.get("duration") or 0),
+                "width": int(_uh_meta.get("width") or 0),
+                "height": int(_uh_meta.get("height") or 0),
+            }
+            # Stash (not gemini_file directly): the "new Run invalidates
+            # previous state" block below clears gemini_file; it is
+            # restored after that block.
+            st.session_state["_url_hybrid_gemini"] = st.session_state.pop(
+                "gemini_file")
+            st.session_state["url_hybrid_path"] = _uh_path
+        except Exception as _uh_exc:  # noqa: BLE001 - fail fast, loudly
+            st.error(f"✕ URL ဗီဒီယို ရယူမရပါ: {_uh_exc}")
+            st.stop()
     # Demo Hybrid: the demo sample is on the server — its metadata
     # comes from ffprobe here (no Gemini upload, mock plan).
     _demo_dur = None
@@ -2134,11 +2469,31 @@ if run_btn and not _run_blocked:
             st.session_state.get("random_crop_offset", False)),
         "bg_volume": float(bg_volume),
         "voice_pitch_hz": int(pitch_hz),
+        "voice_speed_pct": int(st.session_state.get("voice_speed_pct", 0)),
         "burn_subtitles": bool(burn_subtitles),
         "tts_proxy": tts_proxy,
         "model": _parse_model(model_choice),
         "blur_boxes": _blur_boxes,
         "subtitle_config": _subtitle_config,
+        # v1.13 feature pack.
+        "render_quality": str(
+            st.session_state.get("render_quality", "fast")),
+        "output_fps": int(st.session_state.get("output_fps", 30)),
+        "output_filename": str(
+            st.session_state.get("output_filename", "") or ""),
+        "watermark": (
+            {"text": (st.session_state.get("watermark_text") or "").strip(),
+             "position": str(
+                 st.session_state.get("watermark_pos", "bottom-right")),
+             "opacity": float(
+                 st.session_state.get("watermark_opacity", 50)) / 100.0}
+            if (st.session_state.get("watermark_text") or "").strip()
+            else None
+        ),
+        "logo": _logo_snap,
+        "postkit_hashtags": str(
+            st.session_state.get("postkit_hashtags", "") or ""),
+        "postkit_fyp": bool(st.session_state.get("postkit_fyp", True)),
         "run_dir": _run_dir,
         # src_path is resolved at worker start (the upload may land
         # in a later rerun than the click).
@@ -2169,6 +2524,11 @@ if run_btn and not _run_blocked:
     st.session_state["gemini_upload_stage"] = None
     # A fresh Run supersedes any previous Gemini-upload ack.
     st.session_state["gemini_ack"] = None
+    # v1.13 URL-hybrid: restore the server-side Gemini upload info
+    # (cleared above with the previous run's state).
+    if st.session_state.get("_url_hybrid_gemini"):
+        st.session_state["gemini_file"] = st.session_state.pop(
+            "_url_hybrid_gemini")
     # Remember this Run in the browser: if the session dies mid-run,
     # a fresh session re-attaches to the job's status file instead of
     # going silently idle. The load nonce bump forces a fresh read.
@@ -2295,6 +2655,78 @@ _render_run_progress()
 if st.session_state.get("run_error"):
     st.error(f"✕ အမှား: {st.session_state['run_error']}")
 
+# ---- Feature pack v1.13: Post Kit + Library rendering ----
+def _render_postkit(postkit, thumbnail_path=None, key_prefix="pk"):
+    """Render the Post Kit (caption + hashtags + 3:4 thumbnail)."""
+    _pk = postkit or {}
+    _caption = str(_pk.get("caption") or "").strip()
+    _tags = [str(_t) for _t in (_pk.get("hashtags") or []) if str(_t).strip()]
+    if not _caption and not _tags and not thumbnail_path:
+        return
+    st.markdown("### Post Kit")
+    if _caption:
+        st.text_area("Caption (copy ယူနိုင်သည်)",
+                     value=_caption, height=80,
+                     key=f"{key_prefix}_caption")
+    if _tags:
+        st.code(" ".join(_tags), language=None)
+    if thumbnail_path and os.path.isfile(str(thumbnail_path)):
+        st.image(str(thumbnail_path), caption="Thumbnail 3:4 (1080×1440)")
+        with open(str(thumbnail_path), "rb") as _tf:
+            st.download_button(
+                " Thumbnail Download (.png)",
+                data=_tf.read(),
+                file_name="thumbnail.png",
+                mime="image/png",
+                key=f"{key_prefix}_thumb_dl",
+            )
+
+
+def _render_library():
+    """In-session library of completed runs (v1.13)."""
+    _lib = st.session_state.get("recap_library") or []
+    _lib = [_e for _e in _lib
+            if _e.get("video_path")
+            and os.path.isfile(str(_e["video_path"]))]
+    if not _lib:
+        return
+    st.markdown("### Library")
+    st.caption(
+        "ဒီ session မှာပဲ သိမ်းထားသည် — စာမျက်နှာ ပိတ်ရင် / "
+        "server restart ဖြစ်ရင် ပျောက်မယ်။"
+    )
+    for _i, _e in enumerate(_lib):
+        _mode = ("AI Recap" if str(_e.get("processing_mode"))
+                 .startswith("ai") else "Pro")
+        _dur = _e.get("duration")
+        _dur_s = (f"{float(_dur):.0f}s" if _dur else "—")
+        with st.expander(
+                f"{_e.get('title') or 'Recap'} | {_mode} | {_dur_s}",
+                expanded=False):
+            st.caption(f"Mode: {_mode} | Duration: {_dur_s}")
+            _base = os.path.splitext(
+                str(_e.get("output_name") or "recap.mp4"))[0]
+            with open(str(_e["video_path"]), "rb") as _vf:
+                st.download_button(
+                    " MP4 Download",
+                    data=_vf.read(),
+                    file_name=f"{_base}.mp4",
+                    mime="video/mp4",
+                    key=f"lib_mp4_{_i}",
+                )
+            if _e.get("srt_path") and os.path.isfile(str(_e["srt_path"])):
+                with open(str(_e["srt_path"]), "rb") as _sf:
+                    st.download_button(
+                        " SRT Download",
+                        data=_sf.read(),
+                        file_name=f"{_base}.srt",
+                        mime="text/plain",
+                        key=f"lib_srt_{_i}",
+                    )
+            _render_postkit(_e.get("postkit"), _e.get("thumbnail_path"),
+                            key_prefix=f"libpk_{_i}")
+
+
 # Render the last successful result on EVERY run — not only the run in
 # which Run was clicked — so a download click or any other rerun does
 # not wipe the output (the previous bug: the result lived only in a
@@ -2310,11 +2742,13 @@ if _saved and os.path.isfile(_saved.get("video_path", "")):
         height=200,
         disabled=True,
     )
+    _dl_base = os.path.splitext(
+        str(_saved.get("output_name") or "recap.mp4"))[0]
     with open(_saved["video_path"], "rb") as f:
         st.download_button(
             " Recap ဗီဒီယို Download (.mp4)",
             data=f.read(),
-            file_name="recap.mp4",
+            file_name=f"{_dl_base}.mp4",
             mime="video/mp4",
         )
     if os.path.isfile(_saved.get("srt_path", "")):
@@ -2322,9 +2756,11 @@ if _saved and os.path.isfile(_saved.get("video_path", "")):
             st.download_button(
                 " မြန်မာစာတန်းထိုး Download (.srt)",
                 data=f.read(),
-                file_name="subtitles.srt",
+                file_name=f"{_dl_base}.srt",
                 mime="text/plain",
             )
+    _render_postkit(_saved.get("postkit"), _saved.get("thumbnail_path"),
+                    key_prefix="result")
 elif _saved:
     # Output files are gone (session temp cleaned): ask for a fresh run.
     st.info("ထုတ်လုပ်ထားတဲ့ ဗီဒီယိုဖိုင် သက်တမ်းကုန်သွားပါပြီ။ Run ကို ထပ်နှိပ်ပေးပါ။")
@@ -2361,12 +2797,27 @@ if _hybrid_result:
         disabled=True,
     )
     st.info("ဗီဒီယိုက Canvas ထဲမှာ ရှိနေသည် — အဲဒီမှာ ကြည့်ရှု / Download လုပ်နိုင်သည်။")
+    # v1.13: Post Kit from the pack (caption + hashtags; the 3:4
+    # thumbnail is captured device-side from the result video).
+    try:
+        _hpp = os.path.join(
+            str(st.session_state.get("hybrid_pack_dir") or ""),
+            "pack.json")
+        _hp = {}
+        if os.path.isfile(_hpp):
+            with open(_hpp, encoding="utf-8") as _hpf:
+                _hp = json.load(_hpf)
+        _render_postkit((_hp or {}).get("postkit"), None,
+                        key_prefix="hybrid")
+    except (OSError, ValueError):
+        pass
 
-# A Hybrid Run that fell back to Server (URL video) says so once.
-if st.session_state.get("hybrid_fell_back"):
-    st.caption(
-        "URL ဗီဒီယို: Hybrid က ဖုန်းထဲက file အတွက်သာ — "
-        "ဒီ Run ကို Server ပုံစံနဲ့ လုပ်ခဲ့သည်။")
+# v1.13: in-session library (server renders; Hybrid entries live in
+# the Canvas result bar — browser blobs stay on the device).
+_render_library()
+
+# (v1.13: URL videos now stay Hybrid — the server downloads them, so
+# the old Server-fallback caption is gone.)
 
 # A canvas action asked for a refresh. Do it now — after the Run
 # handler has had its chance — so a Run click that arrived in the same

@@ -32,6 +32,7 @@ from ai_analyzer import (
     delete_gemini_file,
     generate_mock_pro_plan,
     generate_mock_recap_plan,
+    generate_post_kit,
     validate_pro_blocks,
     validate_recap_plan,
 )
@@ -41,15 +42,21 @@ from tts_manager import (
     measure_audio_duration,
 )
 from video_editor import (
+    QUALITY_PRESETS,
     SUBTITLE_COLOR_RGB,
+    _audio_is_silent,
     _offset_srt_timestamps,
+    _resolve_aspect_target,
     _subtitle_font_file,
     build_hybrid_filter_graph,
     build_pro_srt,
     fit_audio_to_duration,
+    make_thumbnail,
     mix_pro_block_audio,
+    prepare_overlay_images,
     render_pro_recap_video,
     render_recap_video,
+    sanitize_filename,
 )
 
 
@@ -266,6 +273,13 @@ def _build_hybrid_pack(
     voiceover_path: str,
     srt_path: Optional[str],
     extra: Optional[Dict] = None,
+    # Feature pack v1.13.
+    quality: str = "fast",
+    fps: int = 30,
+    output_name: str = "recap.mp4",
+    watermark: Optional[Dict] = None,
+    logo: Optional[Dict] = None,
+    postkit: Optional[Dict] = None,
 ) -> Dict:
     """Build the Hybrid pack: everything the device encode needs.
 
@@ -290,6 +304,45 @@ def _build_hybrid_pack(
     _sub_enabled = bool(burn_subtitles) and ("-->" in _srt_text)
 
     _cfg = dict(subtitle_config or {})
+    # v1.13: overlay input indices. The browser adds -i args in pack
+    # order (subtitle concat, watermark PNG, logo PNG); the graph is
+    # built with the same indices. Output dims are resolved first so
+    # the overlay PNGs can be rendered at the right size.
+    _out_w, _out_h = _resolve_aspect_target(
+        aspect_ratio,
+        {"width": int(src_w or 0), "height": int(src_h or 0)})
+    _prepared_ovl = prepare_overlay_images(watermark, logo, _out_w,
+                                           _out_h, run_dir)
+    _ovl_inputs: List[Dict] = []
+    _idx = 2
+    _sub_idx = _idx
+    if _sub_enabled:
+        _ovl_inputs.append({"kind": "subtitle", "idx": _idx})
+        _idx += 1
+    _wm_spec = None
+    _wm_prep = _prepared_ovl.get("watermark")
+    if _wm_prep:
+        with open(_wm_prep["png_path"], "rb") as _f:
+            _wm_b64 = base64.b64encode(_f.read()).decode()
+        _wm_spec = {"input_idx": _idx, "x": int(_wm_prep["x"]),
+                    "y": int(_wm_prep["y"])}
+        _ovl_inputs.append({"kind": "watermark", "idx": _idx,
+                            "png_b64": _wm_b64,
+                            "x": int(_wm_prep["x"]),
+                            "y": int(_wm_prep["y"])})
+        _idx += 1
+    _lg_spec = None
+    _lg_prep = _prepared_ovl.get("logo")
+    if _lg_prep:
+        with open(_lg_prep["png_path"], "rb") as _f:
+            _lg_b64 = base64.b64encode(_f.read()).decode()
+        _lg_spec = {"input_idx": _idx, "x": int(_lg_prep["x"]),
+                    "y": int(_lg_prep["y"])}
+        _ovl_inputs.append({"kind": "logo", "idx": _idx,
+                            "png_b64": _lg_b64,
+                            "x": int(_lg_prep["x"]),
+                            "y": int(_lg_prep["y"])})
+        _idx += 1
     _graphs = build_hybrid_filter_graph(
         src_w=int(src_w or 0), src_h=int(src_h or 0),
         aspect_ratio=aspect_ratio, fit_mode=fit_mode,
@@ -299,7 +352,9 @@ def _build_hybrid_pack(
         copyright_zoom=copyright_zoom,
         random_crop_offset=random_crop_offset,
         blur_boxes=blur_boxes, subtitle_enabled=_sub_enabled,
-        bg_volume=bg_volume)
+        bg_volume=bg_volume, subtitle_input_idx=_sub_idx,
+        watermark=_wm_spec, logo=_lg_spec,
+        loudnorm=not _audio_is_silent(str(voiceover_path)))
     _out_w, _out_h = _graphs["out_w"], _graphs["out_h"]
 
     # Subtitle geometry — same normalization as the server's
@@ -330,9 +385,18 @@ def _build_hybrid_pack(
     except (OSError, ValueError):
         _font_b64 = None
 
+    _q = QUALITY_PRESETS.get(str(quality or "fast").lower(),
+                            QUALITY_PRESETS["fast"])
     _pack = {
         "pack_id": os.path.basename(str(run_dir)),
-        "pack_version": 1,
+        "pack_version": 2,
+        "quality": {"name": str(quality or "fast"),
+                    "preset": str(_q["preset"]),
+                    "crf": _q["crf"]},
+        "fps": int(fps or 30),
+        "output_name": str(output_name or "recap.mp4"),
+        "overlay_inputs": _ovl_inputs,
+        "postkit": postkit,
         "processing_mode": processing_mode,
         "title": title,
         "script_text": script_text,
@@ -364,6 +428,7 @@ def _build_hybrid_pack(
             "color_rgb": [_rgb[0], _rgb[1], _rgb[2]],
             "font_b64": _font_b64,
             "font_bold": _font_bold,
+            "words_per_caption": _cfg.get("words_per_caption"),
         },
         "filter_graph": {
             "with_audio": _graphs["with_audio"],
@@ -381,6 +446,49 @@ def _build_hybrid_pack(
         json.dump(_pack, _f)
     _clean_pack_dir(run_dir)
     return _pack
+
+
+def _postkit_for_run(title, script_text, user_api_key, model,
+                     use_mock_plan, extra_hashtags, append_fyp):
+    """Post Kit caption + hashtags (feature pack v1.13).
+
+    Best-effort: returns None on any failure (mock/demo mode, no key,
+    API error) — the Post Kit is a bonus and never fails the run.
+    """
+    try:
+        if use_mock_plan:
+            return None
+        return generate_post_kit(
+            title, script_text, user_api_key, model=model,
+            extra_hashtags=extra_hashtags, append_fyp=append_fyp)
+    except Exception:  # noqa: BLE001 - Post Kit is best-effort
+        return None
+
+
+def _enrich_server_result(result, work_dir, user_api_key, model,
+                          use_mock_plan, extra_hashtags, append_fyp):
+    """Add Post Kit + thumbnail to a server-mode result (best-effort).
+
+    Never raises — both are bonuses on top of the finished render.
+    """
+    try:
+        result["postkit"] = _postkit_for_run(
+            result.get("title"), result.get("script_text"),
+            user_api_key, model, use_mock_plan,
+            extra_hashtags, append_fyp)
+    except Exception:  # noqa: BLE001 - best-effort
+        result["postkit"] = None
+    try:
+        _vp = result.get("final_video_path")
+        if _vp and os.path.isfile(str(_vp)):
+            _tp = os.path.join(work_dir, "thumbnail.png")
+            make_thumbnail(str(_vp), str(result.get("title") or ""), _tp)
+            result["thumbnail_path"] = _tp
+        else:
+            result["thumbnail_path"] = None
+    except Exception:  # noqa: BLE001 - best-effort
+        result["thumbnail_path"] = None
+    return result
 
 
 def run_full_recap_pipeline(
@@ -436,6 +544,16 @@ def run_full_recap_pipeline(
     video_duration: Optional[float] = None,
     src_width: Optional[int] = None,
     src_height: Optional[int] = None,
+    # Feature pack v1.13: render quality (fast/normal/high), output
+    # fps, burned overlays, Post Kit options. watermark =
+    # {"text","position","opacity"}; logo =
+    # {"upload_path","position","scale","opacity"}.
+    quality: str = "fast",
+    fps: int = 30,
+    watermark: Optional[Dict] = None,
+    logo: Optional[Dict] = None,
+    postkit_extra_hashtags: str = "",
+    postkit_append_fyp: bool = True,
 ) -> Dict:
     """Run the full recap pipeline end to end.
 
@@ -701,6 +819,9 @@ def run_full_recap_pipeline(
         # rebuild the SRT on the original timeline, build the pack.
         if hybrid_pack:
             _report("pack", 0.0, "Hybrid pack ထုတ်နေသည်…")
+            _postkit = _postkit_for_run(
+                title, script_text, user_api_key, model, use_mock_plan,
+                postkit_extra_hashtags, postkit_append_fyp)
             _mixed = mix_pro_block_audio(
                 blocks, work_dir,
                 os.path.join(work_dir, "voiceover_mixed.mp3"))
@@ -728,6 +849,8 @@ def run_full_recap_pipeline(
                 voiceover_path=_mixed, srt_path=_pro_srt_path,
                 extra={"pro_fill_status": _pro_fill_status,
                        "pitch": pitch},
+                quality=quality, fps=fps, output_name=output_name,
+                watermark=watermark, logo=logo, postkit=_postkit,
             )
             _report("pack", 1.0, "Hybrid pack အဆင်သင့်")
             if gemini_file_name:
@@ -773,6 +896,8 @@ def run_full_recap_pipeline(
             srt_path=os.path.join(output_dir, "subtitles.srt"),
             on_progress=lambda f: _report(
                 "render", f, "ဗီဒီယို ပေါင်းနေသည်…"),
+            quality=quality, fps=fps,
+            watermark=watermark, logo=logo,
         )
         _report("render", 1.0, "ဗီဒီယို ပေါင်းတာ ပြီးပါပြီ")
         final_srt = render.get("srt_path")
@@ -802,6 +927,9 @@ def run_full_recap_pipeline(
             "copyright_applied": render.get("copyright_applied"),
             "fit_mode": render.get("fit_mode"),
         }
+        result = _enrich_server_result(
+            result, work_dir, user_api_key, model, use_mock_plan,
+            postkit_extra_hashtags, postkit_append_fyp)
     else:
         # AI Recap = Narration Master, FULL duration. The narration
         # covers the whole video; the video keeps its ORIGINAL timing
@@ -986,6 +1114,9 @@ def run_full_recap_pipeline(
         # after ALL analysis calls for this run.
         if hybrid_pack:
             _report("pack", 0.0, "Hybrid pack ထုတ်နေသည်…")
+            _postkit = _postkit_for_run(
+                title, script_text, user_api_key, model, use_mock_plan,
+                postkit_extra_hashtags, postkit_append_fyp)
             _pack = _build_hybrid_pack(
                 run_dir=work_dir, processing_mode="ai_recap",
                 title=title, script_text=script_text,
@@ -1015,6 +1146,8 @@ def run_full_recap_pipeline(
                     "continuation_log": _cont_log,
                     "continuation_error": _cont_error,
                 },
+                quality=quality, fps=fps, output_name=output_name,
+                watermark=watermark, logo=logo, postkit=_postkit,
             )
             _report("pack", 1.0, "Hybrid pack အဆင်သင့်")
             if gemini_file_name:
@@ -1067,6 +1200,8 @@ def run_full_recap_pipeline(
             random_crop_offset=random_crop_offset,
             on_progress=lambda f: _report(
                 "render", f, "ဗီဒီယို ပေါင်းနေသည်…"),
+            quality=quality, fps=fps,
+            watermark=watermark, logo=logo,
         )
         _report("render", 1.0, "ဗီဒီယို ပေါင်းတာ ပြီးပါပြီ")
         final_srt = render.get("sidecar_srt") or fitted_srt
@@ -1104,6 +1239,9 @@ def run_full_recap_pipeline(
             "continuation_log": _cont_log,
             "continuation_error": _cont_error,
         }
+        result = _enrich_server_result(
+            result, work_dir, user_api_key, model, use_mock_plan,
+            postkit_extra_hashtags, postkit_append_fyp)
 
     # 6) cleanup temp fragments (keep final video + srt + voiceover)
     for name in ("segments",):
