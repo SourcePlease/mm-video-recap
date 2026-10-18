@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 
 import streamlit as st
 from streamlit_js_eval import streamlit_js_eval
@@ -31,7 +32,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-18 feature-pack v1.3"
+BUILD_VERSION = "2026-10-18 feature-pack v1.4"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -421,8 +422,24 @@ LS_JOB = "mmr_job_id"
 
 if "gemini_keys" not in st.session_state:
     st.session_state["gemini_keys"] = []
+if "gemini_key_uids" not in st.session_state:
+    # Stable per-row ids, parallel to gemini_keys: widget keys use the
+    # uid (not the positional index) so add/remove never shuffles
+    # typed text between rows.
+    st.session_state["gemini_key_uids"] = []
 if "gemini_key_slots" not in st.session_state:
     st.session_state["gemini_key_slots"] = 1
+if "keys_bootstrapped" not in st.session_state:
+    # True once the key rows were adopted from the browser (or the user
+    # saved/added/removed). After bootstrap, session_state is the
+    # authority — the browser read never overwrites it again. This is
+    # what stops "+ Key" from being clobbered and a removed key from
+    # resurrecting via the stale cached read.
+    st.session_state["keys_bootstrapped"] = False
+if "_key_save_pending" not in st.session_state:
+    # Browser write queued by the Remove on_click callback; the tab
+    # body flushes it (callbacks cannot emit elements themselves).
+    st.session_state["_key_save_pending"] = None
 if "groq_api_key" not in st.session_state:
     st.session_state["groq_api_key"] = ""
 if "quota_warn" not in st.session_state:
@@ -433,6 +450,10 @@ if "forget_pending" not in st.session_state:
     st.session_state["forget_pending"] = False
 if "forgotten_key" not in st.session_state:
     st.session_state["forgotten_key"] = ""
+if "forgotten_keys" not in st.session_state:
+    # Every Gemini key the user removed this session: never resurrect
+    # one for runs, even if a stale browser read still lists it.
+    st.session_state["forgotten_keys"] = []
 if "groq_forgotten_key" not in st.session_state:
     st.session_state["groq_forgotten_key"] = ""
 if "key_load_nonce" not in st.session_state:
@@ -532,24 +553,93 @@ browser_saved_keys = _parse_saved_keys(browser_saved_keys_raw)
 # Migrate the legacy single key once.
 if not browser_saved_keys and browser_saved_legacy:
     _legacy = browser_saved_legacy.strip()
-    if _legacy and _legacy != st.session_state.get("forgotten_key"):
+    if _legacy and _legacy not in (st.session_state.get("forgotten_keys") or []):
         browser_saved_keys = [_legacy]
 
-# Restore on EVERY run while the key boxes are empty (not just once per
-# session): a server session reset must not force the user to re-enter
-# keys. A typed-but-unverified key in a box is never overwritten.
-# After Forget, block restore until the browser confirms removal so a
-# just-deleted key can't come back.
-if (
-    browser_saved_keys
-    and not any(st.session_state.get(f"api_key_box_{i}")
-                for i in range(5))
-    and not st.session_state.get("forget_pending")
-):
-    st.session_state["gemini_keys"] = list(browser_saved_keys)
-    st.session_state["gemini_key_slots"] = max(
-        1, min(5, len(browser_saved_keys)))
-    st.session_state["key_restored"] = True
+
+def _new_key_uid():
+    """A stable, unique id for one key-list row (widget keys use the
+    uid, never the positional index, so add/remove can't shuffle
+    typed text between rows)."""
+    return uuid.uuid4().hex[:8]
+
+
+def _add_key_row():
+    """on_click for "+ Key": bumps the row count. Runs BEFORE the
+    script body, so the new row renders in the same run (an inline
+    handler after the rows would need another rerun to show it)."""
+    _slots = max(1, min(5, int(st.session_state.get("gemini_key_slots") or 1)))
+    st.session_state["gemini_key_slots"] = min(5, _slots + 1)
+
+
+def _remove_key_row(uid):
+    """on_click for a row's Remove: deletes the row from session state
+    BEFORE the script body, so the row disappears in the same run.
+    Queues the browser write via _key_save_pending — a callback cannot
+    emit the js-eval iframe itself, and the tab body flushes it below
+    with no st.rerun() after (st.rerun() would discard the iframe and
+    the key would resurrect from the stale cached read)."""
+    _keys = list(st.session_state.get("gemini_keys") or [])
+    _uids = list(st.session_state.get("gemini_key_uids") or [])
+    try:
+        _idx = _uids.index(uid)
+    except ValueError:
+        return  # stale double-click; nothing to do
+    _removed = (_keys[_idx] or "").strip() if _idx < len(_keys) else ""
+    _new_keys = [k for j, k in enumerate(_keys) if j != _idx]
+    _new_uids = [u for j, u in enumerate(_uids) if j != _idx]
+    if _removed:
+        _fg = list(st.session_state.get("forgotten_keys") or [])
+        if _removed not in _fg:
+            _fg.append(_removed)
+        st.session_state["forgotten_keys"] = _fg
+    # Never leave zero rows: keep one empty Key 1 row.
+    if not _new_keys:
+        _new_keys = [""]
+        _new_uids = [_new_key_uid()]
+    st.session_state["gemini_keys"] = _new_keys
+    st.session_state["gemini_key_uids"] = _new_uids
+    st.session_state["gemini_key_slots"] = max(1, len(_new_keys))
+    # Drop only the removed row's widget state: stable uids keep the
+    # other rows' typed text intact.
+    _box_key = f"api_key_box_{uid}"
+    if _box_key in st.session_state:
+        del st.session_state[_box_key]
+    st.session_state["_key_save_pending"] = [k for k in _new_keys if k]
+
+
+# Bootstrap the key rows from the browser ONCE per session. After
+# bootstrap (or after the user saves a key), session_state is the
+# authority and the browser read never overwrites it again.
+#
+# The old "restore on EVERY run" caused both live bugs:
+#  (1) "+ Key" taps were clobbered — slots were recomputed from the
+#      saved list on the rerun, wiping the +1 before it rendered;
+#  (2) removed keys resurrected — the Remove handler's st.rerun()
+#      discarded the localStorage.setItem iframe, so the write never
+#      executed and the next run's stale cached read re-populated
+#      the list (green pill and all).
+# A server session reset wipes session_state, so the bootstrap simply
+# runs again — the user never has to re-enter keys.
+if not st.session_state.get("keys_bootstrapped"):
+    _adopt = [k for k in (browser_saved_keys or [])
+              if k not in (st.session_state.get("forgotten_keys") or [])]
+    _typed_now = any(
+        st.session_state.get(f"api_key_box_{_u}")
+        for _u in (st.session_state.get("gemini_key_uids") or [])
+    )
+    # A typed-but-unverified key in a box is never overwritten.
+    if _adopt and not _typed_now:
+        _n = max(1, min(5, len(_adopt)))
+        st.session_state["gemini_keys"] = list(_adopt[:5])
+        st.session_state["gemini_key_uids"] = [
+            _new_key_uid() for _ in range(_n)]
+        # Never shrink the row count on adopt: keep extra empty rows
+        # the user added before the read resolved.
+        st.session_state["gemini_key_slots"] = max(
+            _n, int(st.session_state.get("gemini_key_slots") or 1))
+        st.session_state["key_restored"] = True
+        st.session_state["keys_bootstrapped"] = True
 
 if (
     browser_saved_groq
@@ -563,15 +653,19 @@ if (
 def _get_active_gemini_keys():
     """The run's Gemini key list (API Keys v2).
 
-    Session-state keys first, falling back to the browser-saved list
-    (e.g. after a session reset). A key the user just deleted (Forget)
-    is never used, even if a stale cached read still returns it.
+    Session-state keys first. Before the key UI bootstraps (very first
+    runs, browser read not yet resolved), fall back to the browser-saved
+    list. After bootstrap the session is authoritative: an empty session
+    means the user removed every key, and falling back here would
+    resurrect removed keys for runs. A key the user removed this
+    session is never used, even if a stale cached read still lists it.
     """
     _keys = [k for k in (st.session_state.get("gemini_keys") or [])
              if isinstance(k, str) and k.strip()]
-    if not _keys:
+    if not _keys and not st.session_state.get("keys_bootstrapped"):
+        _forgotten = set(st.session_state.get("forgotten_keys") or [])
         _saved = [k for k in (browser_saved_keys or [])
-                  if k != st.session_state.get("forgotten_key")]
+                  if k not in _forgotten]
         _keys = _saved
     # Dedupe, preserve order.
     _seen = set()
@@ -2291,23 +2385,39 @@ with tab_adv:
         # Persist the JSON key list (nonce-keyed so the eval re-runs).
         # Keys live ONLY in the user's browser localStorage — never on
         # our server, never in logs.
+        # NOTE: the list must go through JSON.stringify — embedding the
+        # raw json.dumps output would pass a JS *array* to setItem,
+        # which coerces it to "k1,k2" (and [] to ""), corrupting the
+        # stored value so the pill/restore logic can't parse it back.
         st.session_state["key_load_nonce"] += 1
         streamlit_js_eval(
             js_expressions=(
-                f"localStorage.setItem('{LS_KEYS}',{json.dumps(keys)})"),
+                f"localStorage.setItem('{LS_KEYS}',"
+                f"JSON.stringify({json.dumps(keys)}))"),
             key=f"mmr_keys_save_{st.session_state['key_load_nonce']}",
         )
 
     _slots = int(st.session_state.get("gemini_key_slots") or 1)
     _slots = max(1, min(5, _slots))
     _keys = list(st.session_state.get("gemini_keys") or [])
+    _uids = list(st.session_state.get("gemini_key_uids") or [])
+    # Stable per-row uids (parallel to _keys): widget keys use the uid,
+    # never the positional index, so add/remove can't shuffle typed
+    # text between rows.
+    while len(_uids) < _slots:
+        _uids.append(_new_key_uid())
+    _uids = _uids[:_slots]
     while len(_keys) < _slots:
         _keys.append("")
+    _keys = _keys[:_slots]
     st.session_state["gemini_keys"] = _keys
+    st.session_state["gemini_key_uids"] = _uids
+    st.session_state["gemini_key_slots"] = _slots
     _saved_keys = list(browser_saved_keys or [])
 
     for _i in range(_slots):
-        _box_key = f"api_key_box_{_i}"
+        _uid = _uids[_i]
+        _box_key = f"api_key_box_{_uid}"
         _is_saved = bool(
             _i < len(_keys) and _keys[_i]
             and _keys[_i] in _saved_keys
@@ -2326,9 +2436,10 @@ with tab_adv:
                 disabled=_is_saved,
             )
         with _kc2:
-            _test_btn = st.button("Test", key=f"key_test_{_i}")
+            _test_btn = st.button("Test", key=f"key_test_{_uid}")
         with _kc3:
-            _rm_btn = st.button("Remove", key=f"key_remove_{_i}")
+            st.button("Remove", key=f"key_remove_{_uid}",
+                      on_click=_remove_key_row, args=(_uid,))
         if _is_saved:
             _saved_note()
         if _test_btn:
@@ -2342,28 +2453,28 @@ with tab_adv:
                 _keys[_i] = _k
                 st.session_state["gemini_keys"] = _keys
                 st.session_state["forgotten_key"] = ""
+                _fg = [k for k in (st.session_state.get("forgotten_keys")
+                                   or []) if k != _k]
+                st.session_state["forgotten_keys"] = _fg
                 st.session_state["forget_pending"] = False
+                st.session_state["keys_bootstrapped"] = True
                 _save_gemini_keys_to_browser([k for k in _keys if k])
                 _saved_note()
             else:
                 st.error(_msg)
-        if _rm_btn:
-            _new_keys = [k for j, k in enumerate(_keys)
-                         if j != _i and k]
-            st.session_state["gemini_keys"] = _new_keys
-            st.session_state["gemini_key_slots"] = max(1, len(_new_keys))
-            st.session_state["key_load_nonce"] += 1
-            _save_gemini_keys_to_browser(_new_keys)
-            for _j in range(5):
-                _bk = f"api_key_box_{_j}"
-                if _bk in st.session_state:
-                    del st.session_state[_bk]
-            st.rerun()
+    # Flush a key-list save queued by the Remove on_click callback (a
+    # callback cannot emit the js-eval iframe itself). Emitting it here
+    # — in the same run, with no st.rerun() after — guarantees the
+    # localStorage write executes, so the removed key can't resurrect.
+    if st.session_state.get("_key_save_pending") is not None:
+        _save_gemini_keys_to_browser(st.session_state["_key_save_pending"])
+        st.session_state["_key_save_pending"] = None
 
     if _slots < 5:
-        if st.button("＋ Key ထည့်မယ်"):
-            st.session_state["gemini_key_slots"] = min(5, _slots + 1)
-            st.rerun()
+        # on_click runs BEFORE the script body, so the new row renders
+        # in the same run. (An inline handler after the rows would need
+        # another rerun to show it.)
+        st.button("＋ Key ထည့်မယ်", key="gemini_add_key", on_click=_add_key_row)
 
     st.caption(
         "Key တစ်ခုချင်းစီကို တခြား Google account တစ်ခုစီမှ ယူပါ — "
@@ -2409,7 +2520,7 @@ with tab_adv:
             streamlit_js_eval(
                 js_expressions=(
                     "localStorage.setItem("
-                    f"'{LS_GROQ_KEY}',{json.dumps(_gk)})"),
+                    f"'{LS_GROQ_KEY}',JSON.stringify({json.dumps(_gk)}))"),
                 key=f"mmr_groq_save_{st.session_state['key_load_nonce']}",
             )
             _saved_note()
