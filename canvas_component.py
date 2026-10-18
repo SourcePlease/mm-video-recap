@@ -1292,22 +1292,33 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
      the log has no Video stream). Throws when FFmpeg is unavailable
      (CDN) — the caller falls back / fails fast. */
   async function probeMetaViaFFmpeg(file) {
-    var ff = await loadFFmpeg();
-    var buf = new Uint8Array(await file.arrayBuffer());
-    await ff.writeFile("probe.mp4", buf);
-    S.hybridLogLines = [];
-    try { await ff.exec(["-i", "probe.mp4"]); } catch (e) {
-      /* No output file: expected for a probe-only run. */
-    }
-    var log = S.hybridLogLines.join("\n");
-    var dims = parseDimsFromFFmpegLog(log);
-    var dur = parseDurationFromFFmpegLog(log);
-    try { await ff.deleteFile("probe.mp4"); } catch (e) { /* gone */ }
-    return {
-      duration: dur,
-      width: dims ? dims.width : 0,
-      height: dims ? dims.height : 0,
-    };
+    /* v1.8: the whole probe is bounded — a wedged FFmpeg exec used
+       to hang the probe (and therefore the Run) forever. The
+       timeout error carries the (metadata) stage tag, so the
+       Run-time gate surfaces WHERE it stuck. */
+    return _withTimeout((async function () {
+      var ff = await loadFFmpeg();
+      var buf = new Uint8Array(await file.arrayBuffer());
+      await ff.writeFile("probe.mp4", buf);
+      S.hybridLogLines = [];
+      try { await ff.exec(["-i", "probe.mp4"]); } catch (e) {
+        /* No output file: expected for a probe-only run. */
+      }
+      var log = S.hybridLogLines.join("\n");
+      var dims = parseDimsFromFFmpegLog(log);
+      var dur = parseDurationFromFFmpegLog(log);
+      try { await ff.deleteFile("probe.mp4"); } catch (e) { /* gone */ }
+      return {
+        duration: dur,
+        width: dims ? dims.width : 0,
+        height: dims ? dims.height : 0,
+      };
+    })(), FFMPEG_PROBE_TIMEOUT_MS, function () {
+      return _hybridStageError("metadata",
+        "Metadata ကို FFmpeg နဲ့ စစ်နေစဉ် "
+        + (FFMPEG_PROBE_TIMEOUT_MS / 1000)
+        + "s ကြာ မပြီးပါ — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။");
+    });
   }
 
   /* Video metadata (duration / dims), probed ONCE at pick time and
@@ -1481,14 +1492,40 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
      (S.metaProbeError), so the user sees WHY instead of the generic
      metadata message. Fails fast BEFORE the Gemini upload. */
   async function getRunMeta() {
+    /* v1.8: the waits are BOUNDED. A pick-time probe still running
+       at Run time (e.g. wedged on a CDN fetch) used to be awaited
+       forever — the v1.7 live test hung 20 min at "Gemini upload
+       0%" here, upstream of the upload. A still-running probe past
+       RUN_META_WAIT_MS throws a stage-tagged (metadata) error
+       instead of hanging; a SETTLED-but-failed probe still gets
+       the one FULL retry below. */
     if (S.metaProbePromise) {
-      try { await S.metaProbePromise; } catch (e) { /* use cache */ }
+      try {
+        await _withTimeout(S.metaProbePromise, RUN_META_WAIT_MS,
+          function () {
+            return _hybridStageError("metadata",
+              "Metadata စစ်နေစဉ် " + (RUN_META_WAIT_MS / 1000)
+              + "s ကြာ မပြီးပါ — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။");
+          });
+      } catch (e) {
+        if (e && e.stageTag === "metadata") throw e;
+        /* use cache */
+      }
     }
     var meta = (S.cachedMetaFor === S.videoId) ? S.cachedMeta : null;
     if (!meta) {
       /* Pick-time probe failed — retry the FULL probe once. */
-      try { await probeMetaAtPick(S.videoId); }
-      catch (e) { /* use cache */ }
+      try {
+        await _withTimeout(probeMetaAtPick(S.videoId), RUN_META_WAIT_MS,
+          function () {
+            return _hybridStageError("metadata",
+              "Metadata စစ်နေစဉ် " + (RUN_META_WAIT_MS / 1000)
+              + "s ကြာ မပြီးပါ — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။");
+          });
+      } catch (e) {
+        if (e && e.stageTag === "metadata") throw e;
+        /* use cache */
+      }
       meta = (S.cachedMetaFor === S.videoId) ? S.cachedMeta : null;
     }
     if (!meta) {
@@ -1500,6 +1537,123 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
         + "(ဒါမှမဟုတ် တခြား video ရွေးပေးပါ)။");
     }
     return meta;
+  }
+
+  /* Hybrid pre-upload timeouts (v1.8): the v1.7 live test STILL hung
+     at "Gemini upload 0%" for ~20 min with NO stage-tagged error —
+     v1.7's timeouts cover ONLY uploadToGemini itself, and the hang
+     was UPSTREAM of the upload, in an un-timed await (loadFFmpeg's
+     CDN fetches / the probe) while the UI already showed "upload".
+     Now EVERY await in the Hybrid Run path up to and including the
+     upload is bounded, and the progress line shows the TRUE current
+     sub-stage (FFmpeg / metadata / upload) instead of "upload"
+     throughout — so a future hang is locatable from the UI alone. */
+  var FFMPEG_FETCH_TIMEOUT_MS = 60000;
+  var FFMPEG_IMPORT_TIMEOUT_MS = 60000;
+  var FFMPEG_LOAD_TIMEOUT_MS = 120000;
+  var FFMPEG_PROBE_TIMEOUT_MS = 120000;
+  var RUN_META_WAIT_MS = 180000;
+  var HYBRID_PREUPLOAD_OVERALL_MS = 900000;
+
+  /* Race a promise against a timer. The timer rejects with the
+     error from makeError() (built lazily, so it can name the
+     CURRENT stage). The underlying work keeps running in the
+     background, but the caller fails fast instead of hanging. */
+  function _withTimeout(promise, ms, makeError) {
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var to = setTimeout(function () {
+        if (!settled) {
+          settled = true;
+          reject(makeError());
+        }
+      }, ms);
+      promise.then(function (v) {
+        if (!settled) {
+          settled = true; clearTimeout(to); resolve(v);
+        }
+      }, function (e) {
+        if (!settled) {
+          settled = true; clearTimeout(to); reject(e);
+        }
+      });
+    });
+  }
+
+  /* Stage-tagged Hybrid pre-upload error: the tag (FFmpeg) /
+     (metadata) / (စတင်) / (bytes) tells WHERE the Run stuck. The
+     tag is appended to the message so it survives into the UI. */
+  function _hybridStageError(stageTag, msg) {
+    var err = new Error(msg + " (" + stageTag + ")");
+    err.stageTag = stageTag;
+    return err;
+  }
+
+  /* Overall watchdog for one Hybrid pre-upload Run: rejects after
+     ms with a stage-tagged error naming the stage the Run was in
+     when the watchdog fired (read live from stageRef). */
+  function _withStageTimeout(promise, ms, stageRef) {
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var to = setTimeout(function () {
+        if (!settled) {
+          settled = true;
+          var tag = stageRef.name === "ffmpeg" ? "FFmpeg"
+            : stageRef.name === "metadata" ? "metadata"
+            : stageRef.name === "upload" ? "bytes" : "စတင်";
+          var stageName = stageRef.name === "ffmpeg"
+            ? "FFmpeg ဖွင့်နေစဉ်"
+            : stageRef.name === "metadata" ? "Metadata စစ်နေစဉ်"
+            : stageRef.name === "upload" ? "Gemini တင်နေစဉ်"
+            : "စတင်နေစဉ်";
+          reject(_hybridStageError(tag,
+            "Hybrid Run က " + stageName + " " + (ms / 60000)
+            + " မိနစ်ကြာ ရပ်နေသည် — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။"));
+        }
+      }, ms);
+      promise.then(function (v) {
+        if (!settled) {
+          settled = true; clearTimeout(to); resolve(v);
+        }
+      }, function (e) {
+        if (!settled) {
+          settled = true; clearTimeout(to); reject(e);
+        }
+      });
+    });
+  }
+
+  /* Fetch a URL to a same-origin blob: URL, aborting after
+     timeoutMs. Replaces util.toBlobURL (which has NO timeout): a
+     stalled CDN fetch used to hang loadFFmpeg() forever. AbortError
+     becomes a stage-tagged (FFmpeg) timeout error; HTTP errors and
+     network failures become stage-tagged (FFmpeg) errors too. */
+  async function fetchBlobURL(url, mimeType, timeoutMs) {
+    var ctrl = new AbortController();
+    var timer = setTimeout(function () {
+      try { ctrl.abort(); } catch (e) { /* already settled */ }
+    }, timeoutMs);
+    try {
+      var res = await fetch(url, { signal: ctrl.signal });
+      if (!res.ok) {
+        throw _hybridStageError("FFmpeg",
+          "FFmpeg ကို ဒေါင်းလုဒ်လုပ်နေစဉ် HTTP " + res.status
+          + " — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။");
+      }
+      var blob = await res.blob();
+      return URL.createObjectURL(new Blob([blob], { type: mimeType }));
+    } catch (e) {
+      if (e && e.name === "AbortError") {
+        throw _hybridStageError("FFmpeg",
+          "FFmpeg ကို ဒေါင်းလုဒ်လုပ်နေစဉ် " + (timeoutMs / 1000)
+          + "s အတွင်း မတုံ့ပြန်ပါ — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။");
+      }
+      if (e && e.stageTag) throw e;
+      throw _hybridStageError("FFmpeg",
+        "FFmpeg ကို ဒေါင်းလုဒ်လုပ်နေစဉ် ကွန်ရက် အမှား — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။");
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /* Gemini upload timeouts (v1.7): the v1.6 live test froze at
@@ -1883,23 +2037,31 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
      FFmpeg derive a cross-origin worker.js, and
      `new Worker(crossOriginUrl)` is blocked by the browser
      ("Failed to construct 'Worker'..." — hit live on the user's
-     phone). The documented fix is toBlobURL (@ffmpeg/util): fetch
-     each file via CORS and hand FFmpeg a same-origin blob: URL for
-     core, wasm, worker AND the class worker (classWorkerURL:
+     phone). The fix is fetchBlobURL: fetch each file via CORS and
+     hand FFmpeg a same-origin blob: URL for core, wasm, worker AND
+     the class worker (classWorkerURL:
      `.../dist/esm/worker.js` — v1.3 blob-ified the first three but
      missed this one, so FFmpeg derived it from jsDelivr and the
      probe still threw; v1.5's reason-reporting finally surfaced
      it). After this fix the load call contains NO raw jsDelivr
-     URL at all. */
+     URL at all. v1.8: EVERY fetch / the module import / ff.load()
+     is bounded by a timeout with a stage-tagged (FFmpeg) error —
+     a stalled CDN fetch used to hang this load (and therefore the
+     Run) forever with no error. */
   async function loadFFmpeg() {
     if (S.ffmpeg) return S.ffmpeg;
     if (S.ffmpegLoading) return S.ffmpegLoading;
     S.ffmpegLoading = (async function () {
       try {
-        var mod = await import(
-          "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js");
-        var util = await import(
-          "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/esm/index.js");
+        var mod = await _withTimeout(
+          import(
+            "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js"),
+          FFMPEG_IMPORT_TIMEOUT_MS, function () {
+            return _hybridStageError("FFmpeg",
+              "FFmpeg module ကို ဒေါင်းလုဒ်လုပ်နေစဉ် "
+              + (FFMPEG_IMPORT_TIMEOUT_MS / 1000)
+              + "s အတွင်း မတုံ့ပြန်ပါ — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။");
+          });
         var ff = new mod.FFmpeg();
         ff.on("log", function (e) {
           S.hybridLogLines.push(e.message);
@@ -1917,19 +2079,27 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
         });
         var coreBase =
           "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm";
-        await ff.load({
-          coreURL: await util.toBlobURL(
-            coreBase + "/ffmpeg-core.js", "text/javascript"),
-          wasmURL: await util.toBlobURL(
-            coreBase + "/ffmpeg-core.wasm", "application/wasm"),
-          workerURL: await util.toBlobURL(
-            coreBase + "/ffmpeg-core.worker.js", "text/javascript"),
+        await _withTimeout(ff.load({
+          coreURL: await fetchBlobURL(
+            coreBase + "/ffmpeg-core.js", "text/javascript",
+            FFMPEG_FETCH_TIMEOUT_MS),
+          wasmURL: await fetchBlobURL(
+            coreBase + "/ffmpeg-core.wasm", "application/wasm",
+            FFMPEG_FETCH_TIMEOUT_MS),
+          workerURL: await fetchBlobURL(
+            coreBase + "/ffmpeg-core.worker.js", "text/javascript",
+            FFMPEG_FETCH_TIMEOUT_MS),
           /* v1.6: the FFmpeg CLASS worker (worker.js in the
              @ffmpeg/ffmpeg ESM package — NOT workerURL, which is
              the multithreading core worker). Without this FFmpeg
              derives it from the jsDelivr ESM location and
              `new Worker(jsDelivrUrl)` throws. */
-          classWorkerURL: await util.toBlobURL("https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/worker.js", "text/javascript"),
+          classWorkerURL: await fetchBlobURL("https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/worker.js", "text/javascript",
+            FFMPEG_FETCH_TIMEOUT_MS),
+        }), FFMPEG_LOAD_TIMEOUT_MS, function () {
+          return _hybridStageError("FFmpeg",
+            "FFmpeg ကို ဖွင့်နေစဉ် " + (FFMPEG_LOAD_TIMEOUT_MS / 1000)
+            + "s ကြာ မပြီးပါ — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။");
         });
         S.ffmpeg = ff;
         return ff;
@@ -2173,43 +2343,70 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       S.geminiResultPending = null;
       S.lastGeminiPct = -1;
       (async function () {
+        /* v1.8: stage tracking + overall watchdog. `stageRef` is
+           the single source of truth for (a) the progress text
+           Python shows (setStage sends it — the UI shows the TRUE
+           sub-stage: metadata / FFmpeg / upload, never "upload"
+           throughout) and (b) the overall watchdog error (which
+           names the stage the Run was in when it fired). The inner
+           IIFE RETURNS the upload result instead of sending it, so
+           a watchdog timeout can discard a late success instead of
+           reporting success after an error. `done` stops late
+           stage messages from the still-running inner work after
+           the error was already sent. */
+        var stageRef = { name: "starting" };
+        var done = false;
+        function setStage(name) {
+          if (done) return;
+          stageRef.name = name;
+          sendValue("gemini_upload_stage", { stage: name });
+        }
         try {
-          var f = await getSourceFile();
-          if (!f) {
-            throw new Error(
-              "ဗီဒီယို file ကို browser ထဲမှာ မတွေ့ပါ — ဗီဒီယို ပြန်ရွေးပေးပါ။");
-          }
-          /* v1.5: Run-time metadata gate (getRunMeta) — use the
-             SAME cached pick-time probe result; if the pick-time
-             probe failed, retry the FULL probe once, and surface
-             the recorded probe reason on final failure. */
-          var meta = await getRunMeta();
-          /* Fail fast BEFORE the Gemini upload if browser-side
-             FFmpeg cannot load (CDN / Worker): the device encode
-             would fail after the upload anyway. loadFFmpeg() is
-             cached, so the encode reuses this instance — no double
-             download. Never a raw browser exception: a friendly
-             message directing the user to Server mode. */
-          try {
-            await loadFFmpeg();
-          } catch (e) {
-            throw new Error(
-              "ဖုန်းထဲက FFmpeg ကို ဖွင့်မရပါ (CDN / browser) — "
-              + "Server ပုံစံနဲ့ စမ်းကြည့်ပေးပါ။");
-          }
-          var uploaded = await uploadToGemini(f, S.args.gemini_auth);
-          S.geminiResultPending = {
-            kind: "uploaded",
-            file_name: uploaded.name,
-            duration: meta.duration,
-            width: meta.width, height: meta.height,
-          };
+          var result = await _withStageTimeout((async function () {
+            setStage("metadata");
+            var f = await getSourceFile();
+            if (!f) {
+              throw new Error(
+                "ဗီဒီယို file ကို browser ထဲမှာ မတွေ့ပါ — ဗီဒီယို ပြန်ရွေးပေးပါ။");
+            }
+            /* v1.5: Run-time metadata gate (getRunMeta) — use the
+               SAME cached pick-time probe result; if the pick-time
+               probe failed, retry the FULL probe once, and surface
+               the recorded probe reason on final failure. */
+            var meta = await getRunMeta();
+            /* Fail fast BEFORE the Gemini upload if browser-side
+               FFmpeg cannot load (CDN / Worker): the device encode
+               would fail after the upload anyway. loadFFmpeg() is
+               cached, so the encode reuses this instance — no double
+               download. Never a raw browser exception: a friendly
+               message directing the user to Server mode, carrying
+               the (FFmpeg) stage tag + the underlying reason. */
+            setStage("ffmpeg");
+            try {
+              await loadFFmpeg();
+            } catch (e) {
+              throw new Error(
+                "ဖုန်းထဲက FFmpeg ကို ဖွင့်မရပါ (FFmpeg) — "
+                + String((e && e.message) || e)
+                + " — Server ပုံစံနဲ့ စမ်းကြည့်ပေးပါ။");
+            }
+            setStage("upload");
+            var uploaded = await uploadToGemini(f, S.args.gemini_auth);
+            return {
+              kind: "uploaded",
+              file_name: uploaded.name,
+              duration: meta.duration,
+              width: meta.width, height: meta.height,
+            };
+          })(), HYBRID_PREUPLOAD_OVERALL_MS, stageRef);
+          S.geminiResultPending = result;
           sendValue("gemini_uploaded", {
-            file_name: uploaded.name,
-            duration: meta.duration,
-            width: meta.width, height: meta.height,
+            file_name: result.file_name,
+            duration: result.duration,
+            width: result.width, height: result.height,
           });
         } catch (err) {
+          done = true;
           var _emsg = String((err && err.message) || err);
           S.geminiResultPending = { kind: "error", error: _emsg };
           sendValue("gemini_upload_error", { error: _emsg });

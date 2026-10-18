@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-18 hybrid v1.7"
+BUILD_VERSION = "2026-10-18 hybrid v1.8"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -998,15 +998,30 @@ def _render_run_progress() -> None:
     if job is None and pending is not None and pending.get("needs_gemini_upload"):
         # Hybrid: the browser uploads the video DIRECTLY to Gemini
         # (never to Streamlit) — show that upload's progress.
+        # v1.8: the canvas reports its TRUE sub-stage (metadata /
+        # FFmpeg / upload) — the old code showed "Gemini upload"
+        # from Run press on, so a hang in readiness/probe looked
+        # like an upload hang. The stage text makes a future hang
+        # locatable from the UI alone.
         _gup = st.session_state.get("gemini_upload") or {}
         try:
             _gpct = float(_gup.get("pct", 0.0))
         except (TypeError, ValueError):
             _gpct = 0.0
         elapsed = max(0.0, time.time() - float(pending.get("clicked_at", time.time())))
-        st.progress(min(1.0, _gpct / 100.0),
-                    text=f"Gemini ကို ဗီဒီယို တင်နေသည်… — {_gpct:.0f}% | {elapsed:.0f}s ကြာပြီး")
-        st.caption("ဗီဒီယိုကို Gemini ကို တိုက်ရိုက် တင်နေသည်… server ကို မတင်ပါ။")
+        _gstage = st.session_state.get("gemini_upload_stage") or "upload"
+        if _gstage == "ffmpeg":
+            st.progress(0.0,
+                        text=f"FFmpeg ဖွင့်နေသည်… — 0% | {elapsed:.0f}s ကြာပြီး")
+            st.caption("ဖုန်းထဲက FFmpeg ကို ဖွင့်နေသည်…")
+        elif _gstage == "metadata":
+            st.progress(0.0,
+                        text=f"Metadata စစ်နေသည်… — 0% | {elapsed:.0f}s ကြာပြီး")
+            st.caption("ဗီဒီယိုရဲ့ Metadata ကို စစ်နေသည်…")
+        else:
+            st.progress(min(1.0, _gpct / 100.0),
+                        text=f"Gemini ကို ဗီဒီယို တင်နေသည်… — {_gpct:.0f}% | {elapsed:.0f}s ကြာပြီး")
+            st.caption("ဗီဒီယိုကို Gemini ကို တိုက်ရိုက် တင်နေသည်… server ကို မတင်ပါ။")
         return
     if not job:
         # No in-memory job: re-attach to a job from a dead session, if
@@ -1412,7 +1427,8 @@ if isinstance(_val, dict):
         # server never sees the bytes. Record the file + metadata so
         # the starter can launch the Hybrid worker. Ack it (the
         # canvas re-sends until acked); re-processing the same file
-        # is idempotent.
+        # is idempotent. The pre-upload stage is done — clear it.
+        st.session_state["gemini_upload_stage"] = None
         _gf_name = _val.get("file_name")
         if _gf_name:
             st.session_state["gemini_ack"] = _gf_name
@@ -1435,6 +1451,13 @@ if isinstance(_val, dict):
                 "pct": float(_val.get("pct", 0.0))}
         except (TypeError, ValueError):
             pass
+    elif _action == "gemini_upload_stage":
+        # v1.8: the canvas reports its true pre-upload sub-stage
+        # (metadata / ffmpeg / upload) so the fragment shows honest
+        # progress instead of "Gemini upload" throughout.
+        _stage = str(_val.get("stage") or "")
+        if _stage in ("metadata", "ffmpeg", "upload"):
+            st.session_state["gemini_upload_stage"] = _stage
     elif _action == "gemini_upload_error":
         # Ack the error too (the canvas re-sends until acked).
         st.session_state["gemini_ack"] = "error"
@@ -1442,6 +1465,7 @@ if isinstance(_val, dict):
             _val.get("error") or "Gemini တင်မှု မအောင်မြင်ပါ")
         st.session_state["pending_job"] = None
         st.session_state["gemini_upload"] = None
+        st.session_state["gemini_upload_stage"] = None
     elif _action == "hybrid_pack_received":
         # The device got the pack — stop re-sending it.
         if _val.get("pack_id"):
@@ -2142,6 +2166,7 @@ if run_btn and not _run_blocked:
     st.session_state["hybrid_encode"] = None
     st.session_state["gemini_file"] = None
     st.session_state["gemini_upload"] = None
+    st.session_state["gemini_upload_stage"] = None
     # A fresh Run supersedes any previous Gemini-upload ack.
     st.session_state["gemini_ack"] = None
     # Remember this Run in the browser: if the session dies mid-run,
