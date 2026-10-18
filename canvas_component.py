@@ -1297,6 +1297,13 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
        timeout error carries the (metadata) stage tag, so the
        Run-time gate surfaces WHERE it stuck. */
     return _withTimeout((async function () {
+      /* v1.10: report the TRUE sub-stage — the probe loads FFmpeg
+         internally, so without this the UI stays on "Metadata"
+         while FFmpeg is opening (the v1.9 symptom: stage stuck
+         on Metadata for ~104s). Harmless at pick time: Python
+         only displays the stage during an active Hybrid Run,
+         and the Run handler sets "metadata" first. */
+      sendValue("gemini_upload_stage", { stage: "ffmpeg" });
       var ff = await loadFFmpeg();
       var buf = new Uint8Array(await file.arrayBuffer());
       await ff.writeFile("probe.mp4", buf);
@@ -1642,6 +1649,38 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       }
       var blob = await res.blob();
       return URL.createObjectURL(new Blob([blob], { type: mimeType }));
+    } catch (e) {
+      if (e && e.name === "AbortError") {
+        throw _hybridStageError("FFmpeg",
+          "FFmpeg ကို ဒေါင်းလုဒ်လုပ်နေစဉ် " + (timeoutMs / 1000)
+          + "s အတွင်း မတုံ့ပြန်ပါ — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။");
+      }
+      if (e && e.stageTag) throw e;
+      throw _hybridStageError("FFmpeg",
+        "FFmpeg ကို ဒေါင်းလုဒ်လုပ်နေစဉ် ကွန်ရက် အမှား — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။");
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /* Fetch a URL to TEXT, aborting after timeoutMs. Same timeout /
+     stage-tagged (FFmpeg) error pattern as fetchBlobURL — used by
+     the v1.10 class-worker bundler, which needs the SOURCE TEXT of
+     worker.js / const.js / errors.js (fetchBlobURL returns a blob
+     URL, not text). */
+  async function fetchText(url, timeoutMs) {
+    var ctrl = new AbortController();
+    var timer = setTimeout(function () {
+      try { ctrl.abort(); } catch (e) { /* already settled */ }
+    }, timeoutMs);
+    try {
+      var res = await fetch(url, { signal: ctrl.signal });
+      if (!res.ok) {
+        throw _hybridStageError("FFmpeg",
+          "FFmpeg ကို ဒေါင်းလုဒ်လုပ်နေစဉ် HTTP " + res.status
+          + " — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။");
+      }
+      return await res.text();
     } catch (e) {
       if (e && e.name === "AbortError") {
         throw _hybridStageError("FFmpeg",
@@ -2029,6 +2068,61 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       "sub_list.txt", new TextEncoder().encode(lines.join("\n") + "\n"));
   }
 
+  /* v1.10: inline-bundle the FFmpeg CLASS worker into ONE
+     self-contained blob with NO imports / exports.
+     ROOT CAUSE (v1.9 live test): ff.load() hung the full 120s
+     because @ffmpeg/ffmpeg@0.12.15/dist/esm/worker.js has
+     RELATIVE imports (`./const.js`, `./errors.js`). Blob-ified,
+     they resolve against `blob:...` and FAIL (and if the worker
+     is created as a classic worker, the bare `import` statements
+     are a syntax error outright) — so the worker never
+     initializes, never posts "ready", and ff.load() waits
+     forever. FIX: fetch worker.js + const.js + errors.js
+     (pinned 0.12.15), strip the two static import lines from
+     worker.js, prepend the DE-EXPORTED const.js + errors.js, and
+     create ONE blob. De-exporting is REQUIRED for a classic
+     worker (bare `export` would be a syntax error) and harmless
+     for a module worker — so the bundle works under BOTH worker
+     types. VERIFIED SAFE: const.js has no imports; errors.js has
+     no imports (its only "import" is the word inside the string
+     "failed to import ffmpeg-core.js"); the worker imports
+     exactly 5 names (CORE_URL, FFMessageType,
+     ERROR_UNKNOWN_MESSAGE_TYPE, ERROR_NOT_LOADED,
+     ERROR_IMPORT_FAILURE), all defined by the inlined files.
+     Guards: if a future upstream change adds another relative
+     import / export, the bundler throws a loud stage-tagged
+     error instead of producing a broken worker. */
+  async function buildClassWorkerURL() {
+    var base =
+      "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/";
+    var workerSrc = await fetchText(base + "worker.js",
+      FFMPEG_FETCH_TIMEOUT_MS);
+    var constSrc = await fetchText(base + "const.js",
+      FFMPEG_FETCH_TIMEOUT_MS);
+    var errorsSrc = await fetchText(base + "errors.js",
+      FFMPEG_FETCH_TIMEOUT_MS);
+    /* Strip ONLY the two KNOWN imports (const.js / errors.js) —
+       their names are defined by the inlined files below. Any
+       OTHER relative import is NOT stripped: the guard below
+       must see it and throw loudly, because its names would be
+       undefined in the bundle. */
+    var body = workerSrc.replace(
+      /^\s*import\s+.*\sfrom\s+["']\.\/(const|errors)\.js["'];?\s*$/gm, "");
+    var head = (constSrc + "\n" + errorsSrc).replace(
+      /^\s*export\s+(const|var|let|function|class)\s+/gm, "$1 ");
+    var bundle = head + "\n" + body;
+    if (/\bfrom\s+["']\.\//.test(bundle)) {
+      throw _hybridStageError("FFmpeg",
+        "FFmpeg class worker ကို ပေါင်းနေစဉ် relative import ကျန်နေသည် — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။");
+    }
+    if (/^\s*export\s/m.test(bundle)) {
+      throw _hybridStageError("FFmpeg",
+        "FFmpeg class worker ကို ပေါင်းနေစဉ် export ကျန်နေသည် — အင်တာနက် စစ်ပြီး Run ကို ထပ်နှိပ်ပေးပါ။");
+    }
+    return URL.createObjectURL(
+      new Blob([bundle], { type: "text/javascript" }));
+  }
+
   /* Load FFmpeg.wasm (single-threaded core — Streamlit Cloud cannot
      set COOP/COEP, so the multi-threaded core is not an option).
      CDN risk: ~30MB core per session; if the CDN is unreachable the
@@ -2038,13 +2132,17 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
      `new Worker(crossOriginUrl)` is blocked by the browser
      ("Failed to construct 'Worker'..." — hit live on the user's
      phone). The fix is fetchBlobURL: fetch each file via CORS and
-     hand FFmpeg a same-origin blob: URL for core, wasm, worker AND
-     the class worker (classWorkerURL:
-     `.../dist/esm/worker.js` — v1.3 blob-ified the first three but
-     missed this one, so FFmpeg derived it from jsDelivr and the
-     probe still threw; v1.5's reason-reporting finally surfaced
-     it). After this fix the load call contains NO raw jsDelivr
-     URL at all. v1.8: EVERY fetch / the module import / ff.load()
+     hand FFmpeg a same-origin blob: URL for core, wasm AND the
+     class worker (classWorkerURL — v1.3 blob-ified the first
+     three but missed this one, so FFmpeg derived it from
+     jsDelivr and the probe still threw; v1.5's reason-reporting
+     finally surfaced it). v1.10: the class worker is NOT a plain
+     blob-ified worker.js — worker.js has relative imports
+     (`./const.js`, `./errors.js`) that fail under `blob:...`,
+     so ff.load() hung 120s in the v1.9 live test; it is
+     inline-bundled by buildClassWorkerURL() instead. After
+     this fix the load call contains NO raw jsDelivr URL at
+     all. v1.8: EVERY fetch / the module import / ff.load()
      is bounded by a timeout with a stage-tagged (FFmpeg) error —
      a stalled CDN fetch used to hang this load (and therefore the
      Run) forever with no error. */
@@ -2099,9 +2197,15 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
           /* v1.6: the FFmpeg CLASS worker (worker.js in the
              @ffmpeg/ffmpeg ESM package). Without this FFmpeg
              derives it from the jsDelivr ESM location and
-             `new Worker(jsDelivrUrl)` throws. */
-          classWorkerURL: await fetchBlobURL("https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/worker.js", "text/javascript",
-            FFMPEG_FETCH_TIMEOUT_MS),
+             `new Worker(jsDelivrUrl)` throws. v1.10: the worker
+             is INLINE-BUNDLED (buildClassWorkerURL) — a raw
+             blob-ified worker.js CANNOT work, because worker.js
+             has relative imports (`./const.js`, `./errors.js`)
+             that resolve against `blob:...` and fail, so
+             ff.load() hung the full 120s in the v1.9 live test.
+             Do NOT "simplify" this back to a fetchBlobURL of
+             worker.js — that is the exact bug v1.10 fixed. */
+          classWorkerURL: await buildClassWorkerURL(),
         }), FFMPEG_LOAD_TIMEOUT_MS, function () {
           return _hybridStageError("FFmpeg",
             "FFmpeg ကို ဖွင့်နေစဉ် " + (FFMPEG_LOAD_TIMEOUT_MS / 1000)
