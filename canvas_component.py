@@ -2086,12 +2086,18 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
           wasmURL: await fetchBlobURL(
             coreBase + "/ffmpeg-core.wasm", "application/wasm",
             FFMPEG_FETCH_TIMEOUT_MS),
-          workerURL: await fetchBlobURL(
-            coreBase + "/ffmpeg-core.worker.js", "text/javascript",
-            FFMPEG_FETCH_TIMEOUT_MS),
+          /* v1.9: NO workerURL — the app uses SINGLE-THREADED core
+             (@ffmpeg/core), which ships ONLY ffmpeg-core.js +
+             ffmpeg-core.wasm and needs no worker URL (workerURL is
+             only for core-mt). The old code fetched
+             ffmpeg-core.worker.js, which does NOT exist in
+             @ffmpeg/core (it exists only in @ffmpeg/core-mt), so
+             every Hybrid Run died with HTTP 404 during the probe.
+             Do NOT "fix" this by switching to core-mt: core-mt
+             needs SharedArrayBuffer + COOP/COEP headers, which
+             Streamlit Cloud does not send. */
           /* v1.6: the FFmpeg CLASS worker (worker.js in the
-             @ffmpeg/ffmpeg ESM package — NOT workerURL, which is
-             the multithreading core worker). Without this FFmpeg
+             @ffmpeg/ffmpeg ESM package). Without this FFmpeg
              derives it from the jsDelivr ESM location and
              `new Worker(jsDelivrUrl)` throws. */
           classWorkerURL: await fetchBlobURL("https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/worker.js", "text/javascript",
