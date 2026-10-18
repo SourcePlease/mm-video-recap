@@ -32,7 +32,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-18 feature-pack v1.4"
+BUILD_VERSION = "2026-10-18 webcodecs v1"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -1670,6 +1670,8 @@ _val = interactive_canvas(
     # browser-side FFmpeg header probe to Hybrid mode only.
     render_location=str(
         st.session_state.get("render_location", "hybrid")),
+    # v1.14 (WebCodecs): prefer hardware encode on the device.
+    hw_encode=bool(st.session_state.get("hw_encode", True)),
     key="mmr_canvas",
 )
 if isinstance(_val, dict):
@@ -2087,6 +2089,17 @@ with tab_src:
     st.caption(
         "Fast = ultrafast (v1.12 အတိုင်း, file ကြီးမည်) | "
         "Normal = veryfast crf 23 | High = medium crf 20 (နှေးမည်)။"
+    )
+    # ---- v1.14 (WebCodecs): hardware encode toggle ----
+    st.checkbox(
+        "Hardware encode (မြန်)",
+        value=True,
+        key="hw_encode",
+        help="စက်ရဲ့ GPU နဲ့ မြန်မြန် encode လုပ်မယ် — မရရင် အလိုအလျောက် ပုံမှန်နည်းနဲ့ ပြောင်းမယ်။",
+    )
+    st.caption(
+        "ဖွင့်ထားရင်: canvas → စက်ရဲ့ GPU (VideoEncoder) → FFmpeg နဲ့ အသံပေါင်း "
+        "(~1-2x video အရှည်)။ ပိတ်ထားရင် / မရရင်: FFmpeg.wasm ပုံမှန်နည်း။"
     )
     st.markdown("### FPS")
     st.pills(

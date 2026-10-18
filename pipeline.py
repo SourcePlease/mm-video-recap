@@ -50,6 +50,7 @@ from video_editor import (
     _resolve_aspect_target,
     _subtitle_font_file,
     build_hybrid_filter_graph,
+    build_hybrid_mux_audio_filter,
     build_pro_srt,
     fit_audio_to_duration,
     make_thumbnail,
@@ -359,6 +360,7 @@ def _build_hybrid_pack(
                             "x": int(_lg_prep["x"]),
                             "y": int(_lg_prep["y"])})
         _idx += 1
+    _ln_flag = not _audio_is_silent(str(voiceover_path))
     _graphs = build_hybrid_filter_graph(
         src_w=int(src_w or 0), src_h=int(src_h or 0),
         aspect_ratio=aspect_ratio, fit_mode=fit_mode,
@@ -370,8 +372,13 @@ def _build_hybrid_pack(
         blur_boxes=blur_boxes, subtitle_enabled=_sub_enabled,
         bg_volume=bg_volume, subtitle_input_idx=_sub_idx,
         watermark=_wm_spec, logo=_lg_spec,
-        loudnorm=not _audio_is_silent(str(voiceover_path)))
+        loudnorm=_ln_flag)
     _out_w, _out_h = _graphs["out_w"], _graphs["out_h"]
+    # v1.14 (WebCodecs): audio-only filter for the fast mux step
+    # (hardware video + voiceover + source bg audio, -c:v copy).
+    _mux_audio = build_hybrid_mux_audio_filter(
+        src_audio_idx=2, voice_idx=1, bg_volume=bg_volume,
+        loudnorm=_ln_flag)
 
     # Subtitle geometry — same normalization as the server's
     # _subtitle_step (clamped fpct, pixel pos from fractions).
@@ -405,7 +412,7 @@ def _build_hybrid_pack(
                             QUALITY_PRESETS["fast"])
     _pack = {
         "pack_id": os.path.basename(str(run_dir)),
-        "pack_version": 2,
+        "pack_version": 3,
         "quality": {"name": str(quality or "fast"),
                     "preset": str(_q["preset"]),
                     "crf": _q["crf"]},
@@ -430,6 +437,11 @@ def _build_hybrid_pack(
         "crop_align": crop_align,
         "copyright_applied": _graphs["copyright_applied"],
         "blur_boxes": _graphs["blur_boxes"],
+        # v1.14 (WebCodecs): structured compositor geometry + the
+        # audio-only filter for the fast mux step. Older browsers
+        # (pack_version < 3) fall back to the wasm encode path.
+        "compositor": _graphs["compositor"],
+        "audio_filter": _mux_audio,
         "subtitle": {
             "enabled": _sub_enabled,
             "x_pct": _fx,

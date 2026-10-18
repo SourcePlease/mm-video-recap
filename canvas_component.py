@@ -452,6 +452,445 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
   <script>
+/* MmrMp4Muxer - vendored, zero-dependency fragmented-MP4 muxer for H.264.
+ *
+ * Purpose: WebCodecs hardware-encode path. Takes EncodedVideoChunk output
+ * (already Annex-B-free: length-prefixed NALUs, "avc1" style) and muxes a
+ * video-only fragmented MP4. Audio is muxed later by FFmpeg.wasm with -c:v copy.
+ *
+ * Plain <script> compatible (no modules, no optional chaining, ES2017).
+ * Exposes one global: MmrMp4Muxer = { createMuxer(opts) }.
+ *
+ * opts:
+ *   width: int, height: int
+ *   avcC: Uint8Array - the avcC record from VideoEncoder's decoderConfig.description
+ *   timescale: default 1000000 (timestamps below are in microseconds)
+ *   bitrate: optional int -> btrt box (bufferSizeDB/maxBitrate/avgBitrate)
+ *
+ * createMuxer returns { addChunk(chunk), finalize() -> Blob }.
+ * chunk MUST only use: chunk.byteLength (int), chunk.copyTo(dst),
+ *   chunk.timestamp (int, us), chunk.duration (int, us),
+ *   chunk.type ('key' | 'delta').
+ *
+ * Layout:
+ *   ftyp, moov (mvhd, trak(tkhd, mdia(mdhd, hdlr, minf(vmhd, dinf(dref/url ),
+ *   stbl(stsd/avc1(avcC, btrt), stts, stsc, stsz, stco), mvex(trex)))), then
+ *   fragments: moof(mfhd, traf(tfhd, trun)) + mdat. New fragment at each
+ *   keyframe; also forced when the current fragment exceeds 600 samples.
+ * Timestamps: arrival order = decode order. dts[0] = pts[0];
+ *   dts[i] = dts[i-1] + dur[i-1]; cto[i] = pts[i] - dts[i].
+ */
+var MmrMp4Muxer = (function () {
+  "use strict";
+
+  // ---------------------------------------------------------------- box writer
+  function BoxWriter() {
+    this.parts = [];
+    this.length = 0;
+  }
+  BoxWriter.prototype.writeBytes = function (arr) {
+    this.parts.push(arr);
+    this.length += arr.length;
+  };
+  BoxWriter.prototype.u8 = function (v) {
+    var a = new Uint8Array(1);
+    a[0] = v & 0xff;
+    this.writeBytes(a);
+  };
+  BoxWriter.prototype.u16 = function (v) {
+    var a = new Uint8Array(2);
+    a[0] = (v >>> 8) & 0xff;
+    a[1] = v & 0xff;
+    this.writeBytes(a);
+  };
+  BoxWriter.prototype.u32 = function (v) {
+    var a = new Uint8Array(4);
+    v = v >>> 0;
+    a[0] = (v >>> 24) & 0xff;
+    a[1] = (v >>> 16) & 0xff;
+    a[2] = (v >>> 8) & 0xff;
+    a[3] = v & 0xff;
+    this.writeBytes(a);
+  };
+  BoxWriter.prototype.i32 = function (v) {
+    this.u32(v | 0);
+  };
+  BoxWriter.prototype.u64 = function (v) {
+    // v is a JS number < 2^53; split into high/low 32 bits
+    var hi = Math.floor(v / 4294967296);
+    var lo = v - hi * 4294967296;
+    this.u32(hi);
+    this.u32(lo);
+  };
+  BoxWriter.prototype.ascii = function (s) {
+    var a = new Uint8Array(s.length);
+    for (var i = 0; i < s.length; i++) a[i] = s.charCodeAt(i) & 0xff;
+    this.writeBytes(a);
+  };
+  BoxWriter.prototype.result = function () {
+    var out = new Uint8Array(this.length);
+    var off = 0;
+    for (var i = 0; i < this.parts.length; i++) {
+      out.set(this.parts[i], off);
+      off += this.parts[i].length;
+    }
+    return out;
+  };
+  // Wrap the bytes already queued as a full box of the given fourcc.
+  function box(fourcc, payloadWriter) {
+    var w = new BoxWriter();
+    payloadWriter(w);
+    var payload = w.result();
+    var out = new BoxWriter();
+    out.u32(8 + payload.length);
+    out.ascii(fourcc);
+    out.writeBytes(payload);
+    return out.result();
+  }
+
+  // ---------------------------------------------------------------- utilities
+  function copyChunkBytes(chunk) {
+    var buf = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(buf);
+    return buf;
+  }
+
+  // ---------------------------------------------------------------- muxer
+  function createMuxer(opts) {
+    if (!opts) throw new Error("MmrMp4Muxer: opts is required");
+    var width = opts.width | 0;
+    var height = opts.height | 0;
+    var timescale = opts.timescale != null ? opts.timescale | 0 : 1000000;
+    var avcC = opts.avcC;
+    if (!avcC || avcC.length < 4) {
+      throw new Error("MmrMp4Muxer: opts.avcC (Uint8Array) is required");
+    }
+    if (width <= 0 || height <= 0) {
+      throw new Error("MmrMp4Muxer: width/height must be positive ints");
+    }
+    var bitrate = opts.bitrate != null ? opts.bitrate | 0 : 0;
+
+    var MAX_SAMPLES_PER_FRAG = 600;
+
+    var samples = []; // {data, pts, dur, isKey}
+    var fragments = []; // {samples: [...]}
+    var current = []; // samples accumulating for the open fragment
+    var totalBytes = 0;
+
+    function flushFragment() {
+      if (current.length > 0) {
+        fragments.push({ samples: current });
+        current = [];
+      }
+    }
+
+    function addChunk(chunk) {
+      var isKey = chunk.type === "key";
+      if (isKey) flushFragment(); // new fragment at every keyframe
+      else if (current.length >= MAX_SAMPLES_PER_FRAG) flushFragment();
+      current.push({
+        data: copyChunkBytes(chunk),
+        pts: chunk.timestamp | 0,
+        dur: chunk.duration | 0,
+        isKey: isKey,
+      });
+      totalBytes += chunk.byteLength;
+    }
+
+    function buildMoov() {
+      var durTicks = 0;
+      for (var i = 0; i < samples.length; i++) durTicks += samples[i].dur;
+
+      var mvhd = box("mvhd", function (w) {
+        w.u8(0); w.u8(0); w.u8(0); w.u8(0); // version 0, flags 0
+        w.u32(0); // creation_time
+        w.u32(0); // modification_time
+        w.u32(timescale);
+        w.u32(durTicks);
+        w.u32(0x00010000); // rate 1.0
+        w.u16(0x0100); // volume 1.0
+        w.u16(0); // reserved
+        w.u32(0); w.u32(0); // reserved
+        // unity matrix
+        w.u32(0x00010000); w.u32(0); w.u32(0);
+        w.u32(0); w.u32(0x00010000); w.u32(0);
+        w.u32(0); w.u32(0); w.u32(0x40000000);
+        for (var i = 0; i < 6; i++) w.u32(0); // pre_defined
+        w.u32(2); // next_track_ID
+      });
+
+      var tkhd = box("tkhd", function (w) {
+        w.u8(0); w.u8(0); w.u8(0); w.u8(3); // version 0, flags 3
+        w.u32(0); // creation_time
+        w.u32(0); // modification_time
+        w.u32(1); // track_ID
+        w.u32(0); // reserved
+        w.u32(durTicks); // duration
+        w.u32(0); w.u32(0); // reserved
+        w.u16(0); // layer
+        w.u16(0); // alternate_group
+        w.u16(0x0100); // volume
+        w.u16(0); // reserved
+        // unity matrix
+        w.u32(0x00010000); w.u32(0); w.u32(0);
+        w.u32(0); w.u32(0x00010000); w.u32(0);
+        w.u32(0); w.u32(0); w.u32(0x40000000);
+        w.u32(width * 65536); // width 16.16
+        w.u32(height * 65536); // height 16.16
+      });
+
+      var mdhd = box("mdhd", function (w) {
+        w.u8(0); w.u8(0); w.u8(0); w.u8(0); // version 0, flags 0
+        w.u32(0); // creation_time
+        w.u32(0); // modification_time
+        w.u32(timescale);
+        w.u32(durTicks);
+        // language 'und': 5-bit packed (u=21,n=14,d=4) => 0x55C4
+        w.u16(0x55c4);
+        w.u16(0); // pre_defined
+      });
+
+      var hdlr = box("hdlr", function (w) {
+        w.u8(0); w.u8(0); w.u8(0); w.u8(0); // version 0, flags 0
+        w.u32(0); // pre_defined
+        w.ascii("vide"); // handler_type
+        w.u32(0); w.u32(0); w.u32(0); // reserved
+        w.ascii("VideoHandler");
+        w.u8(0); // null terminator
+      });
+
+      var vmhd = box("vmhd", function (w) {
+        w.u8(0); w.u8(0); w.u8(0); w.u8(1); // version 0, flags 1
+        w.u16(0); // graphicsmode
+        w.u16(0); w.u16(0); w.u16(0); // opcolor
+      });
+
+      var dref = box("dref", function (w) {
+        w.u8(0); w.u8(0); w.u8(0); w.u8(0); // version 0, flags 0
+        w.u32(1); // entry_count
+        var url = box("url ", function (w2) {
+          w2.u8(0); w2.u8(0); w2.u8(0); w2.u8(1); // version 0, flags 1 (self-contained)
+        });
+        w.writeBytes(url);
+      });
+      var dinf = box("dinf", function (w) {
+        w.writeBytes(dref);
+      });
+
+      var avcCBox = box("avcC", function (w) {
+        w.writeBytes(avcC);
+      });
+      var btrt = box("btrt", function (w) {
+        w.u32(0); // bufferSizeDB
+        w.u32(bitrate); // maxBitrate
+        w.u32(bitrate); // avgBitrate
+      });
+      var avc1 = box("avc1", function (w) {
+        for (var i = 0; i < 6; i++) w.u8(0); // reserved
+        w.u16(1); // data_reference_index
+        w.u16(0); // pre_defined
+        w.u16(0); // reserved
+        for (var j = 0; j < 3; j++) w.u32(0); // 12 reserved
+        w.u16(width);
+        w.u16(height);
+        w.u32(0x00480000); // horizresolution 72 dpi
+        w.u32(0x00480000); // vertresolution 72 dpi
+        w.u32(0); // reserved
+        w.u16(1); // frame_count
+        for (var k = 0; k < 32; k++) w.u8(0); // compressorname
+        w.u16(0x0018); // depth
+        w.u16(0xffff); // pre_defined = -1
+        w.writeBytes(avcCBox);
+        w.writeBytes(btrt);
+      });
+
+      var stsd = box("stsd", function (w) {
+        w.u8(0); w.u8(0); w.u8(0); w.u8(0); // version 0, flags 0
+        w.u32(1); // entry_count
+        w.writeBytes(avc1);
+      });
+      var stts = box("stts", function (w) {
+        w.u8(0); w.u8(0); w.u8(0); w.u8(0);
+        w.u32(0); // entry_count
+      });
+      var stsc = box("stsc", function (w) {
+        w.u8(0); w.u8(0); w.u8(0); w.u8(0);
+        w.u32(0);
+      });
+      var stsz = box("stsz", function (w) {
+        w.u8(0); w.u8(0); w.u8(0); w.u8(0);
+        w.u32(0); // sample_size
+        w.u32(0); // sample_count
+      });
+      var stco = box("stco", function (w) {
+        w.u8(0); w.u8(0); w.u8(0); w.u8(0);
+        w.u32(0);
+      });
+      var stbl = box("stbl", function (w) {
+        w.writeBytes(stsd);
+        w.writeBytes(stts);
+        w.writeBytes(stsc);
+        w.writeBytes(stsz);
+        w.writeBytes(stco);
+      });
+      var minf = box("minf", function (w) {
+        w.writeBytes(vmhd);
+        w.writeBytes(dinf);
+        w.writeBytes(stbl);
+      });
+      var mdia = box("mdia", function (w) {
+        w.writeBytes(mdhd);
+        w.writeBytes(hdlr);
+        w.writeBytes(minf);
+      });
+      var trak = box("trak", function (w) {
+        w.writeBytes(tkhd);
+        w.writeBytes(mdia);
+      });
+      var trex = box("trex", function (w) {
+        w.u8(0); w.u8(0); w.u8(0); w.u8(0); // version 0, flags 0
+        w.u32(1); // track_ID
+        w.u32(1); // default_sample_description_index
+        w.u32(0); // default_sample_duration
+        w.u32(0); // default_sample_size
+        w.u32(0); // default_sample_flags
+      });
+      var mvex = box("mvex", function (w) {
+        w.writeBytes(trex);
+      });
+      return box("moov", function (w) {
+        w.writeBytes(mvhd);
+        w.writeBytes(trak);
+        w.writeBytes(mvex);
+      });
+    }
+
+    // Returns {moof: Uint8Array, mdat: Uint8Array} for one fragment.
+    // dtsArr/ctoArr are global per-sample arrays; start is the first sample
+    // index of this fragment.
+    function buildFragment(seqNum, fragSamples, dtsArr, ctoArr, start) {
+      var n = fragSamples.length;
+      var needCto = false;
+      for (var i = 0; i < n; i++) {
+        if (ctoArr[start + i] !== 0) { needCto = true; break; }
+      }
+      var version = needCto ? 1 : 0;
+
+      var mfhd = box("mfhd", function (w) {
+        w.u8(0); w.u8(0); w.u8(0); w.u8(0); // version 0, flags 0
+        w.u32(seqNum);
+      });
+      var tfhd = box("tfhd", function (w) {
+        w.u8(0); w.u8(0x02); w.u8(0); w.u8(0); // version 0, flags 0x020000
+        w.u32(1); // track_ID
+        // default-base-is-moof: base offset implied
+      });
+
+      // Build the trun payload first (without data_offset) to learn the
+      // moof size, then rebuild with the real offset.
+      function trunPayload(dataOffset) {
+        var w = new BoxWriter();
+        w.u8(version);
+        var flags = 0x000001 | 0x000100 | 0x000200 | 0x000400;
+        if (needCto) flags |= 0x000800;
+        w.u8((flags >>> 16) & 0xff);
+        w.u8((flags >>> 8) & 0xff);
+        w.u8(flags & 0xff);
+        w.u32(n); // sample_count
+        w.i32(dataOffset);
+        for (var i = 0; i < n; i++) {
+          var s = fragSamples[i];
+          w.u32(s.dur);
+          w.u32(s.data.length);
+          w.u32(s.isKey ? 0x02000000 : 0x01010000);
+          if (needCto) w.i32(ctoArr[start + i]);
+        }
+        return w.result();
+      }
+
+      var trunNoOffset = box("trun", function (w) {
+        w.writeBytes(trunPayload(0));
+      });
+      var trafInnerSize = tfhd.length + trunNoOffset.length;
+      // moof = header(8) + mfhd(full) + traf header(8) + tfhd(full) + trun(full)
+      var moofSize = 8 + mfhd.length + 8 + trafInnerSize;
+      var dataOffset = moofSize + 8; // + mdat header
+      var trun = box("trun", function (w) {
+        w.writeBytes(trunPayload(dataOffset));
+      });
+      var traf = box("traf", function (w) {
+        w.writeBytes(tfhd);
+        w.writeBytes(trun);
+      });
+      var moof = box("moof", function (w) {
+        w.writeBytes(mfhd);
+        w.writeBytes(traf);
+      });
+      // mdat
+      var mdatPayloadLen = 0;
+      for (var k = 0; k < n; k++) mdatPayloadLen += fragSamples[k].data.length;
+      var mdat = new Uint8Array(8 + mdatPayloadLen);
+      var dv = new DataView(mdat.buffer);
+      dv.setUint32(0, 8 + mdatPayloadLen);
+      mdat[4] = 0x6d; mdat[5] = 0x64; mdat[6] = 0x61; mdat[7] = 0x74; // 'mdat'
+      var pos = 8;
+      for (var m = 0; m < n; m++) {
+        mdat.set(fragSamples[m].data, pos);
+        pos += fragSamples[m].data.length;
+      }
+      return { moof: moof, mdat: mdat };
+    }
+
+    function finalize() {
+      flushFragment();
+      if (fragments.length === 0) {
+        throw new Error("MmrMp4Muxer: finalize() called with zero chunks - no output written");
+      }
+      // Flatten fragments into one global sample list; arrival order = decode order.
+      samples = [];
+      for (var f = 0; f < fragments.length; f++) {
+        var fs = fragments[f].samples;
+        for (var i = 0; i < fs.length; i++) samples.push(fs[i]);
+      }
+      // dts / cto from pts (microsecond timescale).
+      var n = samples.length;
+      var dtsArr = new Array(n);
+      var ctoArr = new Array(n);
+      for (var s = 0; s < n; s++) {
+        if (s === 0) dtsArr[s] = samples[s].pts;
+        else dtsArr[s] = dtsArr[s - 1] + samples[s - 1].dur;
+        ctoArr[s] = samples[s].pts - dtsArr[s];
+      }
+
+      var ftyp = box("ftyp", function (w) {
+        w.ascii("isom");
+        w.u32(512);
+        w.ascii("isom");
+        w.ascii("iso2");
+        w.ascii("avc1");
+        w.ascii("mp41");
+      });
+      var moov = buildMoov();
+
+      var parts = [ftyp, moov];
+      var start = 0;
+      for (var fi = 0; fi < fragments.length; fi++) {
+        var frag = buildFragment(fi + 1, fragments[fi].samples, dtsArr, ctoArr, start);
+        parts.push(frag.moof);
+        parts.push(frag.mdat);
+        start += fragments[fi].samples.length;
+      }
+      return new Blob(parts, { type: "video/mp4" });
+    }
+
+    return { addChunk: addChunk, finalize: finalize };
+  }
+
+  return { createMuxer: createMuxer };
+})();
+
+</script>
+<script>
 /* MM Recap — Interactive Main Canvas component (Step 11).
  * Vanilla JS custom Streamlit component (no build step). Talks to the
  * parent via the standard component postMessage protocol:
@@ -2543,8 +2982,468 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     }
   }
 
-  /* The device encode: source + voiceover + subtitle PNGs, ONE
-     ffmpeg run with the pack's filter graph (server parity). */
+  /* ---------------- WebCodecs hardware encode (v1.14) ----------------
+     Primary Hybrid path when the device supports it and the toggle is
+     on: canvas-2D compositor (every transform the ffmpeg graph does —
+     copyright zoom/mirror, aspect crop/pad + blur bg, blur boxes +
+     caption band, subtitles, watermark, logo) -> VideoEncoder (H.264,
+     prefer-hardware) -> vendored fMP4 muxer (MmrMp4Muxer) -> ONE fast
+     FFmpeg.wasm run that muxes audio with -c:v copy (no re-encode).
+     Fallback chain: VideoEncoder -> MediaRecorder (mp4/avc1) ->
+     FFmpeg.wasm ultrafast (encodeVideoWasm — kept intact, never
+     deleted). Server mode is untouched. If the hardware path fails
+     mid-encode it falls back automatically with a Burmese note — it
+     is NEVER ripped out (no rollback without the user's word). */
+
+  function hwWanted(pack) {
+    return S.args.hw_encode !== false && !!pack &&
+      (pack.pack_version || 0) >= 3 && !!pack.compositor;
+  }
+
+  /* Bitrate ladder (bits/sec at the 720x1280 reference, scaled by
+     pixels): Fast/Normal/High from the Quality selector. */
+  function hwBitrate(pack) {
+    var q = (pack.quality && pack.quality.name) || "fast";
+    var base = q === "high" ? 12000000 : q === "normal" ? 8000000 : 4000000;
+    var px = pack.video.out_w * pack.video.out_h;
+    return Math.max(1000000, Math.round(base * px / (720 * 1280)));
+  }
+
+  function hwProgress(pct, detail) {
+    var now = Date.now();
+    pct = Math.max(0, Math.min(100, Math.round(pct)));
+    if (pct !== S.lastEncodePct && now - S.lastEncodeSent > 2000) {
+      S.lastEncodePct = pct;
+      S.lastEncodeSent = now;
+      sendValue("hybrid_encode_progress",
+                { pct: pct, detail: detail || "" });
+    }
+  }
+
+  /* Precompute subtitle pieces (mirrors renderSubtitlePNGs' grouping,
+     but stores line arrays + frame-quantized windows instead of baking
+     PNGs). Sorted by f0; each piece: {f0, f1, lines}. */
+  function buildHWSubtitlePieces(pack, measure, outW) {
+    var sub = pack.subtitle || {};
+    var enabled = !!(sub.enabled && (pack.srt_text || "").indexOf("-->") >= 0);
+    if (!enabled) return [];
+    var cues = parseSRT(pack.srt_text || "");
+    var fps = pack.fps || 30;
+    var total = Math.max(1, Math.round((pack.video.duration || 0) * fps));
+    var maxWidth = sub.w_pct != null
+      ? Math.floor(Math.min(0.98, Math.max(0.20, sub.w_pct)) * outW)
+      : Math.floor(outW * 0.92);
+    var wpc = sub.words_per_caption;
+    var pieces = [];
+    for (var ci = 0; ci < cues.length; ci++) {
+      var cue = cues[ci];
+      var groups = [];
+      var chunks = splitChunks(cue.text, 30, wpc);
+      for (var k = 0; k < chunks.length; k++) {
+        groups = groups.concat(
+          splitChunkToPieces(chunks[k], measure, maxWidth, 2));
+      }
+      var dur = cue.end - cue.start, n = groups.length || 1;
+      for (var j = 0; j < n; j++) {
+        var f0 = Math.round((cue.start + dur * j / n) * fps);
+        var f1 = Math.round((cue.start + dur * (j + 1) / n) * fps);
+        if (f1 <= f0) f1 = f0 + 1;
+        if (f0 >= total || f1 <= 0) continue;
+        pieces.push({ f0: Math.max(0, f0), f1: Math.min(total, f1),
+                      lines: groups[j] || [cue.text] });
+      }
+    }
+    pieces.sort(function (a, b) { return a.f0 - b.f0; });
+    return pieces;
+  }
+
+  /* Build the compositor: offscreen canvases + precomputed subtitle
+     pieces + decoded overlay images. The source video element is
+     driven separately by driveCompositor. */
+  async function buildHWCompositor(pack, file) {
+    var comp = pack.compositor;
+    var outW = pack.video.out_w, outH = pack.video.out_h;
+    var fps = pack.fps || 30;
+    var duration = pack.video.duration || 0;
+    var totalFrames = Math.max(1, Math.round(duration * fps));
+    var sub = pack.subtitle || {};
+    function mkCanvas(w, h) {
+      var c = document.createElement("canvas");
+      c.width = Math.max(2, Math.round(w));
+      c.height = Math.max(2, Math.round(h));
+      return c;
+    }
+    var canvas = mkCanvas(outW, outH);
+    var base = mkCanvas(comp.base_w, comp.base_h);
+    var copy = mkCanvas(outW, outH);   // blur source (no self-draw)
+    var tmp = null;
+    if (comp.zoom_scaled_w && comp.zoom_scaled_h) {
+      tmp = mkCanvas(comp.zoom_scaled_w, comp.zoom_scaled_h);
+    }
+    /* Subtitle font — same stack/metrics as the PNG baker. */
+    var stack = await hybridFontStack(pack);
+    var measure = mkCanvas(8, 8).getContext("2d");
+    var weight = sub.font_bold ? "700 " : "";
+    var fontStr = weight + sub.font_size + "px " + stack;
+    measure.font = fontStr;
+    var pieces = buildHWSubtitlePieces(pack, measure, outW);
+    var mm = measure.measureText("Hg");
+    var asc = (mm && mm.fontBoundingBoxAscent) || sub.font_size * 0.8;
+    var desc = (mm && mm.fontBoundingBoxDescent) || sub.font_size * 0.25;
+    var rgb = sub.color_rgb || [255, 215, 0];
+    function loadOvl(kind) {
+      return new Promise(function (res) {
+        try {
+          var inputs = pack.overlay_inputs || [];
+          var found = null;
+          for (var i = 0; i < inputs.length; i++) {
+            if (inputs[i].kind === kind && inputs[i].png_b64) {
+              found = inputs[i]; break;
+            }
+          }
+          if (!found) { res(null); return; }
+          var img = new Image();
+          img.onload = function () {
+            res({ img: img, x: found.x || 0, y: found.y || 0 });
+          };
+          img.onerror = function () { res(null); };
+          img.src = "data:image/png;base64," + found.png_b64;
+        } catch (e) { res(null); }
+      });
+    }
+    var wm = await loadOvl("watermark");
+    var lg = await loadOvl("logo");
+    return {
+      comp: comp, pack: pack,
+      canvas: canvas, ctx: canvas.getContext("2d"),
+      base: base, baseCtx: base.getContext("2d"),
+      copy: copy, copyCtx: copy.getContext("2d"),
+      tmp: tmp, tmpCtx: tmp ? tmp.getContext("2d") : null,
+      outW: outW, outH: outH, fps: fps, totalFrames: totalFrames,
+      sub: sub, fontStr: fontStr, pieces: pieces, piecePtr: 0,
+      lineH: asc + desc + Math.max(4, Math.floor(sub.font_size / 10)),
+      strokeW: Math.max(2, Math.round(sub.font_size * 0.1)),
+      fill: "rgb(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + ")",
+      wm: wm, lg: lg,
+      boxes: pack.blur_boxes || [],
+      srcUrl: URL.createObjectURL(file),
+    };
+  }
+
+  /* Draw ONE output frame from the source video element v.
+     Replicates the ffmpeg chain order: copyright -> fit -> blur ->
+     subtitles -> watermark/logo. */
+  function drawHWFrame(C, v, frameIdx) {
+    var comp = C.comp, ctx = C.ctx, outW = C.outW, outH = C.outH;
+    var bw = comp.base_w, bh = comp.base_h;
+    var vw = v.videoWidth || bw, vh = v.videoHeight || bh;
+    var bctx = C.baseCtx;
+    /* 1) copyright: hflip first (when mirrored), then zoom scale +
+       crop back to the base size — same order as ffmpeg. */
+    bctx.save();
+    bctx.imageSmoothingEnabled = true;
+    bctx.imageSmoothingQuality = "high";
+    if (comp.zoom_scaled_w && comp.zoom_scaled_h) {
+      var tctx = C.tmpCtx, zw = comp.zoom_scaled_w, zh = comp.zoom_scaled_h;
+      tctx.save();
+      tctx.imageSmoothingEnabled = true;
+      tctx.imageSmoothingQuality = "high";
+      if (comp.mirror) { tctx.translate(zw, 0); tctx.scale(-1, 1); }
+      tctx.drawImage(v, 0, 0, vw, vh, 0, 0, zw, zh);
+      tctx.restore();
+      bctx.drawImage(C.tmp, comp.zoom_crop_x || 0, comp.zoom_crop_y || 0,
+                     bw, bh, 0, 0, bw, bh);
+    } else {
+      if (comp.mirror) { bctx.translate(bw, 0); bctx.scale(-1, 1); }
+      /* normalize odd source dims to the even base (ffmpeg does
+         scale=base_w:base_h first when they differ) */
+      bctx.drawImage(v, 0, 0, vw, vh, 0, 0, bw, bh);
+    }
+    bctx.restore();
+
+    /* 2) fit: crop or pad (+blur bg, like boxblur=20:2) */
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    var fit = comp.fit || { mode: "crop" };
+    if (fit.mode === "pad") {
+      var s = Math.max(outW / bw, outH / bh);
+      var dw = bw * s, dh = bh * s;
+      ctx.filter = "blur(25px)";
+      ctx.drawImage(C.base, (outW - dw) / 2, (outH - dh) / 2, dw, dh);
+      ctx.filter = "none";
+      ctx.drawImage(C.base, 0, 0, bw, bh,
+                    fit.fg_x, fit.fg_y, fit.fg_w, fit.fg_h);
+    } else if (fit.mode === "pad_black") {
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, outW, outH);
+      ctx.drawImage(C.base, 0, 0, bw, bh,
+                    fit.fg_x, fit.fg_y, fit.fg_w, fit.fg_h);
+    } else {
+      var sx = fit.src_x || 0, sy = fit.src_y || 0;
+      var sw = fit.src_w || bw, sh = fit.src_h || bh;
+      ctx.drawImage(C.base, sx, sy, sw, sh, 0, 0, outW, outH);
+    }
+    ctx.restore();
+
+    /* 3) blur boxes at output coords (includes the caption band) */
+    var boxes = C.boxes;
+    if (boxes && boxes.length) {
+      C.copyCtx.drawImage(C.canvas, 0, 0);
+      for (var bi = 0; bi < boxes.length; bi++) {
+        var b = boxes[bi];
+        if (!(b.w > 0 && b.h > 0)) continue;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(b.x, b.y, b.w, b.h);
+        ctx.clip();
+        ctx.filter = "blur(" + (b.radius || 16) + "px)";
+        ctx.drawImage(C.copy, b.x, b.y, b.w, b.h, b.x, b.y, b.w, b.h);
+        ctx.restore();
+      }
+      ctx.filter = "none";
+    }
+
+    /* 4) subtitles (under watermark/logo, like the ffmpeg order) */
+    drawHWSubtitles(C, frameIdx);
+
+    /* 5) watermark + logo (small PNGs at pack x/y) */
+    if (C.wm) ctx.drawImage(C.wm.img, C.wm.x, C.wm.y);
+    if (C.lg) ctx.drawImage(C.lg.img, C.lg.x, C.lg.y);
+  }
+
+  function drawHWSubtitles(C, frameIdx) {
+    var pieces = C.pieces;
+    if (!pieces.length) return;
+    var ptr = C.piecePtr;
+    while (ptr < pieces.length && pieces[ptr].f1 <= frameIdx) ptr++;
+    C.piecePtr = ptr;
+    var p = ptr < pieces.length ? pieces[ptr] : null;
+    if (!p || frameIdx < p.f0 || frameIdx >= p.f1) return;
+    var ctx = C.ctx, sub = C.sub;
+    ctx.save();
+    ctx.font = C.fontStr;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = C.strokeW;
+    ctx.strokeStyle = "#000";
+    ctx.fillStyle = C.fill;
+    for (var li = 0; li < p.lines.length; li++) {
+      var y = sub.pos_y - (p.lines.length - 1 - li) * C.lineH;
+      ctx.strokeText(p.lines[li], sub.pos_x, y);
+      ctx.fillText(p.lines[li], sub.pos_x, y);
+    }
+    ctx.restore();
+  }
+
+  /* Drive the compositor at 1x realtime from a DEDICATED video element
+     (never the preview element — no fights with pause state).
+     onFrame(frameIdx, v) is called once per output frame, in order.
+     Bounded: stall watchdog (no time advance 45s) + absolute cap, so
+     a stuck decode falls back instead of hanging forever. */
+  function driveCompositor(C, gen, onFrame) {
+    return new Promise(function (resolve, reject) {
+      var v = document.createElement("video");
+      v.muted = true;
+      v.playsInline = true;
+      v.preload = "auto";
+      v.src = C.srcUrl;
+      var fps = C.fps, total = C.totalFrames;
+      var last = -1, done = false, raf = 0;
+      var lastT = -1, lastAdvance = Date.now();
+      var startMs = Date.now();
+      var capMs = (C.pack.video.duration || 0) * 1000 * 3 + 120000;
+      function cleanup() {
+        try { cancelAnimationFrame(raf); } catch (e) {}
+        try { v.pause(); } catch (e) {}
+        try { v.removeAttribute("src"); v.load(); } catch (e) {}
+      }
+      function fail(e) {
+        if (done) return;
+        done = true; cleanup(); reject(e);
+      }
+      function finish() {
+        if (done) return;
+        try {
+          for (var f = last + 1; f < total; f++) onFrame(f, v);
+        } catch (e) { fail(e); return; }
+        done = true; cleanup(); resolve();
+      }
+      v.addEventListener("error", function () {
+        fail(new Error("encode video element error"));
+      });
+      v.addEventListener("ended", finish);
+      v.addEventListener("playing", function () {
+        lastAdvance = Date.now();
+      });
+      function tick() {
+        if (done) return;
+        if (gen !== S.hybridGen) { fail(new Error("aborted")); return; }
+        var now = Date.now();
+        if (now - startMs > capMs) { fail(new Error("encode timeout")); return; }
+        var t = v.currentTime || 0;
+        if (t > lastT + 1e-6) { lastT = t; lastAdvance = now; }
+        else if (now - lastAdvance > 45000 && !v.ended && !v.paused) {
+          fail(new Error("encode stall")); return;
+        }
+        var cur = Math.min(total - 1, Math.floor(t * fps + 1e-6));
+        try {
+          for (var f = last + 1; f <= cur; f++) onFrame(f, v);
+        } catch (e) { fail(e); return; }
+        last = Math.max(last, cur);
+        hwProgress(((last + 1) / total) * 100,
+                   "ဖုန်းမှာ ဗီဒီယို ပေါင်းနေသည်…");
+        raf = requestAnimationFrame(tick);
+      }
+      v.play().then(function () { raf = requestAnimationFrame(tick); },
+                    function (e) { fail(e || new Error("play failed")); });
+    });
+  }
+
+  /* VideoEncoder path (primary): hardware H.264 -> fMP4 muxer. */
+  async function encodeVideoHW_VE(pack, ff, gen, C) {
+    if (typeof VideoEncoder === "undefined") {
+      throw new Error("VideoEncoder မရပါ");
+    }
+    if (typeof VideoFrame === "undefined") {
+      throw new Error("VideoFrame မရပါ");
+    }
+    var cfg = {
+      codec: "avc1.640028",
+      width: C.outW, height: C.outH,
+      bitrate: hwBitrate(pack),
+      framerate: C.fps,
+      hardwareAcceleration: "prefer-hardware",
+    };
+    var sup = null;
+    try { sup = await VideoEncoder.isConfigSupported(cfg); }
+    catch (e) { sup = null; }
+    if (!sup || !sup.supported) {
+      throw new Error("ဒီစက်မှာ VideoEncoder (H.264) မရပါ");
+    }
+    var desc = sup.config && sup.config.decoderConfig &&
+               sup.config.decoderConfig.description;
+    if (!desc) throw new Error("VideoEncoder decoderConfig မရပါ");
+    if (typeof MmrMp4Muxer === "undefined") {
+      throw new Error("MP4 muxer မရပါ");
+    }
+    var muxer = MmrMp4Muxer.createMuxer({
+      width: C.outW, height: C.outH,
+      avcC: new Uint8Array(desc),
+      bitrate: hwBitrate(pack),
+    });
+    var encErr = null;
+    var enc = new VideoEncoder({
+      output: function (ch) {
+        try { muxer.addChunk(ch); } catch (e) { encErr = encErr || e; }
+      },
+      error: function (e) { encErr = encErr || e; },
+    });
+    var keyEvery = Math.max(1, Math.round(C.fps * 2));
+    try {
+      enc.configure(cfg);
+      await driveCompositor(C, gen, function (frameIdx, v) {
+        if (encErr) throw encErr;
+        drawHWFrame(C, v, frameIdx);
+        var ts = Math.round(frameIdx * 1000000 / C.fps);
+        var dur = Math.round(1000000 / C.fps);
+        var vf = new VideoFrame(C.canvas,
+                                { timestamp: ts, duration: dur });
+        try {
+          enc.encode(vf, { keyFrame: frameIdx % keyEvery === 0 });
+        } finally { vf.close(); }
+        if (encErr) throw encErr;
+      });
+      await enc.flush();
+    } finally {
+      try { enc.close(); } catch (e) {}
+    }
+    if (encErr) throw encErr;
+    var blob = muxer.finalize();
+    if (!blob.size) throw new Error("muxer output empty");
+    await ff.writeFile("hw_video.mp4",
+                       new Uint8Array(await blob.arrayBuffer()));
+  }
+
+  /* MediaRecorder path (fallback): canvas.captureStream -> mp4/avc1. */
+  async function encodeVideoHW_MR(pack, ff, gen, C) {
+    if (typeof MediaRecorder === "undefined") {
+      throw new Error("MediaRecorder မရပါ");
+    }
+    var mime = "video/mp4;codecs=avc1";
+    var okType = false;
+    try { okType = MediaRecorder.isTypeSupported(mime); }
+    catch (e) { okType = false; }
+    if (!okType) throw new Error("MediaRecorder mp4 မရပါ");
+    var stream = C.canvas.captureStream(C.fps);
+    var rec = new MediaRecorder(stream,
+      { mimeType: mime, videoBitsPerSecond: hwBitrate(pack) });
+    var parts = [];
+    var stopped = new Promise(function (res, rej) {
+      rec.ondataavailable = function (e) {
+        if (e.data && e.data.size) parts.push(e.data);
+      };
+      rec.onerror = function () { rej(new Error("MediaRecorder error")); };
+      rec.onstop = function () { res(); };
+    });
+    rec.start(1000);
+    try {
+      await driveCompositor(C, gen, function (frameIdx, v) {
+        drawHWFrame(C, v, frameIdx);
+      });
+    } finally {
+      try { rec.stop(); } catch (e) {}
+    }
+    await stopped;
+    try {
+      stream.getTracks().forEach(function (t) { t.stop(); });
+    } catch (e) {}
+    var blob = new Blob(parts, { type: "video/mp4" });
+    if (!blob.size) throw new Error("MediaRecorder output empty");
+    await ff.writeFile("hw_video.mp4",
+                       new Uint8Array(await blob.arrayBuffer()));
+  }
+
+  /* Fast audio mux: hardware video-only MP4 + voiceover + source bg
+     audio, -c:v copy (NO re-encode — this run takes seconds). */
+  async function muxHWAudo(ff, pack, gen, hasAudio) {
+    var af = pack.audio_filter || null;
+    if (!af) throw new Error("pack မှာ audio_filter မပါပါ");
+    var graph = hasAudio ? af.with_audio : af.no_audio;
+    if (gen !== S.hybridGen) return;
+    sendValue("hybrid_encode_progress",
+              { pct: 99, detail: "အသံ ပေါင်းနေသည်…" });
+    var args = ["-i", "hw_video.mp4", "-i", "voice.mp3", "-i", "input.mp4",
+      "-filter_complex", graph,
+      "-map", "0:v", "-c:v", "copy",
+      "-map", "[aout]", "-c:a", "aac", "-b:a", "128k",
+      "-movflags", "+faststart", "-shortest", "out.mp4"];
+    var code = await ff.exec(args);
+    if (code !== 0) {
+      throw new Error("အသံ ပေါင်းမရပါ (code " + code + ")");
+    }
+  }
+
+  /* Hardware attempt: VideoEncoder -> MediaRecorder. Throws if both
+     fail (the dispatcher falls back to the wasm path). */
+  async function encodeVideoHW(pack, ff, file, gen, hasAudio) {
+    var C = await buildHWCompositor(pack, file);
+    try {
+      try {
+        await encodeVideoHW_VE(pack, ff, gen, C);
+      } catch (eVE) {
+        await encodeVideoHW_MR(pack, ff, gen, C);
+      }
+      await muxHWAudo(ff, pack, gen, hasAudio);
+    } finally {
+      try { URL.revokeObjectURL(C.srcUrl); } catch (e) {}
+    }
+  }
+
+  /* The device encode (v1.14 dispatcher): prefer the hardware
+     path (WebCodecs -> fast audio mux); fall back automatically to
+     the FFmpeg.wasm ultrafast path with a Burmese note. */
   async function runHybridEncode(pack) {
     var gen = ++S.hybridGen;
     S.hybridEncoding = true;
@@ -2563,18 +3462,74 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       await ff.writeFile("input.mp4",
                          new Uint8Array(await file.arrayBuffer()));
       await ff.writeFile("voice.mp3", b64ToBytes(pack.voiceover_b64 || ""));
+      var hasAudio = await probeHasAudio(ff);
+      if (gen !== S.hybridGen) return;
+      /* v1.14: prefer hardware; on any failure fall back to the wasm
+         path automatically (never rip the wasm path out). */
+      var usedWasm = true;
+      if (hwWanted(pack)) {
+        try {
+          await encodeVideoHW(pack, ff, file, gen, hasAudio);
+          usedWasm = false;
+        } catch (eHW) {
+          sendValue("hybrid_encode_progress",
+                    { pct: 0,
+                      detail: "ဒီစက်မှာ hardware encode မရလို့ ပုံမှန်နည်းနဲ့ ပြောင်းလုပ်နေပါတယ်" });
+        }
+      }
+      if (usedWasm) {
+        pngNames = await encodeVideoWasm(pack, ff, file, gen, hasAudio);
+      }
+      if (gen !== S.hybridGen) return;
+      /* Shared finish: out.mp4 -> blob -> result URLs. */
+      var data = await ff.readFile("out.mp4");
+      var blob = new Blob([data], { type: "video/mp4" });
+      /* Free MEMFS: inputs + PNGs + list + intermediates + output (the
+         result lives as a blob URL now). */
+      var trash = ["input.mp4", "voice.mp3", "sub_list.txt",
+                   "sub_blank.png", "watermark.png", "logo.png",
+                   "hw_video.mp4", "out.mp4"].concat(pngNames);
+      for (var ti = 0; ti < trash.length; ti++) {
+        try { await ff.deleteFile(trash[ti]); } catch (e) { /* gone */ }
+      }
+      if (S.resultBlobUrl) {
+        try { URL.revokeObjectURL(S.resultBlobUrl); } catch (e) {}
+      }
+      if (S.resultSrtUrl) {
+        try { URL.revokeObjectURL(S.resultSrtUrl); } catch (e) {}
+      }
+      S.resultBlobUrl = URL.createObjectURL(blob);
+      S.resultSrtUrl = URL.createObjectURL(
+        new Blob([pack.srt_text || ""], { type: "text/plain" }));
+      video.src = S.resultBlobUrl;
+      video.load();
+      showResultBar(pack);
+      sendValue("hybrid_encode_done", {});
+    } catch (err) {
+      sendValue("hybrid_encode_error",
+                { error: String((err && err.message) || err) });
+    } finally {
+      S.hybridEncoding = false;
+    }
+  }
+
+  /* The device encode: source + voiceover + subtitle PNGs, ONE
+     ffmpeg run with the pack's filter graph (server parity). */
+  /* The FFmpeg.wasm ultrafast device encode (kept intact as the
+     final fallback of the v1.14 chain — never delete this path). */
+  async function encodeVideoWasm(pack, ff, file, gen, hasAudio) {
+    var pngNames = [];
+
       var hasSub = !!(pack.subtitle && pack.subtitle.enabled &&
                       pack.subtitle_input &&
                       (pack.srt_text || "").indexOf("-->") >= 0);
       if (hasSub) {
         var pieces = await renderSubtitlePNGs(ff, pack, pack.subtitle);
-        if (gen !== S.hybridGen) return;
+        if (gen !== S.hybridGen) return pngNames;
         pngNames = pieces.map(function (p) { return p.name; });
         await buildSubtitleConcat(ff, pieces, pack.video.out_w,
                                   pack.video.out_h);
       }
-      var hasAudio = await probeHasAudio(ff);
-      if (gen !== S.hybridGen) return;
       var graph = hasAudio
         ? pack.filter_graph.with_audio
         : pack.filter_graph.no_audio;
@@ -2616,35 +3571,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       if (code !== 0) {
         throw new Error("FFmpeg encode failed (code " + code + ")");
       }
-      var data = await ff.readFile("out.mp4");
-      var blob = new Blob([data], { type: "video/mp4" });
-      /* Free MEMFS: inputs + PNGs + list + output (the result lives
-         as a blob URL now). */
-      var trash = ["input.mp4", "voice.mp3", "sub_list.txt",
-                   "sub_blank.png", "watermark.png", "logo.png",
-                   "out.mp4"].concat(pngNames);
-      for (var ti = 0; ti < trash.length; ti++) {
-        try { await ff.deleteFile(trash[ti]); } catch (e) { /* gone */ }
-      }
-      if (S.resultBlobUrl) {
-        try { URL.revokeObjectURL(S.resultBlobUrl); } catch (e) {}
-      }
-      if (S.resultSrtUrl) {
-        try { URL.revokeObjectURL(S.resultSrtUrl); } catch (e) {}
-      }
-      S.resultBlobUrl = URL.createObjectURL(blob);
-      S.resultSrtUrl = URL.createObjectURL(
-        new Blob([pack.srt_text || ""], { type: "text/plain" }));
-      video.src = S.resultBlobUrl;
-      video.load();
-      showResultBar(pack);
-      sendValue("hybrid_encode_done", {});
-    } catch (err) {
-      sendValue("hybrid_encode_error",
-                { error: String((err && err.message) || err) });
-    } finally {
-      S.hybridEncoding = false;
-    }
+      return pngNames;
   }
 
   /* ---------------- render (from Streamlit) ---------------- */
@@ -3130,6 +4057,11 @@ def interactive_canvas(
     # browser-side FFmpeg header probe to Hybrid mode only — Server
     # mode must never load browser FFmpeg at pick time.
     render_location: str = "hybrid",
+    # v1.14 (WebCodecs): prefer the hardware encode path (canvas 2D
+    # compositor -> VideoEncoder -> fast FFmpeg audio mux). When False
+    # — or when the device lacks WebCodecs — the browser uses the
+    # FFmpeg.wasm ultrafast path. Default True.
+    hw_encode: bool = True,
     key: Optional[str] = None,
 ) -> Dict:
     """Render the canvas and return the latest user-edited state.
@@ -3166,6 +4098,7 @@ def interactive_canvas(
         gemini_ack=gemini_ack,
         hybrid_pack=hybrid_pack,
         render_location=render_location,
+        hw_encode=bool(hw_encode),
         default=CANVAS_DEFAULT,
         key=key,
     )

@@ -652,6 +652,10 @@ def _copyright_filter_chain(
         "crop_y": None,
         "shift_x": 0,
         "shift_y": 0,
+        # v1.14 (WebCodecs compositor): the scaled dims, so the device
+        # can replicate the zoom scale+crop without ffmpeg.
+        "scaled_w": None,
+        "scaled_h": None,
     }
     if mirror_horizontal:
         parts.append("hflip")
@@ -679,8 +683,75 @@ def _copyright_filter_chain(
             applied["shift_x"] = cx - slack_x // 2
             applied["shift_y"] = cy - slack_y // 2
         parts.append(f"crop={base_w}:{base_h}:{cx}:{cy}")
-        applied.update({"zoom": z, "crop_x": cx, "crop_y": cy})
+        applied.update({"zoom": z, "crop_x": cx, "crop_y": cy,
+                        "scaled_w": zw, "scaled_h": zh})
     return (",".join(parts), applied)
+
+
+def _fit_numbers(
+    base_w: int, base_h: int,
+    out_w: int, out_h: int, fit_mode: Optional[str],
+    crop_align: str, inner_scale: float,
+    vertical_pos: float, horizontal_pos: float,
+    aspect_ratio: str,
+) -> Dict:
+    """Pure geometry for the aspect/fit stage (v1.14 WebCodecs).
+
+    Returns the numbers (no ffmpeg strings) so the device compositor
+    can replicate the fit exactly:
+    - crop: {"mode": "crop", "scale": s, "src_x", "src_y", "src_w",
+      "src_h"} — the source rect IN BASE PIXELS for a 9-arg
+      drawImage(base, sx, sy, sw, sh, 0, 0, out_w, out_h).
+    - pad: {"mode": "pad", "fg_w", "fg_h", "fg_x", "fg_y"} — the
+      foreground rect in OUTPUT pixels (the bg is cover+blur).
+    Mirrors _fit_filter_steps exactly (same clamps, same rounding).
+    """
+    _mode = fit_mode
+    if _mode is None:
+        _mode = "crop" if aspect_ratio != "16:9" else "pad_black"
+    if _mode == "pad_black":
+        # Legacy 16:9: scale-to-fit + black pad (kept for parity with
+        # the old filter string; the compositor draws it the same way).
+        s = min(out_w / base_w, out_h / base_h) if base_w and base_h else 1.0
+        dw = base_w * s
+        dh = base_h * s
+        return {"mode": "pad_black",
+                "fg_w": dw, "fg_h": dh,
+                "fg_x": (out_w - dw) / 2, "fg_y": (out_h - dh) / 2}
+    if _mode == "crop":
+        s = max(out_w / base_w, out_h / base_h) if base_w and base_h else 1.0
+        sw_s, sh_s = base_w * s, base_h * s
+        cx_s = (sw_s - out_w) / 2
+        if crop_align == "top":
+            cy_s = 0.0
+        elif crop_align == "bottom":
+            cy_s = sh_s - out_h
+        else:
+            cy_s = (sh_s - out_h) / 2
+        return {"mode": "crop", "scale": s,
+                "src_x": cx_s / s, "src_y": cy_s / s,
+                "src_w": out_w / s, "src_h": out_h / s}
+    if _mode == "pad":
+        try:
+            scale_f = float(inner_scale or 1.0)
+        except (TypeError, ValueError):
+            scale_f = 1.0
+        scale_f = min(2.0, max(0.5, scale_f))
+        try:
+            vpos = min(50.0, max(-50.0, float(vertical_pos or 0.0)))
+            hpos = min(50.0, max(-50.0, float(horizontal_pos or 0.0)))
+        except (TypeError, ValueError):
+            vpos, hpos = 0.0, 0.0
+        base = min(out_w / base_w, out_h / base_h) if base_w and base_h else 1.0
+        fg_w = max(2, int(round(base_w * base * scale_f)))
+        fg_h = max(2, int(round(base_h * base * scale_f)))
+        fg_w -= fg_w % 2
+        fg_h -= fg_h % 2
+        ox = (out_w - fg_w) // 2 + int(round(hpos / 100.0 * out_w))
+        oy = (out_h - fg_h) // 2 + int(round(vpos / 100.0 * out_h))
+        return {"mode": "pad", "fg_w": fg_w, "fg_h": fg_h,
+                "fg_x": ox, "fg_y": oy}
+    raise ValueError("fit_mode must be 'crop', 'pad', or None (legacy).")
 
 
 def _fit_filter_steps(
@@ -1500,6 +1571,23 @@ def build_hybrid_filter_graph(
         f"alimiter=limit=0.95,{_ln}aresample=44100[aout]"
     )
     audio_without = f"[1:a]{_ln}aresample=44100[aout]"
+    # v1.14 (WebCodecs): structured compositor geometry so the device
+    # can replicate every transform in canvas 2D without ffmpeg video
+    # filters. Pure numbers — the filter strings above are unchanged.
+    _fit_nums = _fit_numbers(
+        base_w, base_h, out_w, out_h, fit_mode, crop_align,
+        inner_scale, vertical_pos, horizontal_pos, aspect_ratio)
+    _compositor = {
+        "base_w": base_w, "base_h": base_h,
+        "out_w": out_w, "out_h": out_h,
+        "mirror": bool(copyright_applied.get("mirror")),
+        "zoom": float(copyright_applied.get("zoom") or 1.0),
+        "zoom_scaled_w": copyright_applied.get("scaled_w"),
+        "zoom_scaled_h": copyright_applied.get("scaled_h"),
+        "zoom_crop_x": copyright_applied.get("crop_x"),
+        "zoom_crop_y": copyright_applied.get("crop_y"),
+        "fit": _fit_nums,
+    }
     return {
         "with_audio": video_part + ";" + audio_with,
         "no_audio": video_part + ";" + audio_without,
@@ -1508,7 +1596,33 @@ def build_hybrid_filter_graph(
         "out_h": out_h,
         "blur_boxes": boxes,
         "subtitle_input": bool(subtitle_enabled),
+        "compositor": _compositor,
     }
+
+
+def build_hybrid_mux_audio_filter(
+    src_audio_idx: int = 2,
+    voice_idx: int = 1,
+    bg_volume: float = 0.0,
+    loudnorm: bool = True,
+) -> Dict[str, str]:
+    """Audio-only filter_complex for the WebCodecs mux step (v1.14).
+
+    The hardware path encodes video with VideoEncoder/MediaRecorder
+    (no ffmpeg video filters), then muxes: inputs are 0 = hardware
+    video-only MP4, 1 = voiceover MP3, 2 = source MP4 (bg audio).
+    Returns {"with_audio", "no_audio"} — the SAME audio chain the
+    wasm path uses, with remapped input indices. Pure function.
+    """
+    _ln = LOUDNORM_FILTER + "," if loudnorm else ""
+    with_audio = (
+        f"[{int(src_audio_idx)}:a]anull,volume={bg_volume}[bg];"
+        f"[bg][{int(voice_idx)}:a]amix=inputs=2:duration=longest:"
+        "dropout_transition=0:normalize=0,"
+        f"alimiter=limit=0.95,{_ln}aresample=44100[aout]"
+    )
+    no_audio = f"[{int(voice_idx)}:a]{_ln}aresample=44100[aout]"
+    return {"with_audio": with_audio, "no_audio": no_audio}
 
 
 def mix_pro_block_audio(blocks: List[Dict], work_dir: str,
