@@ -2284,7 +2284,7 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
       args = args.concat([
         "-filter_complex", graph,
         "-map", "[vout]", "-map", "[aout]",
-        "-c:v", "libx264", "-preset", "veryfast",
+        "-c:v", "libx264", "-preset", "ultrafast",
         "-pix_fmt", "yuv420p", "-r", "30",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", "-shortest", "out.mp4"]);
