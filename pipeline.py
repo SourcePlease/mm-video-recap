@@ -391,6 +391,7 @@ def run_full_recap_pipeline(
     style: str = DEFAULT_STYLE,
     voice_name: str = "my-MM-ThihaNeural",
     rate: str = "+0%",
+    pitch: str = "+0Hz",
     aspect_ratio: str = "16:9",
     bg_volume: float = 0.0,
     work_dir: Optional[str] = None,
@@ -626,6 +627,7 @@ def run_full_recap_pipeline(
         blocks = generate_block_voiceovers(
             blocks, os.path.join(work_dir, "block_audio"),
             voice_name=voice_name, rate=rate, proxy=tts_proxy,
+            pitch=pitch,
             on_progress=lambda f: _report(
                 "tts", f, "မြန်မာအသံ ထုတ်နေသည်…"))
         # Coverage fix v3 — Pro under-filled detection: a block can
@@ -678,7 +680,7 @@ def run_full_recap_pipeline(
                             blocks,
                             os.path.join(work_dir, "block_audio"),
                             voice_name=voice_name, rate=rate,
-                            proxy=tts_proxy,
+                            proxy=tts_proxy, pitch=pitch,
                             on_progress=lambda f: _report(
                                 "tts", f,
                                 "မြန်မာအသံ ထပ်ထုတ်နေသည်…"))
@@ -724,7 +726,8 @@ def run_full_recap_pipeline(
                 subtitle_config=subtitle_config,
                 burn_subtitles=burn_subtitles,
                 voiceover_path=_mixed, srt_path=_pro_srt_path,
-                extra={"pro_fill_status": _pro_fill_status},
+                extra={"pro_fill_status": _pro_fill_status,
+                       "pitch": pitch},
             )
             _report("pack", 1.0, "Hybrid pack အဆင်သင့်")
             if gemini_file_name:
@@ -836,7 +839,8 @@ def run_full_recap_pipeline(
             for _try_rate in _ladder:
                 audio_duration = generate_burmese_voiceover(
                     script_text, voiceover_path, auto_srt,
-                    voice_name=voice_name, rate=_try_rate, proxy=tts_proxy,
+                    voice_name=voice_name, rate=_try_rate,
+                    proxy=tts_proxy, pitch=pitch,
                 )
                 _tts_rate_used = _try_rate
                 if _video_dur <= 0 or audio_duration <= _video_dur:
@@ -930,7 +934,7 @@ def run_full_recap_pipeline(
                 _cont_len = generate_burmese_voiceover(
                     _cont_text, _cont_audio, _cont_srt,
                     voice_name=voice_name, rate=_tts_rate_used,
-                    proxy=tts_proxy)
+                    proxy=tts_proxy, pitch=pitch)
                 if _cont_len <= 0 or not os.path.isfile(_cont_audio):
                     _cont_error = "continuation TTS produced no audio"
                     break
@@ -1004,6 +1008,7 @@ def run_full_recap_pipeline(
                 voiceover_path=fitted_audio, srt_path=fitted_srt,
                 extra={
                     "tts_rate": _tts_rate_used,
+                    "pitch": pitch,
                     "audio_fit": audio_fit,
                     "continuation_rounds": len(_cont_log),
                     "continuation_cap_hit": _cont_cap_hit,

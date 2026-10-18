@@ -34,6 +34,15 @@ MYANMAR_VOICES = {
 }
 
 _RATE_RE = re.compile(r"^[+-]?\d+%$")
+_PITCH_RE = re.compile(r"^[+-]?\d+Hz$")
+
+
+def format_pitch(pitch_hz: int) -> str:
+    """Format a slider value (-10..+10) as an Edge-TTS pitch string.
+
+    0 -> "+0Hz" (flat), +5 -> "+5Hz", -5 -> "-5Hz".
+    """
+    return f"{int(pitch_hz):+d}Hz"
 
 
 class TTSManagerError(Exception):
@@ -68,9 +77,11 @@ async def _synthesize(
     voice_name: str,
     rate: str,
     proxy: Optional[str],
+    pitch: str = "+0Hz",
 ) -> None:
     communicate = edge_tts.Communicate(
-        text, voice_name, rate=rate, boundary="WordBoundary", proxy=proxy
+        text, voice_name, rate=rate, pitch=pitch,
+        boundary="WordBoundary", proxy=proxy
     )
     submaker = SubMaker()
     out_dir = os.path.dirname(os.path.abspath(audio_path))
@@ -104,6 +115,7 @@ def generate_burmese_voiceover(
     voice_name: str = "my-MM-ThihaNeural",
     rate: str = "+0%",
     proxy: Optional[str] = None,
+    pitch: str = "+0Hz",
 ) -> float:
     """Render Myanmar voiceover MP3 (+ optional SRT); return audio seconds.
 
@@ -114,6 +126,8 @@ def generate_burmese_voiceover(
         voice_name: "my-MM-ThihaNeural" (male) or "my-MM-NilarNeural" (female).
         rate: speech rate like "+0%", "+20%", "-10%".
         proxy: optional proxy URL (dev-VM use only; default None).
+        pitch: voice tone like "+0Hz" (flat), "+5Hz" (higher),
+            "-5Hz" (lower). Independent of rate.
     """
     text = (script_text or "").strip()
     if not text:
@@ -122,9 +136,14 @@ def generate_burmese_voiceover(
         raise ValueError(
             f"rate ပုံစံမမှန်ပါ: {rate!r} (ဥပမာ '+0%', '+20%', '-10%')"
         )
+    if not _PITCH_RE.match(pitch or ""):
+        raise ValueError(
+            f"pitch ပုံစံမမှန်ပါ: {pitch!r} (ဥပမာ '+0Hz', '+5Hz', '-5Hz')"
+        )
 
     asyncio.run(
-        _synthesize(text, output_audio_path, output_srt_path, voice_name, rate, proxy)
+        _synthesize(text, output_audio_path, output_srt_path,
+                    voice_name, rate, proxy, pitch)
     )
 
     if not os.path.isfile(output_audio_path) or os.path.getsize(output_audio_path) == 0:
@@ -138,6 +157,7 @@ def generate_block_voiceovers(
     voice_name: str = "my-MM-ThihaNeural",
     rate: str = "+0%",
     proxy: Optional[str] = None,
+    pitch: str = "+0Hz",
     # Progress callback: called with 0..1 after each block finishes.
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> List[Dict]:
@@ -189,7 +209,8 @@ def generate_block_voiceovers(
                 for _try_rate in _ladder:
                     audio_len = generate_burmese_voiceover(
                         text, ap, None,
-                        voice_name=voice_name, rate=_try_rate, proxy=proxy,
+                        voice_name=voice_name, rate=_try_rate,
+                        proxy=proxy, pitch=pitch,
                     )
                     used_rate = _try_rate
                     # Fits the dialogue window — stop, keep this audio.
