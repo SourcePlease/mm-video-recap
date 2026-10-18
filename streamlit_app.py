@@ -31,7 +31,7 @@ from pipeline import run_full_recap_pipeline
 
 # Build marker: bump on every push so a live page check can prove
 # which code the running app has.
-BUILD_VERSION = "2026-10-18 feature-pack v1"
+BUILD_VERSION = "2026-10-18 feature-pack v1.2"
 # Server boot time: set ONCE when this module is imported (i.e. when
 # the app process starts). A server restart re-imports the module, so
 # BOOT_TIME jumps forward. The re-attach logic compares it with a
@@ -411,18 +411,30 @@ def verify_gemini_api_key(user_api_key: str):
 
 
 # Browser-local key storage (per-user, never touches our server).
-LS_KEY = "mmr_gemini_api_key"
+# API Keys v2: Gemini keys are a JSON list (up to 5); the old single-key
+# entry is migrated on first load. Groq key is a separate single entry.
+LS_KEY = "mmr_gemini_api_key"  # legacy single key (migrated, then unused)
+LS_KEYS = "mmr_gemini_api_keys"  # JSON array of Gemini keys
+LS_GROQ_KEY = "mmr_groq_api_key"
 # Browser-local remembered Run (job persistence; see helpers below).
 LS_JOB = "mmr_job_id"
 
-if "api_key" not in st.session_state:
-    st.session_state["api_key"] = ""
+if "gemini_keys" not in st.session_state:
+    st.session_state["gemini_keys"] = []
+if "gemini_key_slots" not in st.session_state:
+    st.session_state["gemini_key_slots"] = 1
+if "groq_api_key" not in st.session_state:
+    st.session_state["groq_api_key"] = ""
+if "quota_warn" not in st.session_state:
+    st.session_state["quota_warn"] = True
 if "key_restored" not in st.session_state:
     st.session_state["key_restored"] = False
 if "forget_pending" not in st.session_state:
     st.session_state["forget_pending"] = False
 if "forgotten_key" not in st.session_state:
     st.session_state["forgotten_key"] = ""
+if "groq_forgotten_key" not in st.session_state:
+    st.session_state["groq_forgotten_key"] = ""
 if "key_load_nonce" not in st.session_state:
     st.session_state["key_load_nonce"] = 0
 if "job_load_nonce" not in st.session_state:
@@ -487,28 +499,98 @@ if "session_dir" not in st.session_state:
 # The component key includes a nonce: bumping the nonce forces a FRESH
 # read. Without it the component keeps returning its first (stale) value
 # even after localStorage changes (Verify-save / Forget).
-browser_saved = streamlit_js_eval(
-    js_expressions=f"localStorage.getItem('{LS_KEY}')",
-    key=f"mmr_key_load_{st.session_state['key_load_nonce']}",
+# API Keys v2: the Gemini keys are a JSON list. The legacy single-key
+# entry is migrated into the list on first load.
+browser_saved_keys_raw = streamlit_js_eval(
+    js_expressions=f"localStorage.getItem('{LS_KEYS}')",
+    key=f"mmr_keys_load_{st.session_state['key_load_nonce']}",
 )
-# Restore on EVERY run while the key box is empty (not just once per
+browser_saved_legacy = streamlit_js_eval(
+    js_expressions=f"localStorage.getItem('{LS_KEY}')",
+    key=f"mmr_key_legacy_load_{st.session_state['key_load_nonce']}",
+)
+browser_saved_groq = streamlit_js_eval(
+    js_expressions=f"localStorage.getItem('{LS_GROQ_KEY}')",
+    key=f"mmr_groq_load_{st.session_state['key_load_nonce']}",
+)
+
+
+def _parse_saved_keys(raw):
+    """Parse the saved Gemini key list (JSON array)."""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if isinstance(data, list):
+        return [k for k in data if isinstance(k, str) and k.strip()]
+    return []
+
+
+browser_saved_keys = _parse_saved_keys(browser_saved_keys_raw)
+# Migrate the legacy single key once.
+if not browser_saved_keys and browser_saved_legacy:
+    _legacy = browser_saved_legacy.strip()
+    if _legacy and _legacy != st.session_state.get("forgotten_key"):
+        browser_saved_keys = [_legacy]
+
+# Restore on EVERY run while the key boxes are empty (not just once per
 # session): a server session reset must not force the user to re-enter
-# the key. A typed-but-unverified key in the box is never overwritten.
-# After Forget, block restore until the browser confirms removal
-# (browser_saved is None) so the just-deleted key can't come back;
-# forgotten_key also guards against a stale cached read of it.
-# NOTE: the forget guards are NEVER cleared by a None read — a None
-# can be transient (the component hasn't answered yet), and clearing
-# on it would let a stale OLD value re-restore the deleted key. The
-# guards clear only on a fresh Verify-save or a fresh session.
+# keys. A typed-but-unverified key in a box is never overwritten.
+# After Forget, block restore until the browser confirms removal so a
+# just-deleted key can't come back.
 if (
-    browser_saved
-    and browser_saved != st.session_state.get("forgotten_key")
-    and not st.session_state.get("api_key_box")
+    browser_saved_keys
+    and not any(st.session_state.get(f"api_key_box_{i}")
+                for i in range(5))
     and not st.session_state.get("forget_pending")
 ):
-    st.session_state["api_key"] = browser_saved
+    st.session_state["gemini_keys"] = list(browser_saved_keys)
+    st.session_state["gemini_key_slots"] = max(
+        1, min(5, len(browser_saved_keys)))
     st.session_state["key_restored"] = True
+
+if (
+    browser_saved_groq
+    and browser_saved_groq != st.session_state.get("groq_forgotten_key")
+    and not st.session_state.get("groq_api_key_box")
+    and not st.session_state.get("groq_forget_pending")
+):
+    st.session_state["groq_api_key"] = browser_saved_groq
+
+
+def _get_active_gemini_keys():
+    """The run's Gemini key list (API Keys v2).
+
+    Session-state keys first, falling back to the browser-saved list
+    (e.g. after a session reset). A key the user just deleted (Forget)
+    is never used, even if a stale cached read still returns it.
+    """
+    _keys = [k for k in (st.session_state.get("gemini_keys") or [])
+             if isinstance(k, str) and k.strip()]
+    if not _keys:
+        _saved = [k for k in (browser_saved_keys or [])
+                  if k != st.session_state.get("forgotten_key")]
+        _keys = _saved
+    # Dedupe, preserve order.
+    _seen = set()
+    _out = []
+    for _k in _keys:
+        if _k not in _seen:
+            _seen.add(_k)
+            _out.append(_k)
+    return _out
+
+
+def _get_active_groq_key():
+    """The Groq key (single, optional)."""
+    _g = (st.session_state.get("groq_api_key") or "").strip()
+    if not _g:
+        _g = (browser_saved_groq or "").strip()
+        if _g == st.session_state.get("groq_forgotten_key"):
+            _g = ""
+    return _g
 
 # Ask this browser for a remembered Run (job persistence): the
 # component key includes a nonce, bumped on every Run save, so the
@@ -847,6 +929,8 @@ def _apply_job_result(result, snap) -> Dict:
             str(result.get("final_video_path") or "recap.mp4")),
         "processing_mode": result.get("processing_mode"),
         "duration": (result.get("metadata") or {}).get("duration"),
+        # API Keys v2: quota-rotation warnings (non-fatal).
+        "quota_warnings": list(result.get("quota_warnings") or []),
     }
     _cleanup_run_workdir(
         snap.get("run_dir"),
@@ -913,6 +997,16 @@ def _run_pipeline_job(job: Dict) -> None:
             "snapshot": _job_file_snapshot(snap),
         })
 
+    def _record_quota_warning(msg: str) -> None:
+        # API Keys v2: a key exhausted mid-run and rotation happened.
+        # Recorded on the job (thread-safe); the UI shows it as a
+        # non-fatal warning banner when the run finishes (and the
+        # result also carries quota_warnings).
+        with lock:
+            _wl = job.setdefault("quota_warnings", [])
+            if msg not in _wl:
+                _wl.append(msg)
+
     try:
         if snap.get("render_location") == "hybrid":
             # Hybrid: the browser holds the source video (never
@@ -922,7 +1016,11 @@ def _run_pipeline_job(job: Dict) -> None:
             result = run_full_recap_pipeline(
                 video_path=None,
                 video_url=None,
-                user_api_key=snap["key"] or None,
+                user_api_key=snap.get("gemini_keys") or [],
+                groq_api_key=snap.get("groq_api_key") or "",
+                on_quota_warning=(_record_quota_warning
+                                  if snap.get("quota_warn", True)
+                                  else None),
                 voice_name=snap["voice_name"],
                 pitch=_format_pitch_hz(snap.get("voice_pitch_hz", 0)),
                 processing_mode=snap["processing_mode"],
@@ -966,7 +1064,11 @@ def _run_pipeline_job(job: Dict) -> None:
             result = run_full_recap_pipeline(
                 video_path=snap["src_path"],
                 video_url=snap["src_url"],
-                user_api_key=snap["key"] or None,
+                user_api_key=snap.get("gemini_keys") or [],
+                groq_api_key=snap.get("groq_api_key") or "",
+                on_quota_warning=(_record_quota_warning
+                                  if snap.get("quota_warn", True)
+                                  else None),
                 # No target_duration: AI Recap is always full-duration
                 # (pipeline ignores target_duration; see pipeline.py).
                 voice_name=snap["voice_name"],
@@ -1429,15 +1531,11 @@ if st.session_state.get("hybrid_pack_dir"):
 # needs_gemini_upload). It is never logged, never rendered, and clears
 # the moment the upload completes (pending_job is consumed). The key
 # already travels browser<->server for the server-side Gemini calls,
-# so this adds no new trust boundary.
+# so this adds no new trust boundary. API Keys v2: the canvas gets the
+# full KEY LIST; the browser rotates on 429/quota errors.
 _gemini_auth = None
 if (st.session_state.get("pending_job") or {}).get("needs_gemini_upload"):
-    _saved_for_gemini = browser_saved or ""
-    if _saved_for_gemini == st.session_state.get("forgotten_key"):
-        _saved_for_gemini = ""
-    _gemini_auth = (
-        st.session_state.get("api_key") or _saved_for_gemini or ""
-    ).strip() or None
+    _gemini_auth = _get_active_gemini_keys() or None
 _val = interactive_canvas(
     video_id=_canvas_video_id,
     video_data_url=_canvas_data_url,
@@ -1723,6 +1821,25 @@ if isinstance(_val, dict):
         except (TypeError, ValueError):
             pass  # keep previous canvas state on malformed values
 
+# v1.13.1: heal a lost pick (defense-in-depth for the Run check).
+# If Python lost pending_video_id (e.g. a restart race the pick
+# re-announce hasn't healed yet) but the canvas still holds a local
+# video, adopt the canvas's live video_id so Run sees the video.
+# The canvas supplies the bytes on the upload/Gemini nonce, so the
+# Run proceeds exactly like a normally-announced pick. Guarded by
+# `not _fresh_action`: a just-processed remove_video / new pick /
+# URL must never be overridden by a stale component value.
+if (not _fresh_action
+        and not st.session_state.get("pending_video_id")
+        and not st.session_state.get("src_path")
+        and not (st.session_state.get("src_url") or "").strip()
+        and isinstance(_val, dict)
+        and _val.get("has_video")
+        and _val.get("video_id")):
+    st.session_state["pending_video_id"] = str(_val.get("video_id"))
+    st.session_state["pending_video_name"] = (
+        str(_val.get("video_name") or "video"))
+
 # ---- Step 12: Segmented Settings Tabs (directly below the canvas) ----
 tab_src, tab_voice, tab_sub, tab_adv = st.tabs(
     [" Source", " Voice", " Subtitles", " Advanced"]
@@ -1774,6 +1891,28 @@ def _stepper_slider(label: str, key: str, lo: float, hi: float,
     with c3:
         st.button("+", key=f"{key}_plus", on_click=_bump,
                   args=(key, step, lo, hi))
+
+
+def _resolve_video_source(src_path, src_url, pending_video_id,
+                          demo_active, demo_exists):
+    """v1.13.1: pure Run video-source check (unit-testable).
+
+    Precedence matches the canvas display: picked file > demo > URL.
+    Returns (ok, error_message) — error_message is "" when ok.
+    """
+    _src_url = (src_url or "").strip() or None
+    _has_pending = bool(pending_video_id)
+    if src_path:
+        return True, ""
+    if demo_active and not _src_url:
+        if not demo_exists:
+            return False, "✕ Demo video မရှိပါ"
+        return True, ""
+    if not _src_url and not _has_pending:
+        return False, (
+            "✕ Canvas ထဲမှာ ဗီဒီယို ရွေးပေးပါ "
+            "သို့မဟုတ် Video URL ထည့်ပေးပါ")
+    return True, ""
 
 
 with tab_src:
@@ -2042,15 +2181,18 @@ with tab_voice:
                 from tts_manager import generate_burmese_voiceover as _pv_tts
                 _pv_proxy = (os.environ.get("HTTPS_PROXY")
                              or os.environ.get("https_proxy"))
-                _pv_audio = _pv_tts(
-                    _pv_text, os.path.join(
-                        tempfile.gettempdir(), "voice_preview.mp3"),
+                # NOTE: generate_burmese_voiceover returns the audio
+                # DURATION (float), not the path — open the known path.
+                _pv_path = os.path.join(
+                    tempfile.gettempdir(), "voice_preview.mp3")
+                _pv_tts(
+                    _pv_text, _pv_path,
                     voice_name=_pv_voice,
                     rate=_format_rate_pct(voice_speed_pct),
                     pitch=_format_pitch_hz(pitch_hz),
                     proxy=_pv_proxy,
                 )
-                with open(_pv_audio, "rb") as _pf:
+                with open(_pv_path, "rb") as _pf:
                     st.session_state["voice_preview_audio"] = _pf.read()
         except Exception as _pv_exc:  # noqa: BLE001 - show, don't crash
             st.error(f"✕ အသံ နမူနာ ထုတ်မရပါ: {_pv_exc}")
@@ -2142,92 +2284,153 @@ def _saved_note() -> None:
 with tab_adv:
     st.markdown(KEY_GUIDE)
 
-    def _key_changed() -> None:
-        # Fires ONLY when the user actually edits the key box. Browser
-        # autofill does not trigger this, so a stale autofill ghost can
-        # never clobber the restored key. The restored key lives in
-        # "api_key" (a plain key); the box itself always starts empty.
-        st.session_state["api_key"] = st.session_state.get("api_key_box", "")
+    # ---- API Keys v2: Gemini key list (up to 5, auto-rotating) ----
+    st.markdown("### Gemini API Keys")
 
-    key_saved = bool(
-        browser_saved
-        and st.session_state.get("api_key") == browser_saved
-        # After Forget, a stale cached read can still equal a re-typed
-        # key — forget_pending blocks the note until a fresh save.
-        and not st.session_state.get("forget_pending")
-    )
-    key_input = st.text_input(
-        " သင်၏ Free Gemini API Key ထည့်ပါ",
-        type="password",
-        # Always start empty: the restored key is shown via the green
-        # "သိမ်းပြီး" note, never echoed back into the box (and an
-        # autofill ghost in the box must not become the app's key).
-        # Once saved, the box is disabled so it is obvious no re-entry
-        # is needed; Forget re-enables it for a new key.
-        value="",
-        key="api_key_box",
-        placeholder="••••••••" if key_saved else "AIza...",
-        disabled=key_saved,
-        on_change=_key_changed,
-    )
-    # NOTE: do NOT copy key_input into api_key here. The box is empty on
-    # every fresh load; copying it would wipe the localStorage-restored
-    # key (the "enter the key every time" bug). api_key is set only by
-    # the restore above and by _key_changed (a real user edit).
-
-    if key_saved:
-        _saved_note()
-
-    def _forget_key() -> None:
-        # on_click callback: runs BEFORE the script body on the click
-        # run, so the tab UI below renders the cleared state
-        # immediately (no stale green note / disabled box).
-        _old = st.session_state.get("api_key") or ""
-        st.session_state["forgotten_key"] = _old
-        st.session_state["api_key"] = ""
-        st.session_state["key_restored"] = True
-        st.session_state["forget_pending"] = True
+    def _save_gemini_keys_to_browser(keys):
+        # Persist the JSON key list (nonce-keyed so the eval re-runs).
+        # Keys live ONLY in the user's browser localStorage — never on
+        # our server, never in logs.
         st.session_state["key_load_nonce"] += 1
-        st.session_state["forget_just_clicked"] = True
-        if "api_key_box" in st.session_state:
-            del st.session_state["api_key_box"]
+        streamlit_js_eval(
+            js_expressions=(
+                f"localStorage.setItem('{LS_KEYS}',{json.dumps(keys)})"),
+            key=f"mmr_keys_save_{st.session_state['key_load_nonce']}",
+        )
 
-    key_col1, key_col2 = st.columns(2)
-    with key_col1:
-        verify_save_btn = st.button("✓ API Key စစ်ဆေးပြီး Browser မှာ သိမ်းမည်")
-    with key_col2:
-        forget_btn = st.button(" သိမ်းထားသော Key ဖျက်မည်", on_click=_forget_key)
+    _slots = int(st.session_state.get("gemini_key_slots") or 1)
+    _slots = max(1, min(5, _slots))
+    _keys = list(st.session_state.get("gemini_keys") or [])
+    while len(_keys) < _slots:
+        _keys.append("")
+    st.session_state["gemini_keys"] = _keys
+    _saved_keys = list(browser_saved_keys or [])
 
-    if verify_save_btn:
-        _k = (st.session_state["api_key"] or "").strip()
-        _ok, _msg = verify_gemini_api_key(_k)
-        if _ok:
-            # A fresh save supersedes any earlier Forget; force a fresh
-            # localStorage read so the green note shows immediately.
-            st.session_state["forgotten_key"] = ""
-            st.session_state["forget_pending"] = False
+    for _i in range(_slots):
+        _box_key = f"api_key_box_{_i}"
+        _is_saved = bool(
+            _i < len(_keys) and _keys[_i]
+            and _keys[_i] in _saved_keys
+            and not st.session_state.get("forget_pending")
+        )
+        _kc1, _kc2, _kc3 = st.columns([3, 1, 1])
+        with _kc1:
+            st.text_input(
+                f"Key {_i + 1}",
+                type="password",
+                # Always start empty: the saved key is shown via the
+                # green pill, never echoed back into the box.
+                value="",
+                key=_box_key,
+                placeholder="••••••••" if _is_saved else "AIza...",
+                disabled=_is_saved,
+            )
+        with _kc2:
+            _test_btn = st.button("Test", key=f"key_test_{_i}")
+        with _kc3:
+            _rm_btn = st.button("Remove", key=f"key_remove_{_i}")
+        if _is_saved:
+            _saved_note()
+        if _test_btn:
+            _k = (st.session_state.get(_box_key) or "").strip()
+            if not _k and _i < len(_keys):
+                _k = (_keys[_i] or "").strip()
+            _ok, _msg = verify_gemini_api_key(_k)
+            if _ok:
+                while len(_keys) <= _i:
+                    _keys.append("")
+                _keys[_i] = _k
+                st.session_state["gemini_keys"] = _keys
+                st.session_state["forgotten_key"] = ""
+                st.session_state["forget_pending"] = False
+                _save_gemini_keys_to_browser([k for k in _keys if k])
+                _saved_note()
+            else:
+                st.error(_msg)
+        if _rm_btn:
+            _new_keys = [k for j, k in enumerate(_keys)
+                         if j != _i and k]
+            st.session_state["gemini_keys"] = _new_keys
+            st.session_state["gemini_key_slots"] = max(1, len(_new_keys))
+            st.session_state["key_load_nonce"] += 1
+            _save_gemini_keys_to_browser(_new_keys)
+            for _j in range(5):
+                _bk = f"api_key_box_{_j}"
+                if _bk in st.session_state:
+                    del st.session_state[_bk]
+            st.rerun()
+
+    if _slots < 5:
+        if st.button("＋ Key ထည့်မယ်"):
+            st.session_state["gemini_key_slots"] = min(5, _slots + 1)
+            st.rerun()
+
+    st.caption(
+        "Key တစ်ခုချင်းစီကို တခြား Google account တစ်ခုစီမှ ယူပါ — "
+        "account တစ်ခုစီမှာ free quota သီးခြား ရမယ်။ (Google AI Studio)"
+    )
+
+    # Quota-exhausted warning toggle (default ON).
+    st.checkbox(
+        "Quota ကုန်ရင် သတိပေးမယ်",
+        value=True,
+        key="quota_warn",
+    )
+
+    # ---- Groq API key (optional, text tasks only) ----
+    st.markdown("### Groq API Key (optional)")
+    _groq_saved = bool(
+        browser_saved_groq
+        and st.session_state.get("groq_api_key") == browser_saved_groq
+        and not st.session_state.get("groq_forget_pending")
+    )
+    st.text_input(
+        "Groq API Key",
+        type="password",
+        value="",
+        key="groq_api_key_box",
+        placeholder="••••••••" if _groq_saved else "gsk_...",
+        disabled=_groq_saved,
+    )
+    if _groq_saved:
+        _saved_note()
+    _gq1, _gq2 = st.columns(2)
+    with _gq1:
+        _groq_save_btn = st.button("✓ Groq Key သိမ်းမည်")
+    with _gq2:
+        _groq_forget_btn = st.button("Groq Key ဖျက်မည်")
+    if _groq_save_btn:
+        _gk = (st.session_state.get("groq_api_key_box") or "").strip()
+        if _gk:
+            st.session_state["groq_api_key"] = _gk
+            st.session_state["groq_forgotten_key"] = ""
+            st.session_state["groq_forget_pending"] = False
             st.session_state["key_load_nonce"] += 1
             streamlit_js_eval(
-                js_expressions=f"localStorage.setItem('{LS_KEY}',{json.dumps(_k)})",
-                key=f"mmr_key_save_{st.session_state['key_load_nonce']}",
+                js_expressions=(
+                    "localStorage.setItem("
+                    f"'{LS_GROQ_KEY}',{json.dumps(_gk)})"),
+                key=f"mmr_groq_save_{st.session_state['key_load_nonce']}",
             )
             _saved_note()
         else:
-            # Invalid key: show the error and do NOT save anything.
-            st.error(_msg)
-
-    if st.session_state.get("forget_just_clicked"):
-        # Execute the removal exactly once. The eval key includes the
-        # nonce (bumped in the callback), so the component re-executes
-        # even if the user forgets again later (the frontend only runs
-        # an expression when it changes). NO st.rerun() here: it would
-        # discard this run's render and the removal would never reach
-        # the browser. The removal result triggers a rerun on its own.
+            st.error("✕ Groq API Key ထည့်သွင်းပေးပါ")
+    if _groq_forget_btn:
+        st.session_state["groq_forgotten_key"] = (
+            st.session_state.get("groq_api_key") or "")
+        st.session_state["groq_api_key"] = ""
+        st.session_state["groq_forget_pending"] = True
+        st.session_state["key_load_nonce"] += 1
+        if "groq_api_key_box" in st.session_state:
+            del st.session_state["groq_api_key_box"]
         streamlit_js_eval(
-            js_expressions=f"localStorage.removeItem('{LS_KEY}')",
-            key=f"mmr_key_del_{st.session_state['key_load_nonce']}",
+            js_expressions=f"localStorage.removeItem('{LS_GROQ_KEY}')",
+            key=f"mmr_groq_del_{st.session_state['key_load_nonce']}",
         )
-        st.session_state["forget_just_clicked"] = False
+    st.caption(
+        "Video analysis (ဗီဒီယို ကြည့်တာ) က Gemini ပဲ ရမယ် — "
+        "Groq က စာသား task တွေ (Post Kit caption) အတွက်သုံး"
+    )
 
     # ---- Feature pack v1.13: output filename + Post Kit options ----
     st.markdown("### Output")
@@ -2282,12 +2485,10 @@ if run_btn and not _run_blocked:
     # (e.g. a session reset) but the browser still has it. A key the
     # user just deleted (Forget) is never used, even if a stale cached
     # read still returns it.
-    _saved = browser_saved or ""
-    if _saved == st.session_state.get("forgotten_key"):
-        _saved = ""
-    key = (st.session_state.get("api_key") or _saved or "").strip()
+    gemini_keys = _get_active_gemini_keys()
+    groq_key = _get_active_groq_key()
 
-    if not demo_active and not key:
+    if not demo_active and not gemini_keys:
         st.error("✕ ကျေးဇူးပြု၍ သင်၏ Free Gemini API Key ကို ထည့်သွင်းပေးပါ")
         st.stop()
 
@@ -2300,12 +2501,11 @@ if run_btn and not _run_blocked:
     _has_pending_video = bool(st.session_state.get("pending_video_id"))
     if src_path:
         src_url = None
-    elif demo_active and not src_url:
-        if not os.path.isfile(DEMO_SAMPLE):
-            st.error("✕ Demo video မရှိပါ")
-            st.stop()
-    elif not src_url and not _has_pending_video:
-        st.error("✕ Canvas ထဲမှာ ဗီဒီယို ရွေးပေးပါ သို့မဟုတ် Video URL ထည့်ပေးပါ")
+    _src_ok, _src_err = _resolve_video_source(
+        src_path, src_url, st.session_state.get("pending_video_id"),
+        demo_active, os.path.isfile(DEMO_SAMPLE))
+    if not _src_ok:
+        st.error(_src_err)
         st.stop()
 
     # Snapshot ALL settings at click time — the worker runs async,
@@ -2387,8 +2587,13 @@ if run_btn and not _run_blocked:
             _uh_meta = _uh_gvm(_uh_path)
             with st.spinner("Gemini ကို ဗီဒီယို တင်နေသည်…"):
                 from google import genai as _uh_genai
-                _uh_client = _uh_genai.Client(api_key=key)
-                _uh_up = _uh_client.files.upload(file=_uh_path)
+                from key_pool import GeminiKeyPool as _UHKeyPool
+                # API Keys v2: rotate the upload across keys on quota.
+                _uh_pool = _UHKeyPool(gemini_keys)
+                _uh_up = _uh_pool.run(
+                    lambda _k: _uh_genai.Client(api_key=_k).files.upload(
+                        file=_uh_path))
+                _uh_client = _uh_genai.Client(api_key=_uh_pool.first_key())
                 _uh_name = _uh_up.name
                 for _ in range(72):
                     _uh_f = _uh_client.files.get(name=_uh_name)
@@ -2431,7 +2636,12 @@ if run_btn and not _run_blocked:
             st.session_state["hybrid_fell_back"] = True
 
     _snap = {
-        "key": key,
+        # API Keys v2: the run carries the full Gemini key LIST (the
+        # pipeline rotates on quota exhaustion), the optional Groq key,
+        # and the quota-warning toggle.
+        "gemini_keys": gemini_keys,
+        "groq_api_key": groq_key,
+        "quota_warn": bool(st.session_state.get("quota_warn", True)),
         "demo_active": bool(demo_active),
         "render_location": _render_location,
         # Hybrid: filled in by the gemini_uploaded handler (local
@@ -2734,6 +2944,9 @@ def _render_library():
 _saved = st.session_state.get("recap_result")
 if _saved and os.path.isfile(_saved.get("video_path", "")):
     st.success(_saved["status"])
+    # API Keys v2: non-fatal quota-rotation warnings.
+    for _qw in (_saved.get("quota_warnings") or []):
+        st.warning(f"⚠ {_qw}")
     st.video(_saved["video_path"])
     st.text_input(" ခေါင်းစဉ်", value=_saved["title"], disabled=True)
     st.text_area(

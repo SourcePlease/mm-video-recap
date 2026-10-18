@@ -36,6 +36,10 @@ from typing import Any, Dict, List, Optional
 from google import genai
 from google.genai import types
 
+from key_pool import (
+    QuotaExhaustedError,
+    is_quota_error,
+)
 from video_processor import get_video_metadata
 
 # Shown to the user when they forget to paste their own free key.
@@ -465,9 +469,10 @@ def _generate_with_fallback(client: genai.Client, uploaded, prompt: str,
     plan: Optional[Dict[str, Any]] = None
     last_err: Optional[Exception] = None
     tried: List[str] = []
+    quota_hits = 0
 
     def _try_generate(mid: str) -> bool:
-        nonlocal plan, last_err
+        nonlocal plan, last_err, quota_hits
         tried.append(mid)
         try:
             resp = client.models.generate_content(
@@ -481,6 +486,15 @@ def _generate_with_fallback(client: genai.Client, uploaded, prompt: str,
             plan = json.loads(resp.text)
             return True
         except Exception as exc:  # noqa: BLE001 - inspected below
+            # Quota exhaustion is tracked separately from other
+            # model errors: when EVERY model fails with a quota error,
+            # the KEY (not the model) is exhausted and the key pool
+            # must rotate. Checked before _looks_like_model_error
+            # because quota tokens overlap with model-error tokens.
+            if is_quota_error(exc):
+                quota_hits += 1
+                last_err = exc
+                return False
             if _looks_like_model_error(exc):
                 last_err = exc
                 return False
@@ -496,6 +510,10 @@ def _generate_with_fallback(client: genai.Client, uploaded, prompt: str,
             if _try_generate(mid):
                 break
     if plan is None:
+        if tried and quota_hits >= len(tried):
+            # Every model answered "quota" — the key is exhausted.
+            raise QuotaExhaustedError(
+                f"Key quota ကုန်နေပါတယ် ({last_err})")
         raise AnalyzerError(
             "AI model နှင့် ချိတ်ဆက်၍ မရပါ။ "
             f"({last_err if last_err else 'unknown error'})"
@@ -917,18 +935,135 @@ POST_KIT_SCHEMA = {
 }
 
 
-def generate_post_kit(title, script_text, user_api_key, model=None,
-                      extra_hashtags="", append_fyp=True):
-    """Post Kit: Gemini writes a Burmese TikTok caption + hashtags.
+# ---------------------------------------------------------------------------
+# Text-task router (API Keys v2): Gemini keys (rotated) -> Groq fallback.
+# Groq can only do TEXT tasks (it cannot analyze video). Future text-only
+# tasks should call generate_text_json so they reuse this provider order.
+# ---------------------------------------------------------------------------
 
-    Uses the caller's own BYOK key (same key as the recap analysis).
-    Returns {"caption": str, "hashtags": [str]} with the user's extra
-    hashtags appended and #fyp appended when the toggle is on.
-    Raises AnalyzerError on failure — callers catch it and skip the
-    Post Kit gracefully (it is a bonus, never fatal to the run).
+GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
+
+
+def _groq_generate_json(prompt: str, groq_key: str,
+                        model: Optional[str] = None) -> Dict[str, Any]:
+    """Strict-JSON text generation via Groq. Raises on failure."""
+    key = (groq_key or "").strip()
+    if not key:
+        raise AnalyzerError("Groq key မရှိပါ")
+    try:
+        from groq import Groq
+    except ImportError as exc:
+        raise AnalyzerError(
+            "Groq library မရှိပါ (pip install groq)") from exc
+    client = Groq(api_key=key)
+    resp = client.chat.completions.create(
+        model=model or GROQ_DEFAULT_MODEL,
+        messages=[{
+            "role": "user",
+            "content": prompt + "\n\nReturn ONLY strict JSON, no prose.",
+        }],
+        response_format={"type": "json_object"},
+        temperature=0.7,
+    )
+    text = ((resp.choices[0].message.content) or "").strip()
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise AnalyzerError(
+            f"Groq returned non-JSON: {text[:120]}") from exc
+    if not isinstance(data, dict):
+        raise AnalyzerError("Groq returned non-object JSON")
+    return data
+
+
+def _gemini_text_json(key: str, prompt: str, schema: Dict[str, Any],
+                      model: Optional[str] = None) -> Dict[str, Any]:
+    """One Gemini key attempt at a strict-JSON text task.
+
+    Key comes FIRST (the GeminiKeyPool calls fn(key, *args, **kwargs)).
     """
-    key = _require_key(user_api_key)
-    client = genai.Client(**{"api_key": key})
+    client = genai.Client(api_key=key)
+    candidates = []
+    if model:
+        candidates.append(model)
+    for m in MODEL_CANDIDATES:
+        if m not in candidates:
+            candidates.append(m)
+    last_err = None
+    tried: List[str] = []
+    quota_hits = 0
+    for mid in candidates:
+        tried.append(mid)
+        try:
+            resp = client.models.generate_content(
+                model=mid,
+                contents=[prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_json_schema=schema,
+                ),
+            )
+            return json.loads(resp.text)
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if is_quota_error(exc):
+                quota_hits += 1
+                last_err = exc
+                continue
+            if _looks_like_model_error(exc):
+                last_err = exc
+                continue
+            raise
+    if tried and quota_hits >= len(tried):
+        raise QuotaExhaustedError(f"Key quota ကုန်နေပါတယ် ({last_err})")
+    raise AnalyzerError(
+        "Text model နှင့် ချိတ်ဆက်၍ မရပါ။ "
+        f"({last_err if last_err else 'unknown error'})"
+    )
+
+
+def generate_text_json(prompt: str, schema: Dict[str, Any],
+                       gemini_pool, groq_key: Optional[str] = None,
+                       model: Optional[str] = None) -> Dict[str, Any]:
+    """Text-only LLM task with provider fallback (API Keys v2).
+
+    Order: Gemini keys (rotated via the pool) -> Groq key if present.
+    Groq cannot analyze video — text tasks only. Returns the parsed JSON
+    dict. Raises the pool's QuotaExhaustedError (exact Burmese fatal
+    message) when Gemini keys are all exhausted and no Groq key exists;
+    raises a Groq-naming fatal when Groq is present but also quota-hit.
+    """
+    last_err: Optional[BaseException] = None
+    if gemini_pool:
+        try:
+            return gemini_pool.run(_gemini_text_json, prompt, schema,
+                                   model=model)
+        except Exception as exc:  # noqa: BLE001 - Groq fallback below
+            last_err = exc
+    _gq = (groq_key or "").strip()
+    if _gq:
+        try:
+            return _groq_generate_json(prompt, _gq)
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if is_quota_error(exc):
+                raise QuotaExhaustedError(
+                    "Groq quota ကုန်နေပါတယ် — "
+                    "Gemini key အသစ် ထည့်ပါ") from exc
+            raise
+    if last_err is not None:
+        raise last_err
+    raise AnalyzerError("Text task အတွက် key မရှိပါ")
+
+
+def generate_post_kit(title, script_text, gemini_pool, groq_key=None,
+                      model=None, extra_hashtags="", append_fyp=True):
+    """Post Kit: Burmese TikTok caption + hashtags (API Keys v2).
+
+    Text-only task routed via generate_text_json: Gemini keys (rotated)
+    -> Groq fallback. Returns {"caption": str, "hashtags": [str]} with
+    the user's extra hashtags appended and #fyp appended when the toggle
+    is on. Raises on failure — callers catch it and skip the Post Kit
+    gracefully (it is a bonus, never fatal to the run).
+    """
     script_excerpt = str(script_text or "")[:2000]
     prompt = (
         "You are writing a TikTok/Facebook post for a Myanmar video recap.\n"
@@ -940,36 +1075,8 @@ def generate_post_kit(title, script_text, user_api_key, model=None,
         "each starting with #). Do NOT include #myanmartiktok.\n"
         "Return ONLY strict JSON matching the schema."
     )
-    candidates = []
-    if model:
-        candidates.append(model)
-    for m in MODEL_CANDIDATES:
-        if m not in candidates:
-            candidates.append(m)
-    last_err = None
-    data = None
-    for mid in candidates:
-        try:
-            resp = client.models.generate_content(
-                model=mid,
-                contents=[prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_json_schema=POST_KIT_SCHEMA,
-                ),
-            )
-            data = json.loads(resp.text)
-            break
-        except Exception as exc:  # noqa: BLE001 - try next model
-            if _looks_like_model_error(exc):
-                last_err = exc
-                continue
-            raise
-    if data is None:
-        raise AnalyzerError(
-            "Post Kit ဖန်တီးမရပါ။ "
-            f"({last_err if last_err else 'unknown error'})"
-        )
+    data = generate_text_json(prompt, POST_KIT_SCHEMA, gemini_pool,
+                              groq_key=groq_key, model=model)
     caption = str(data.get("caption") or "").strip()
     tags = []
     for h in data.get("hashtags") or []:

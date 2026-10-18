@@ -20,9 +20,10 @@ import json
 import os
 import shutil
 import tempfile
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Union
 
 from video_processor import get_video_metadata, prepare_video_source
+from key_pool import GeminiKeyPool, QuotaExhaustedError
 from ai_analyzer import (
     DEFAULT_STYLE,
     analyze_video_continuation,
@@ -448,24 +449,25 @@ def _build_hybrid_pack(
     return _pack
 
 
-def _postkit_for_run(title, script_text, user_api_key, model,
+def _postkit_for_run(title, script_text, gemini_pool, groq_key, model,
                      use_mock_plan, extra_hashtags, append_fyp):
-    """Post Kit caption + hashtags (feature pack v1.13).
+    """Post Kit caption + hashtags (feature pack v1.13; Keys v2).
 
     Best-effort: returns None on any failure (mock/demo mode, no key,
     API error) — the Post Kit is a bonus and never fails the run.
+    Text task routed: Gemini keys (rotated) -> Groq fallback.
     """
     try:
         if use_mock_plan:
             return None
         return generate_post_kit(
-            title, script_text, user_api_key, model=model,
+            title, script_text, gemini_pool, groq_key=groq_key, model=model,
             extra_hashtags=extra_hashtags, append_fyp=append_fyp)
     except Exception:  # noqa: BLE001 - Post Kit is best-effort
         return None
 
 
-def _enrich_server_result(result, work_dir, user_api_key, model,
+def _enrich_server_result(result, work_dir, gemini_pool, groq_key, model,
                           use_mock_plan, extra_hashtags, append_fyp):
     """Add Post Kit + thumbnail to a server-mode result (best-effort).
 
@@ -474,7 +476,7 @@ def _enrich_server_result(result, work_dir, user_api_key, model,
     try:
         result["postkit"] = _postkit_for_run(
             result.get("title"), result.get("script_text"),
-            user_api_key, model, use_mock_plan,
+            gemini_pool, groq_key, model, use_mock_plan,
             extra_hashtags, append_fyp)
     except Exception:  # noqa: BLE001 - best-effort
         result["postkit"] = None
@@ -494,7 +496,9 @@ def _enrich_server_result(result, work_dir, user_api_key, model,
 def run_full_recap_pipeline(
     video_path: Optional[str] = None,
     video_url: Optional[str] = None,
-    user_api_key: Optional[str] = None,
+    user_api_key: Union[str, List[str], None] = None,
+    groq_api_key: Optional[str] = None,
+    on_quota_warning: Optional[Callable[[str], None]] = None,
     target_duration: int = 30,
     style: str = DEFAULT_STYLE,
     voice_name: str = "my-MM-ThihaNeural",
@@ -619,6 +623,28 @@ def run_full_recap_pipeline(
         pct = base + span * min(1.0, max(0.0, frac))
         on_progress(round(pct, 1), phase, detail)
 
+    # API Keys v2: rotating Gemini key pool (one run shares exhaustion
+    # state across analyze / continuation / fill / post-kit calls).
+    # Warnings are collected here; the caller surfaces them via
+    # on_quota_warning (the UI shows a non-fatal banner per rotation).
+    _quota_warnings: List[str] = []
+
+    def _on_key_exhausted(key_num: int) -> None:
+        _msg = (f"Key {key_num} quota ကုန်သွားလို့ "
+                f"Key {key_num + 1} နဲ့ ဆက်လုပ်နေပါတယ်")
+        _quota_warnings.append(_msg)
+        if on_quota_warning is not None:
+            try:
+                on_quota_warning(_msg)
+            except Exception:
+                pass
+
+    _key_pool = GeminiKeyPool(user_api_key, on_exhausted=_on_key_exhausted)
+
+    def _gcall(fn, *args, **kwargs):
+        """Run a Gemini analyzer fn through the rotating key pool."""
+        return _key_pool.run(fn, *args, **kwargs)
+
     # 1) ingest
     _report("analyze", 0.0, "ဗီဒီယို ရယူနေသည်…")
     if hybrid_pack:
@@ -680,8 +706,9 @@ def run_full_recap_pipeline(
             if use_mock_plan:
                 plan = generate_mock_pro_plan(_video_dur)
             else:
-                plan = analyze_video_pro_blocks(
-                    local_path, user_api_key, model=model,
+                plan = _gcall(
+                    analyze_video_pro_blocks,
+                    local_path, model=model,
                     gemini_file_name=gemini_file_name,
                     video_duration=_video_dur,
                     delete_remote=False)
@@ -689,8 +716,9 @@ def run_full_recap_pipeline(
             if use_mock_plan:
                 plan = generate_mock_recap_plan(_video_dur)
             else:
-                plan = analyze_video_for_recap(
-                    local_path, user_api_key,
+                plan = _gcall(
+                    analyze_video_for_recap,
+                    local_path,
                     target_duration=target_duration, style=style,
                     model=model,
                     gemini_file_name=gemini_file_name,
@@ -727,8 +755,9 @@ def run_full_recap_pipeline(
                     _filled_blocks = []
                     for _i in range(0, len(_empty), PRO_FILL_BATCH):
                         try:
-                            _filled = analyze_video_pro_fill(
-                                local_path, user_api_key,
+                            _filled = _gcall(
+                                analyze_video_pro_fill,
+                                local_path,
                                 _empty[_i:_i + PRO_FILL_BATCH], model=model,
                                 gemini_file_name=gemini_file_name,
                                 delete_remote=False)
@@ -767,8 +796,9 @@ def run_full_recap_pipeline(
                     _exp_blocks = []
                     for _i in range(0, len(_under), PRO_FILL_BATCH):
                         try:
-                            _exp = analyze_video_pro_fill(
-                                local_path, user_api_key,
+                            _exp = _gcall(
+                                analyze_video_pro_fill,
+                                local_path,
                                 _under[_i:_i + PRO_FILL_BATCH],
                                 model=model,
                                 gemini_file_name=gemini_file_name,
@@ -820,7 +850,8 @@ def run_full_recap_pipeline(
         if hybrid_pack:
             _report("pack", 0.0, "Hybrid pack ထုတ်နေသည်…")
             _postkit = _postkit_for_run(
-                title, script_text, user_api_key, model, use_mock_plan,
+                title, script_text, _key_pool, groq_api_key, model,
+                use_mock_plan,
                 postkit_extra_hashtags, postkit_append_fyp)
             _mixed = mix_pro_block_audio(
                 blocks, work_dir,
@@ -854,7 +885,11 @@ def run_full_recap_pipeline(
             )
             _report("pack", 1.0, "Hybrid pack အဆင်သင့်")
             if gemini_file_name:
-                delete_gemini_file(user_api_key, gemini_file_name)
+                try:
+                    delete_gemini_file(_key_pool.first_key(),
+                                       gemini_file_name)
+                except Exception:
+                    pass
             return {
                 "hybrid_pack": True,
                 "pack_dir": work_dir,
@@ -866,6 +901,7 @@ def run_full_recap_pipeline(
                 "sync_method": "pro_blocks",
                 "narration_coverage": _narration_coverage(
                     _pro_covered, _video_dur),
+                "quota_warnings": list(_quota_warnings),
                 "video_speed_factor": None,
                 "aspect_ratio": aspect_ratio,
                 "processing_mode": "pro_ai_recap",
@@ -917,6 +953,7 @@ def run_full_recap_pipeline(
             "sync_method": "pro_blocks",
             "narration_coverage": _narration_coverage(
                 _pro_covered, _video_dur),
+            "quota_warnings": list(_quota_warnings),
             "video_speed_factor": None,
             "aspect_ratio": aspect_ratio,
             "processing_mode": "pro_ai_recap",
@@ -928,7 +965,7 @@ def run_full_recap_pipeline(
             "fit_mode": render.get("fit_mode"),
         }
         result = _enrich_server_result(
-            result, work_dir, user_api_key, model, use_mock_plan,
+            result, work_dir, _key_pool, groq_api_key, model, use_mock_plan,
             postkit_extra_hashtags, postkit_append_fyp)
     else:
         # AI Recap = Narration Master, FULL duration. The narration
@@ -1012,8 +1049,9 @@ def run_full_recap_pipeline(
                         audio_duration >= NARRATION_COVERAGE_TARGET * _video_dur:
                     break
                 try:
-                    _tail = analyze_video_continuation(
-                        local_path, user_api_key,
+                    _tail = _gcall(
+                        analyze_video_continuation,
+                        local_path,
                         from_time=audio_duration,
                         video_duration=_video_dur,
                         style=style, model=model,
@@ -1037,8 +1075,9 @@ def run_full_recap_pipeline(
                 if _expected_words > 0 and \
                         _delivered_words < 0.5 * _expected_words:
                     try:
-                        _tail2 = analyze_video_continuation(
-                            local_path, user_api_key,
+                        _tail2 = _gcall(
+                            analyze_video_continuation,
+                            local_path,
                             from_time=audio_duration,
                             video_duration=_video_dur,
                             style=style, model=model,
@@ -1115,7 +1154,8 @@ def run_full_recap_pipeline(
         if hybrid_pack:
             _report("pack", 0.0, "Hybrid pack ထုတ်နေသည်…")
             _postkit = _postkit_for_run(
-                title, script_text, user_api_key, model, use_mock_plan,
+                title, script_text, _key_pool, groq_api_key, model,
+                use_mock_plan,
                 postkit_extra_hashtags, postkit_append_fyp)
             _pack = _build_hybrid_pack(
                 run_dir=work_dir, processing_mode="ai_recap",
@@ -1151,7 +1191,11 @@ def run_full_recap_pipeline(
             )
             _report("pack", 1.0, "Hybrid pack အဆင်သင့်")
             if gemini_file_name:
-                delete_gemini_file(user_api_key, gemini_file_name)
+                try:
+                    delete_gemini_file(_key_pool.first_key(),
+                                       gemini_file_name)
+                except Exception:
+                    pass
             return {
                 "hybrid_pack": True,
                 "pack_dir": work_dir,
@@ -1163,6 +1207,7 @@ def run_full_recap_pipeline(
                 "sync_method": "full_narration",
                 "narration_coverage": _narration_coverage(
                     audio_duration, _video_dur),
+            "quota_warnings": list(_quota_warnings),
                 "video_speed_factor": 1.0,
                 "aspect_ratio": aspect_ratio,
                 "processing_mode": "ai_recap",
@@ -1221,6 +1266,7 @@ def run_full_recap_pipeline(
             "sync_method": "full_narration",
             "narration_coverage": _narration_coverage(
                 audio_duration, _video_dur),
+            "quota_warnings": list(_quota_warnings),
             "video_speed_factor": 1.0,
             "aspect_ratio": aspect_ratio,
             "processing_mode": "ai_recap",
@@ -1240,7 +1286,7 @@ def run_full_recap_pipeline(
             "continuation_error": _cont_error,
         }
         result = _enrich_server_result(
-            result, work_dir, user_api_key, model, use_mock_plan,
+            result, work_dir, _key_pool, groq_api_key, model, use_mock_plan,
             postkit_extra_hashtags, postkit_append_fyp)
 
     # 6) cleanup temp fragments (keep final video + srt + voiceover)

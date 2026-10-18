@@ -597,6 +597,14 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
          font (a one-shot send can miss the component's first render
          if a rerun lands first). */
       loaded_font: S.loadedFont,
+      /* v1.13.1: live video state for Run validation (defense-in-depth).
+         If Python ever loses pending_video_id (e.g. a restart race the
+         pick re-announce hasn't healed yet), the Run handler can still
+         see that the canvas holds a local video and proceed — the
+         canvas supplies the bytes on the upload/Gemini nonce. */
+      has_video: !!S.hasVideo,
+      video_id: S.videoId || null,
+      video_name: S.localName || null,
     };
   }
 
@@ -1067,6 +1075,13 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
   function wireTopButtons() {
     btnX.addEventListener("click", function () {
       S.expectRemove = true;
+      /* v1.13.1: clear the live video state immediately so the
+         component value never reports a video that was just removed
+         (Python's remove_video handler clears its side; this keeps
+         the has_video/video_id fallback consistent). */
+      S.videoId = null;
+      S.hasVideo = false;
+      S.localPicked = false;
       sendValue("remove_video");
     });
     btnEdit.addEventListener("click", function () {
@@ -1817,6 +1832,9 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
     err.retryable = (kind === "timeout" || kind === "stall"
       || kind === "network"
       || (kind === "http" && (detail >= 500 || detail === 429)));
+    /* API Keys v2: carry the HTTP status so the key pool can rotate
+       on 429/quota without parsing the Burmese message. */
+    if (kind === "http") { err.httpStatus = detail; }
     return err;
   }
 
@@ -1828,15 +1846,53 @@ _EMBEDDED_HTML = r"""<!DOCTYPE html>
      Retries ONCE on transient failures with a FRESH resumable
      session (the old session URI may be dead). Non-retryable
      errors (4xx auth) throw immediately. */
-  async function uploadToGemini(file, auth) {
+  /* API Keys v2: `auth` is a KEY LIST (or a single key string for
+     backward compat). Each key gets the full retry treatment
+     (uploadToGeminiOnce + one retry on transient errors); on a
+     quota error (HTTP 429 / quota mention) the pool rotates to the
+     NEXT key. Non-quota errors raise immediately. */
+  function normalizeAuthKeys(auth) {
+    if (!auth) return [];
+    if (typeof auth === "string") return auth ? [auth] : [];
+    if (Array.isArray(auth)) {
+      return auth.filter(function (k) { return !!k; });
+    }
+    return [];
+  }
+  function isQuotaUploadError(e) {
+    if (!e) return false;
+    if (e.httpStatus === 429) return true;
+    var m = String((e && e.message) || "").toLowerCase();
+    return m.indexOf("429") >= 0
+      || m.indexOf("quota") >= 0
+      || m.indexOf("resource_exhausted") >= 0;
+  }
+  async function uploadToGeminiWithRetry(file, key) {
     var lastErr = null;
     for (var attempt = 0; attempt < 2; attempt++) {
       S.lastGeminiPct = -1;
       try {
-        return await uploadToGeminiOnce(file, auth);
+        return await uploadToGeminiOnce(file, key);
       } catch (e) {
         lastErr = e;
         if (attempt === 0 && e && e.retryable) { continue; }
+        throw e;
+      }
+    }
+    throw lastErr;
+  }
+  async function uploadToGemini(file, auth) {
+    var keys = normalizeAuthKeys(auth);
+    if (!keys.length) {
+      throw new Error("Gemini API Key မရှိပါ — Advanced tab မှာ Key ထည့်ပေးပါ။");
+    }
+    var lastErr = null;
+    for (var ki = 0; ki < keys.length; ki++) {
+      try {
+        return await uploadToGeminiWithRetry(file, keys[ki]);
+      } catch (e) {
+        lastErr = e;
+        if (isQuotaUploadError(e) && ki < keys.length - 1) { continue; }
         throw e;
       }
     }
