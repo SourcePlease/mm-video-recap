@@ -27,7 +27,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import streamlit.components.v1 as components
 
@@ -3115,8 +3115,10 @@ def interactive_canvas(
     # upload) + the Hybrid pack for the device encode (acked once).
     # gemini_auth is the user's own Gemini credential, passed to the
     # canvas ONLY for the direct-to-Gemini upload step; it is never
-    # logged, rendered, or stored by the frontend.
-    gemini_auth: Optional[str] = None,
+    # logged, rendered, or stored by the frontend. API Keys v2: a
+    # LIST of keys (the browser rotates on quota); a single string
+    # still works (treated as one key).
+    gemini_auth: Optional[Union[str, List[str]]] = None,
     gemini_upload_request: Optional[int] = None,
     # Ack for the browser→Gemini upload result: the frontend re-sends
     # gemini_uploaded / gemini_upload_error until it sees this

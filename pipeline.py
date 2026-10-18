@@ -65,6 +65,21 @@ class PipelineError(Exception):
     """Raised for pipeline failures."""
 
 
+def _gcall_with_pool(key_pool, fn, *args, **kwargs):
+    """Run a Gemini analyzer fn through a rotating key pool.
+
+    The pool supplies each candidate key as the ``user_api_key``
+    KEYWORD. Every analyzer signature is
+    ``(video_path, user_api_key=None, ...)`` — prepending the key
+    positionally (the pool's ``fn(key, ...)`` convention) would land
+    the key in ``video_path`` and leave ``user_api_key`` empty, which
+    raised the v1.2 "please enter your key" error live even with a
+    saved key (2026-10-18). The lambda adapts the two conventions.
+    Module-level so tests can exercise the real wiring.
+    """
+    return key_pool.run(lambda key: fn(*args, user_api_key=key, **kwargs))
+
+
 # Narration coverage: a plan is "full" when the Myanmar speech covers
 # at least 90% of the video. Below that, the pipeline retries Gemini
 # for the missing part (AI continuation / Pro fill).
@@ -643,7 +658,7 @@ def run_full_recap_pipeline(
 
     def _gcall(fn, *args, **kwargs):
         """Run a Gemini analyzer fn through the rotating key pool."""
-        return _key_pool.run(fn, *args, **kwargs)
+        return _gcall_with_pool(_key_pool, fn, *args, **kwargs)
 
     # 1) ingest
     _report("analyze", 0.0, "ဗီဒီယို ရယူနေသည်…")
