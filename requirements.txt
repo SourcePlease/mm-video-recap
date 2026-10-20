@@ -4,7 +4,11 @@
 google-genai>=2.30.1
 edge-tts>=7.3.1
 groq>=0.11.0
-yt-dlp>=2026.8.19
+# yt-dlp extras: "default" = yt-dlp-ejs (YouTube challenge solver),
+# "deno" = the JavaScript runtime yt-dlp needs for YouTube. Streamlit Cloud has
+# no JS runtime, so without it yt-dlp falls back to one client and the video
+# download ends in HTTP 403.
+yt-dlp[default,deno]>=2026.8.19
 gradio>=6.30.0
 streamlit>=1.32.0
 streamlit-js-eval>=1.0.0

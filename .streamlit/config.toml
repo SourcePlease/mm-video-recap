@@ -11,6 +11,14 @@
 [server]
 maxWidgetStateSize = 500
 
+# The app deliberately seeds st.session_state before the widgets exist (so the
+# canvas preview sees the defaults on the very first run) AND passes the same
+# default= to each st.pills(...). Both always agree, so Streamlit's "widget was
+# created with a default value but also had its value set via the Session
+# State API" warning (logged once per process, with a stack trace) is noise.
+[global]
+disableWidgetStateDuplicationWarning = true
+
 # Black & white only: the theme's primary accent (slider fill, radio
 # dots, checkbox checks) defaults to Streamlit red — force it to black.
 [theme]

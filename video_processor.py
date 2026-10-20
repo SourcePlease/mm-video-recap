@@ -5,15 +5,23 @@ Functions:
 - get_video_metadata(video_path): ffprobe-based metadata dict.
 - download_video_from_url(url, output_dir, max_duration=1800): yt-dlp download,
   capped at 720p and merged to MP4 to stay light on free-server RAM.
+  YouTube often answers shared cloud IPs with HTTP 403, so the download uses
+  the pip-installed Deno runtime and retries with other player clients.
 - prepare_video_source(uploaded_file_path=None, video_url=None, work_dir=None):
   accepts either an uploaded file or a URL and returns (local_path, metadata).
+
+Optional environment variable:
+- YTDLP_PROXY: proxy URL (http://user:pass@host:port, socks5://...) used for
+  URL downloads when YouTube blocks the server's own IP address.
 
 No API keys are used or stored anywhere in this module.
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -22,6 +30,8 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import yt_dlp
+
+_LOG = logging.getLogger(__name__)
 
 
 class VideoProcessorError(Exception):
@@ -58,6 +68,157 @@ def _parse_fps(avg_frame_rate: Optional[str]) -> Optional[float]:
         return round(num / den, 3)
     except (ValueError, AttributeError):
         return None
+
+
+# --------------------------------------------------------------------------- #
+# yt-dlp helpers
+# --------------------------------------------------------------------------- #
+# YouTube often refuses media requests that come from shared cloud IPs
+# (Streamlit Cloud, Hugging Face Spaces, ...): metadata extraction works but
+# the download itself fails with "HTTP Error 403: Forbidden". Which player
+# client gets through changes by video and by day, so the download is retried
+# with a few clients that need no PO token (yt-dlp wiki: "PO Token Guide").
+# ``None`` means yt-dlp's own default client selection.
+_PLAYER_CLIENT_ATTEMPTS: Tuple[Optional[Tuple[str, ...]], ...] = (
+    None,
+    ("android_vr",),
+    ("web_safari",),
+    ("tv", "web_embedded"),
+)
+
+# Lower-case fragments of yt-dlp errors that another client may get around.
+_BLOCK_MARKERS = (
+    "http error 403",
+    "forbidden",
+    "not a bot",
+    "requested format is not available",
+    "only images are available",
+)
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _clean_msg(msg: object) -> str:
+    """yt-dlp message without colour codes, "ERROR:" prefix or edge spaces."""
+    text = _ANSI_RE.sub("", str(msg)).strip()
+    return re.sub(r"^ERROR:\s*", "", text)
+
+
+def _looks_blocked(exc: BaseException) -> bool:
+    text = _clean_msg(exc).lower()
+    return any(marker in text for marker in _BLOCK_MARKERS)
+
+
+class _YtdlpLogger:
+    """Send yt-dlp's messages to ``logging`` instead of stdout/stderr.
+
+    The old ``no_warnings`` option hid every yt-dlp warning, including "No
+    supported JavaScript runtime could be found" — the usual reason a YouTube
+    download ends in HTTP 403. Warnings and errors now reach the app log.
+    """
+
+    def debug(self, msg: str) -> None:  # progress / info lines: not needed
+        pass
+
+    def info(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        _LOG.warning("yt-dlp: %s", _clean_msg(msg))
+
+    def error(self, msg: str) -> None:
+        _LOG.error("yt-dlp: %s", _clean_msg(msg))
+
+
+def _ydl_opts(clients: Optional[Tuple[str, ...]]) -> dict:
+    """yt-dlp options shared by the inspect pass and the download pass.
+
+    No ``js_runtimes`` option is needed: yt-dlp looks for Deno by itself,
+    including the interpreter's scripts directory where the ``deno`` wheel
+    (requirements.txt: ``yt-dlp[deno]``) installs it. Without any JavaScript
+    runtime yt-dlp falls back to a single player client and many YouTube
+    downloads end in HTTP 403.
+    """
+    opts: dict = {
+        "noplaylist": True,
+        "quiet": True,
+        "logger": _YtdlpLogger(),
+    }
+    proxy = os.environ.get("YTDLP_PROXY", "").strip()
+    if proxy:
+        opts["proxy"] = proxy
+    if clients:
+        opts["extractor_args"] = {"youtube": {"player_client": list(clients)}}
+    return opts
+
+
+def _download_error_message(exc: BaseException) -> str:
+    detail = _clean_msg(exc)
+    if _looks_blocked(exc):
+        return (
+            "YouTube refused the download from this server (HTTP 403 / bot "
+            "check) - common on shared cloud IPs. Please download the video "
+            "yourself and upload the file instead. "
+            "(YouTube က ဒီ server ကနေ ဒေါင်းလုဒ်လုပ်တာကို ပိတ်ထားပါတယ်။ "
+            "ဗီဒီယိုကို ကိုယ်တိုင် ဒေါင်းလုဒ်ဆွဲပြီး ဖိုင်အဖြစ် တင်ပေးပါ။) "
+            f"[{detail[:160]}]"
+        )
+    return f"Could not download the video: {detail[:300]}"
+
+
+def _download_once(
+    url: str, output_dir, max_duration: int, clients: Optional[Tuple[str, ...]]
+) -> str:
+    """One inspect + download pass using the given YouTube player clients."""
+    # 1) inspect without downloading to enforce the duration cap
+    with yt_dlp.YoutubeDL(_ydl_opts(clients)) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
+        raise VideoProcessorError(f"Could not read video info from URL: {url}")
+    if info.get("_type") == "playlist":
+        raise VideoProcessorError(
+            "Playlists are not supported; provide a single video URL."
+        )
+    duration = info.get("duration")
+    if duration is not None and duration > max_duration:
+        raise VideoProcessorError(
+            f"Video is {duration / 60:.1f} min, longer than the "
+            f"{max_duration / 60:.0f} min limit."
+        )
+
+    # 2) download at most 720p, merged to mp4
+    outtmpl = os.path.join(str(output_dir), "%(title).60s_[%(id)s].%(ext)s")
+    opts = _ydl_opts(clients)
+    opts.update(
+        {
+            "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+            "merge_output_format": "mp4",
+            "outtmpl": outtmpl,
+        }
+    )
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+        expected = ydl.prepare_filename(info)
+
+    mp4_path = os.path.splitext(expected)[0] + ".mp4"
+    final = mp4_path if os.path.isfile(mp4_path) else expected
+    if not os.path.isfile(final):
+        # last resort: newest media file in the output dir
+        candidates = sorted(
+            (
+                p
+                for p in Path(output_dir).iterdir()
+                if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
+            ),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            raise VideoProcessorError(
+                "Download finished but no video file was found."
+            )
+        final = str(candidates[0])
+    return final
 
 
 # --------------------------------------------------------------------------- #
@@ -100,63 +261,32 @@ def download_video_from_url(
     """Download a video URL (YouTube etc.) with yt-dlp, max 720p, merged to MP4.
 
     Returns the local path of the downloaded file.
-    Raises VideoProcessorError if the video exceeds max_duration seconds.
+    Raises VideoProcessorError if the video exceeds max_duration seconds, or
+    if every YouTube player client is refused (HTTP 403 / bot check).
     """
     if not url or not isinstance(url, str):
         raise ValueError("A video URL string is required.")
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1) inspect without downloading to enforce the duration cap
-    with yt_dlp.YoutubeDL(
-        {"quiet": True, "no_warnings": True, "noplaylist": True}
-    ) as ydl:
-        info = ydl.extract_info(url, download=False)
-    if not info:
-        raise VideoProcessorError(f"Could not read video info from URL: {url}")
-    if info.get("_type") == "playlist":
-        raise VideoProcessorError(
-            "Playlists are not supported; provide a single video URL."
-        )
-    duration = info.get("duration")
-    if duration is not None and duration > max_duration:
-        raise VideoProcessorError(
-            f"Video is {duration / 60:.1f} min, longer than the "
-            f"{max_duration / 60:.0f} min limit."
-        )
-
-    # 2) download at most 720p, merged to mp4
-    outtmpl = os.path.join(str(output_dir), "%(title).60s_[%(id)s].%(ext)s")
-    opts = {
-        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-        "merge_output_format": "mp4",
-        "outtmpl": outtmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-        expected = ydl.prepare_filename(info)
-
-    mp4_path = os.path.splitext(expected)[0] + ".mp4"
-    final = mp4_path if os.path.isfile(mp4_path) else expected
-    if not os.path.isfile(final):
-        # last resort: newest media file in the output dir
-        candidates = sorted(
-            (
-                p
-                for p in Path(output_dir).iterdir()
-                if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
-            ),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if not candidates:
-            raise VideoProcessorError(
-                "Download finished but no video file was found."
+    last_exc: Optional[BaseException] = None
+    for clients in _PLAYER_CLIENT_ATTEMPTS:
+        try:
+            return _download_once(url, output_dir, max_duration, clients)
+        except VideoProcessorError:
+            raise
+        except yt_dlp.utils.YoutubeDLError as exc:
+            last_exc = exc
+            if not _looks_blocked(exc):
+                break
+            _LOG.warning(
+                "yt-dlp was refused with player_client=%s (%s); "
+                "trying the next client",
+                ",".join(clients) if clients else "default",
+                _clean_msg(exc)[:160],
             )
-        final = str(candidates[0])
-    return final
+    if last_exc is None:  # pragma: no cover - the attempt list is never empty
+        raise VideoProcessorError("Could not download the video.")
+    raise VideoProcessorError(_download_error_message(last_exc)) from last_exc
 
 
 def prepare_video_source(
