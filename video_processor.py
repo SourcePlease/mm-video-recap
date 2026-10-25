@@ -77,13 +77,16 @@ def _parse_fps(avg_frame_rate: Optional[str]) -> Optional[float]:
 # (Streamlit Cloud, Hugging Face Spaces, ...): metadata extraction works but
 # the download itself fails with "HTTP Error 403: Forbidden". Which player
 # client gets through changes by video and by day, so the download is retried
-# with a few clients that need no PO token (yt-dlp wiki: "PO Token Guide").
-# ``None`` means yt-dlp's own default client selection.
+# with other clients. ``None`` means yt-dlp's own pick (with a JavaScript
+# runtime that is tv_samsung, visionos, web). The fallbacks are ordered by how
+# little they need: tv / web_embedded serve plain HTTPS formats without a GVS
+# PO token, web_safari adds HLS formats (also token-free), and android_vr goes
+# last because its HTTPS/DASH formats want a PO token in yt-dlp 2026.10.
 _PLAYER_CLIENT_ATTEMPTS: Tuple[Optional[Tuple[str, ...]], ...] = (
     None,
-    ("android_vr",),
-    ("web_safari",),
     ("tv", "web_embedded"),
+    ("web_safari",),
+    ("android_vr",),
 )
 
 # Lower-case fragments of yt-dlp errors that another client may get around.
